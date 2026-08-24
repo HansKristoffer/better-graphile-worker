@@ -42,8 +42,10 @@ describe('createBetterWorker', () => {
 		const defs = worker.getQueueDefinitions()
 		expect(defs.map((d) => d.name)).toEqual(['sendEmail', 'dailySweep'])
 		expect(defs[0]?.type).toBe('regular')
+		expect(defs[0]?.inputSchema).toBe(sendEmail.inputSchema)
 		expect(defs[1]?.type).toBe('cron')
 		expect(defs[1]?.cron).toBe('0 3 * * *')
+		expect(defs[1]?.inputSchema).toBeNull()
 	})
 
 	test('shouldSkipEnqueue skips createJob and createJobs', async () => {

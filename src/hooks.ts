@@ -10,10 +10,16 @@ export type JobLogger = {
 	error(message: string, attributes?: LogAttributes): void
 }
 
+export type SpanEventAttributes = Record<
+	string,
+	string | number | boolean | null | undefined
+>
+
 export type JobSpan = {
 	setAttribute(key: string, value: string | number | boolean): void
 	setAttributes(attributes: Record<string, string | number | boolean>): void
 	setStatus(status: { code: number; message?: string }): void
+	addEvent(name: string, attributes?: SpanEventAttributes): void
 	recordException(error: Error): void
 	end(): void
 }

@@ -1,5 +1,7 @@
 import type { WorkerUtils } from 'graphile-worker'
+import type z from 'zod'
 import type { QueueAny } from './create-queue'
+import type { CompletedJobStats } from './completed-jobs-store'
 import {
 	formatCronSchedule,
 	getQueueType,
@@ -20,6 +22,7 @@ export type QueueDefinition = {
 	maxAttempts: number
 	priority: number | null
 	hasInputSchema: boolean
+	inputSchema: z.ZodType | null
 }
 
 export type JobCountRow = {
@@ -27,6 +30,10 @@ export type JobCountRow = {
 	pending: number
 	running: number
 	failed: number
+}
+
+export type WorkerJobStatsRow = JobCountRow & {
+	completed: number
 }
 
 export type ListedJob = {
@@ -65,8 +72,34 @@ export function getQueueDefinitions(
 		serial: queue.serial ?? null,
 		maxAttempts: queue.maxAttempts ?? DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
 		priority: queue.priority ?? null,
-		hasInputSchema: hasInputSchema(queue)
+		hasInputSchema: hasInputSchema(queue),
+		inputSchema: hasInputSchema(queue) ? queue.inputSchema : null
 	}))
+}
+
+export function mergeJobStats(
+	rows: readonly JobCountRow[],
+	ring: CompletedJobStats,
+	taskIdentifiers: readonly string[] = []
+): WorkerJobStatsRow[] {
+	const names = new Set<string>([
+		...taskIdentifiers,
+		...rows.map((row) => row.taskIdentifier),
+		...Object.keys(ring)
+	])
+	const byTask = new Map(rows.map((row) => [row.taskIdentifier, row]))
+
+	return [...names].map((taskIdentifier) => {
+		const pg = byTask.get(taskIdentifier)
+		const mem = ring[taskIdentifier]
+		return {
+			taskIdentifier,
+			pending: pg?.pending ?? 0,
+			running: pg?.running ?? 0,
+			completed: mem?.completed ?? 0,
+			failed: mem?.failed ?? pg?.failed ?? 0
+		}
+	})
 }
 
 export async function queryJobCounts(

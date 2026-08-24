@@ -285,7 +285,7 @@ export function createCli<TQueues extends readonly QueueAny[]>(
 					for (const row of stats) {
 						console.log(`  ${row.taskIdentifier}`)
 						console.log(
-							`    pending: ${row.pending}  running: ${row.running}  failed: ${row.failed}`
+							`    pending: ${row.pending}  running: ${row.running}  completed: ${row.completed}  failed: ${row.failed}`
 						)
 					}
 					console.log()

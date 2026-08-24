@@ -147,7 +147,7 @@ All hooks are optional:
 - `onEnqueueFail` — `createJob` / `createJobs` database failures
 - `shouldSkipEnqueue` — return `true` to skip enqueue (e.g. while seeding)
 
-`span` is always present: a real OpenTelemetry span when `@opentelemetry/api` is installed (or injected via `otel: { api }`), otherwise a no-op. Producer spans use `PRODUCER` kind and W3C `traceparent`; the legacy `__trace` payload field is still read.
+`span` is always present: a real OpenTelemetry span when `@opentelemetry/api` is installed (or injected via `otel: { api }`), otherwise a no-op. `JobSpan` includes `addEvent` so host loggers can attach events without casting. Producer spans use `PRODUCER` kind and W3C `traceparent`; the legacy `__trace` payload field is still read.
 
 ## Admin helpers
 
@@ -160,7 +160,7 @@ await worker.failJobs(['123'], 'gave up')
 worker.getCompletedJobs()
 ```
 
-Completed jobs are an **opt-in** in-memory ring (`completedJobs: { maxPerQueue: 50 }`) so they remain visible after Graphile deletes them.
+Completed jobs are an **opt-in** in-memory ring (`completedJobs: { maxPerQueue: 50 }`) so they remain visible after Graphile deletes them. `getQueueDefinitions()` includes the Zod `inputSchema` when present. `getJobStats()` returns `{ pending, running, completed, failed }` per task: pending/running from Postgres, completed (and ring `failed`) from the in-memory store when enabled.
 
 ## CLI
 

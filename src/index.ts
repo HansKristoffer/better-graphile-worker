@@ -104,15 +104,18 @@ export type {
 	JobFinishedEvent,
 	PermanentFailureEvent,
 	EnqueueFailEvent,
-	LogAttributes
+	LogAttributes,
+	SpanEventAttributes
 } from './hooks'
 
 export {
 	getQueueDefinitions,
+	mergeJobStats,
 	queryJobCounts,
 	queryRecentJobs,
 	type QueueDefinition,
 	type JobCountRow,
+	type WorkerJobStatsRow,
 	type ListedJob,
 	type ListJobsOptions,
 	type JobListState

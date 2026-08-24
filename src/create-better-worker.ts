@@ -20,12 +20,13 @@ import {
 } from './completed-jobs-store'
 import {
 	getQueueDefinitions,
+	mergeJobStats,
 	queryJobCounts,
 	queryRecentJobs,
-	type JobCountRow,
 	type ListedJob,
 	type ListJobsOptions,
-	type QueueDefinition
+	type QueueDefinition,
+	type WorkerJobStatsRow
 } from './admin'
 import {
 	buildCronItems,
@@ -87,7 +88,7 @@ export type BetterWorker<TQueues extends readonly QueueAny[]> = {
 	buildCronItems(): CronItem[]
 	getCompletedJobs(): CompletedJob[]
 	getCompletedJobsStats(): CompletedJobStats
-	getJobStats(): Promise<JobCountRow[]>
+	getJobStats(): Promise<WorkerJobStatsRow[]>
 	listJobs(options?: ListJobsOptions): Promise<ListedJob[]>
 	retryJobs(ids: string[]): Promise<string[]>
 	failJobs(ids: string[], reason?: string): Promise<string[]>
@@ -285,7 +286,13 @@ export function createBetterWorker<TQueues extends readonly QueueAny[]>(
 		},
 		async getJobStats() {
 			const utils = await client.getUtils()
-			return queryJobCounts(utils, schema)
+			const rows = await queryJobCounts(utils, schema)
+			const taskIdentifiers = options.queues.flatMap((queue) =>
+				isCronInitQueue(queue)
+					? [queue.name, `${queue.name}${CRON_INIT_SUFFIX}`]
+					: [queue.name]
+			)
+			return mergeJobStats(rows, completedJobs.getStats(), taskIdentifiers)
 		},
 		async listJobs(listOptions) {
 			const utils = await client.getUtils()

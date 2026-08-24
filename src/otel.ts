@@ -5,9 +5,26 @@ type OtelSpan = {
 	setAttribute(key: string, value: string | number | boolean): unknown
 	setAttributes(attributes: Record<string, string | number | boolean>): unknown
 	setStatus(status: { code: number; message?: string }): unknown
+	addEvent?(
+		name: string,
+		attributes?: Record<string, string | number | boolean>
+	): unknown
 	recordException(error: Error): unknown
 	end(): unknown
 	spanContext(): { traceId: string; spanId: string; traceFlags: number }
+}
+
+function compactSpanEventAttributes(
+	attributes?: Record<string, string | number | boolean | null | undefined>
+): Record<string, string | number | boolean> | undefined {
+	if (!attributes) return undefined
+	const compact: Record<string, string | number | boolean> = {}
+	for (const [key, value] of Object.entries(attributes)) {
+		if (value !== null && value !== undefined) {
+			compact[key] = value
+		}
+	}
+	return compact
 }
 
 type OtelLink = {
@@ -84,6 +101,7 @@ export function createNoopSpan(): JobSpan {
 		setAttribute() {},
 		setAttributes() {},
 		setStatus() {},
+		addEvent() {},
 		recordException() {},
 		end() {}
 	}
@@ -99,6 +117,9 @@ export function wrapOtelSpan(span: OtelSpan): JobSpan {
 		},
 		setStatus(status) {
 			span.setStatus(status)
+		},
+		addEvent(name, attributes) {
+			span.addEvent?.(name, compactSpanEventAttributes(attributes))
 		},
 		recordException(error) {
 			span.recordException(error)
