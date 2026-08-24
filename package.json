@@ -1,0 +1,84 @@
+{
+	"name": "better-graphile-worker",
+	"version": "0.1.0",
+	"description": "Typed Graphile Worker queues with Zod schemas, cron-init, and optional OpenTelemetry.",
+	"type": "module",
+	"license": "MIT",
+	"sideEffects": false,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kristofferhansen/better-graphile-worker.git"
+	},
+	"homepage": "https://github.com/kristofferhansen/better-graphile-worker",
+	"keywords": [
+		"graphile-worker",
+		"postgres",
+		"jobs",
+		"queue",
+		"zod",
+		"typescript"
+	],
+	"engines": {
+		"node": ">=20"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./cli": {
+			"types": "./dist/cli.d.ts",
+			"import": "./dist/cli.js"
+		},
+		"./client": {
+			"types": "./dist/job-client.d.ts",
+			"import": "./dist/job-client.js"
+		},
+		"./testing": {
+			"types": "./dist/testing.d.ts",
+			"import": "./dist/testing.js"
+		}
+	},
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"LICENSE",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "bun scripts/build.ts",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit",
+		"lint": "bun run typecheck && biome check",
+		"lint:write": "bun run typecheck && biome check --write",
+		"attw": "attw --pack . --profile esm-only",
+		"publint": "publint"
+	},
+	"peerDependencies": {
+		"@opentelemetry/api": "^1.9.0",
+		"graphile-worker": "^0.17.3",
+		"pg": ">=8",
+		"zod": ">=4"
+	},
+	"peerDependenciesMeta": {
+		"@opentelemetry/api": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "^0.18.2",
+		"@biomejs/biome": "^2.2.4",
+		"@changesets/cli": "^2.29.6",
+		"@opentelemetry/api": "^1.9.0",
+		"@types/bun": "^1.2.0",
+		"@types/pg": "^8.16.0",
+		"graphile-worker": "^0.17.3",
+		"pg": "^8.16.0",
+		"publint": "^0.3.12",
+		"typescript": "^5.9.2",
+		"zod": "^4.4.3"
+	}
+}
