@@ -9,6 +9,7 @@ import {
 } from './create-queue'
 import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job'
 import { assertValidSchemaName } from './schema-name'
+import { extractProducerLink } from './payload'
 
 /**
  * Queries Graphile Worker's internal `_private_jobs` / `_private_tasks` tables.
@@ -209,7 +210,7 @@ export async function queryRecentJobs(
 	return result.rows.map((row) => ({
 		id: row.id,
 		queueName: row.task_identifier,
-		payload: row.payload,
+		payload: extractProducerLink(row.payload).cleanPayload,
 		priority: row.priority,
 		attempts: row.attempts,
 		maxAttempts: row.max_attempts,

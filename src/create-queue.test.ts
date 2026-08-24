@@ -144,6 +144,10 @@ describe('input schema inference', () => {
 		type InitFnCtx = Parameters<typeof cronInitQueue.initFn>[0]
 		expectTypeOf<InitFnCtx>().toEqualTypeOf<JobContext>()
 	})
+
+	test('JobContext includes step.run', () => {
+		expectTypeOf<JobContext['step']['run']>().toBeFunction()
+	})
 })
 
 // ═══════════════════════════════════════════════════════════════════════════

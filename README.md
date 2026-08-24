@@ -136,6 +136,21 @@ A "queue" here is a Graphile **task identifier**, not Graphile's serialization `
 - `createJob` / `createJobs` (bound to the same worker)
 - `cron` (`{ ts, backfilled }`) when Graphile injected a `_cron` payload
 - `helpers` for the raw Graphile API
+- `step.run(id, fn)` — memoizes JSON-serializable results across retries
+
+```ts
+processFn: async (payload, ctx) => {
+	const user = await ctx.step.run('fetch-user', async () => {
+		return await db.users.find(payload.userId)
+	})
+
+	await ctx.step.run('send-email', async () => {
+		await sendEmail(user.email)
+	})
+}
+```
+
+On retry the handler runs from the top again, but completed steps return the cached output and do not re-run `fn`. Use unique ids in loops (`send-email-${i}`). `undefined` is stored as `null`. This is replay-with-cache, not Trigger.dev-style sleep/wait checkpointing.
 
 ## Hooks
 

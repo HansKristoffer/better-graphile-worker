@@ -27,6 +27,7 @@ import { NonRetriableError } from './errors'
 import { extractCronMeta, extractProducerLink } from './payload'
 import { otelStatusCodes, withActiveSpan } from './otel'
 import { createConsoleLogger } from './default-logger'
+import { createPgStepStore, createStepRunner } from './steps'
 
 export type TaskListRuntime<
 	TQueues extends readonly QueueAny[] = readonly QueueAny[]
@@ -36,6 +37,7 @@ export type TaskListRuntime<
 	createJob: CreateJobFn<TQueues>
 	createJobs: CreateJobsFn<TQueues>
 	logger: JobLogger
+	schema: string
 }
 
 export { extractProducerLink } from './payload'
@@ -47,7 +49,8 @@ function createJobContext<TQueues extends readonly QueueAny[]>(
 	helpers: JobHelpers,
 	hooks: BetterWorkerHooks,
 	runtime: TaskListRuntime<TQueues>,
-	cron: JobContext['cron']
+	cron: JobContext['cron'],
+	rawPayload: unknown
 ): JobContext {
 	const createLogger = hooks.createLogger ?? createConsoleLogger
 	return {
@@ -65,6 +68,15 @@ function createJobContext<TQueues extends readonly QueueAny[]>(
 			queue: queueName,
 			jobId,
 			attempt: helpers.job.attempts,
+			span
+		}),
+		step: createStepRunner({
+			store: createPgStepStore({
+				helpers,
+				schema: runtime.schema,
+				jobId,
+				rawPayload
+			}),
 			span
 		})
 	}
@@ -99,9 +111,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
 	const { link, cleanPayload } = extractProducerLink(payload)
-	const cron = extractCronMeta(
-		typeof payload === 'object' && payload !== null ? payload : cleanPayload
-	)
+	const cron = extractCronMeta(cleanPayload)
 	const statusCodes = otelStatusCodes()
 
 	await withActiveSpan(
@@ -136,7 +146,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 				helpers,
 				runtime.hooks,
 				runtime,
-				cron
+				cron,
+				payload
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined

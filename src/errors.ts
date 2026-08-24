@@ -57,3 +57,16 @@ export class InvalidSchemaNameError extends Error {
 		this.name = 'InvalidSchemaNameError'
 	}
 }
+
+export class StepSerializationError extends NonRetriableError {
+	constructor(
+		readonly stepId: string,
+		options?: ErrorOptions
+	) {
+		super(
+			`Step "${stepId}" returned a value that is not JSON-serializable`,
+			options
+		)
+		this.name = 'StepSerializationError'
+	}
+}

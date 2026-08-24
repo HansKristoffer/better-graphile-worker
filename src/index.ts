@@ -86,8 +86,13 @@ export {
 export {
 	extractCronMeta,
 	isPayloadEnvelope,
-	isPlainObject
+	isPlainObject,
+	extractStepCache,
+	withStepCache,
+	type StepCache
 } from './payload'
+
+export type { JobStep, StepStore } from './steps'
 
 export {
 	createCompletedJobsStore,
@@ -131,7 +136,8 @@ export {
 	JobValidationError,
 	DuplicateQueueError,
 	QueueNameCollisionError,
-	InvalidSchemaNameError
+	InvalidSchemaNameError,
+	StepSerializationError
 } from './errors'
 
 export {

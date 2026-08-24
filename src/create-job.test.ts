@@ -443,3 +443,70 @@ integrationDescribe('createJob - with options', () => {
 		expect(payload.organizationId).toBe('org_test_dedup-second')
 	})
 })
+
+integrationDescribe('step cache', () => {
+	const counts = { fetch: 0, send: 0 }
+	const stepQueue = createQueue({
+		name: 'bgwStepQueue',
+		inputSchema: z.object({ userId: z.string() }),
+		maxAttempts: 3,
+		processFn: async (payload, ctx) => {
+			await ctx.step.run('fetch-user', async () => {
+				counts.fetch += 1
+				return { id: payload.userId }
+			})
+			await ctx.step.run('send-email', async () => {
+				counts.send += 1
+				throw new Error('smtp down')
+			})
+		}
+	})
+
+	const stepWorker = createBetterWorker({
+		pgPool: pool,
+		queues: [stepQueue],
+		hooks: { createLogger: () => silentLogger }
+	})
+
+	beforeAll(async () => {
+		await stepWorker.migrate()
+	})
+
+	afterAll(async () => {
+		await stepWorker.stop()
+	})
+
+	test('persists completed steps and skips them on retry', async () => {
+		counts.fetch = 0
+		counts.send = 0
+
+		const jobId = await stepWorker.createJob('bgwStepQueue', { userId: 'u1' })
+		expect(jobId).toBeTruthy()
+
+		await stepWorker.runOnce()
+
+		const utils = await stepWorker.getWorkerUtils()
+		const stored = await utils.withPgClient(async (client) => {
+			const result = await client.query<{ payload: unknown }>(
+				`SELECT payload FROM ${DEFAULT_GRAPHILE_WORKER_SCHEMA}._private_jobs WHERE id = $1`,
+				[jobId]
+			)
+			return result.rows[0]?.payload
+		})
+
+		expect(stored).toMatchObject({
+			[BGW_ENVELOPE_KEY]: 1,
+			payload: { userId: 'u1' },
+			steps: { 'fetch-user': { output: { id: 'u1' } } }
+		})
+
+		const listed = await stepWorker.listJobs({ queue: 'bgwStepQueue' })
+		expect(listed[0]?.payload).toEqual({ userId: 'u1' })
+
+		await utils.rescheduleJobs([jobId!], { runAt: new Date() })
+		await stepWorker.runOnce()
+
+		expect(counts.fetch).toBe(1)
+		expect(counts.send).toBe(2)
+	})
+})

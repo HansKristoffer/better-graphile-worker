@@ -16,9 +16,12 @@ export const TRACEPARENT_KEY = 'traceparent' as const
 export const BGW_ENVELOPE_KEY = '__bgw' as const
 export const BGW_ENVELOPE_VERSION = 1 as const
 
+export type StepCache = Record<string, { output: unknown }>
+
 export type PayloadEnvelope = {
 	[BGW_ENVELOPE_KEY]: typeof BGW_ENVELOPE_VERSION
 	payload: unknown
+	steps?: StepCache
 	[TRACE_CONTEXT_KEY]?: JobTraceContext
 	[TRACEPARENT_KEY]?: string
 }
@@ -119,11 +122,72 @@ function linkFromPayload(
 export function extractCronMeta(
 	payload: unknown
 ): { ts: Date; backfilled?: boolean } | undefined {
-	if (!isPlainObject(payload)) return undefined
-	const cron = payload._cron
+	const source = isPayloadEnvelope(payload) ? payload.payload : payload
+	if (!isPlainObject(source)) return undefined
+	const cron = source._cron
 	if (!isPlainObject(cron) || typeof cron.ts !== 'string') return undefined
 	return {
 		ts: new Date(cron.ts),
 		backfilled: cron.backfilled === true ? true : undefined
+	}
+}
+
+export function extractStepCache(payload: unknown): StepCache {
+	if (!isPayloadEnvelope(payload) || !isPlainObject(payload.steps)) {
+		return {}
+	}
+
+	const cache: StepCache = {}
+	for (const [id, value] of Object.entries(payload.steps)) {
+		if (isPlainObject(value) && 'output' in value) {
+			cache[id] = { output: value.output }
+		}
+	}
+	return cache
+}
+
+export function withStepCache(
+	rawPayload: unknown,
+	steps: StepCache
+): PayloadEnvelope {
+	if (isPayloadEnvelope(rawPayload)) {
+		const envelope: PayloadEnvelope = {
+			[BGW_ENVELOPE_KEY]: BGW_ENVELOPE_VERSION,
+			payload: rawPayload.payload,
+			steps
+		}
+		if (rawPayload[TRACE_CONTEXT_KEY]) {
+			envelope[TRACE_CONTEXT_KEY] = rawPayload[TRACE_CONTEXT_KEY]
+		}
+		if (rawPayload[TRACEPARENT_KEY]) {
+			envelope[TRACEPARENT_KEY] = rawPayload[TRACEPARENT_KEY]
+		}
+		return envelope
+	}
+
+	if (isPlainObject(rawPayload)) {
+		const {
+			[TRACE_CONTEXT_KEY]: trace,
+			[TRACEPARENT_KEY]: traceparent,
+			...rest
+		} = rawPayload
+		const envelope: PayloadEnvelope = {
+			[BGW_ENVELOPE_KEY]: BGW_ENVELOPE_VERSION,
+			payload: rest,
+			steps
+		}
+		if (isPlainObject(trace) && typeof trace.traceId === 'string') {
+			envelope[TRACE_CONTEXT_KEY] = trace as JobTraceContext
+		}
+		if (typeof traceparent === 'string') {
+			envelope[TRACEPARENT_KEY] = traceparent
+		}
+		return envelope
+	}
+
+	return {
+		[BGW_ENVELOPE_KEY]: BGW_ENVELOPE_VERSION,
+		payload: rawPayload,
+		steps
 	}
 }

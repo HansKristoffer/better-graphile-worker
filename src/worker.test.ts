@@ -20,7 +20,10 @@ import {
 	getQueueType,
 	type QueueAny
 } from './create-queue'
-import { createBetterWorker } from './create-better-worker'
+import {
+	createBetterWorker,
+	DEFAULT_GRAPHILE_WORKER_SCHEMA
+} from './create-better-worker'
 import { createCompletedJobsStore } from './completed-jobs-store'
 import type { JobLogger } from './hooks'
 import { NonRetriableError } from './errors'
@@ -64,7 +67,8 @@ function testRuntime(): TaskListRuntime<typeof testQueues> {
 		createJobs: (async () => []) as TaskListRuntime<
 			typeof testQueues
 		>['createJobs'],
-		logger: silentLogger
+		logger: silentLogger,
+		schema: DEFAULT_GRAPHILE_WORKER_SCHEMA
 	}
 }
 
@@ -141,6 +145,17 @@ describe('extractProducerLink', () => {
 		expect(
 			(result.cleanPayload as Record<string, unknown>)[TRACE_CONTEXT_KEY]
 		).toBeUndefined()
+	})
+
+	test('unwraps an envelope that includes a step cache', () => {
+		const result = extractProducerLink({
+			[BGW_ENVELOPE_KEY]: 1,
+			payload: { userId: 'u1' },
+			steps: { 'fetch-user': { output: { id: 'u1' } } }
+		})
+
+		expect(result.cleanPayload).toEqual({ userId: 'u1' })
+		expect(result.link).toBeNull()
 	})
 
 	test('unwraps a non-object envelope payload', () => {

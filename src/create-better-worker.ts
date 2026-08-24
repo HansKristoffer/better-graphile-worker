@@ -148,7 +148,8 @@ export function createBetterWorker<TQueues extends readonly QueueAny[]>(
 		completedJobs,
 		createJob,
 		createJobs,
-		logger
+		logger,
+		schema
 	}
 
 	let runner: Runner | null = null

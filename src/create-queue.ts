@@ -2,6 +2,7 @@ import type { CronItemOptions, CronMatcher, JobHelpers } from 'graphile-worker'
 import type z from 'zod'
 import type { JobLogger, JobSpan } from './hooks'
 import type { JobOptions } from './job-options'
+import type { JobStep } from './steps'
 
 export type { JobLogger, JobSpan }
 
@@ -49,6 +50,7 @@ export type JobContext = {
 	createJob: CreateJobFnLike
 	createJobs: CreateJobsFnLike
 	cron?: JobCronMeta
+	step: JobStep
 }
 
 export type QueueContract<TName extends string = string> = {

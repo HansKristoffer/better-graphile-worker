@@ -34,4 +34,34 @@ describe('createTestHarness', () => {
 		const harness = createTestHarness([sendEmail, gather])
 		expect(await harness.init('gather')).toEqual([{ id: '1' }])
 	})
+
+	test('caches step.run results across process calls with the same jobId', async () => {
+		const counts = { fetch: 0, send: 0 }
+		const checkout = createQueue({
+			name: 'checkout',
+			inputSchema: z.object({ userId: z.string() }),
+			processFn: async (payload, ctx) => {
+				const user = await ctx.step.run('fetch-user', async () => {
+					counts.fetch += 1
+					return { id: payload.userId }
+				})
+				await ctx.step.run('send-email', async () => {
+					counts.send += 1
+					void user
+					throw new Error('smtp down')
+				})
+			}
+		})
+
+		const harness = createTestHarness([checkout])
+		await expect(
+			harness.process('checkout', { userId: 'u1' }, { jobId: 'job-1' })
+		).rejects.toThrow('smtp down')
+		await expect(
+			harness.process('checkout', { userId: 'u1' }, { jobId: 'job-1' })
+		).rejects.toThrow('smtp down')
+
+		expect(counts.fetch).toBe(1)
+		expect(counts.send).toBe(2)
+	})
 })

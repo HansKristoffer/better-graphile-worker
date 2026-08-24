@@ -8,6 +8,8 @@ import {
 import type { JobLogger, LogAttributes } from './hooks'
 import { createNoopSpan } from './otel'
 import type { QueueInput, QueueName } from './types'
+import { createStepRunner, type StepStore } from './steps'
+import type { StepCache } from './payload'
 
 export type CapturedLog = {
 	level: keyof JobLogger
@@ -99,28 +101,56 @@ function fakeHelpers(
 	} as unknown as JobHelpers
 }
 
+function createHarnessStepStore(
+	jobId: string,
+	caches: Map<string, StepCache>
+): StepStore {
+	if (!caches.has(jobId)) {
+		caches.set(jobId, {})
+	}
+	return {
+		get(id) {
+			return caches.get(jobId)?.[id]
+		},
+		async set(id, output) {
+			const cache = caches.get(jobId) ?? {}
+			cache[id] = { output }
+			caches.set(jobId, cache)
+		}
+	}
+}
+
 export function createTestHarness<const TQueues extends readonly QueueAny[]>(
 	queues: TQueues
 ): TestHarness<TQueues> {
 	const logs: CapturedLog[] = []
 	const logger = createCapturingLogger(logs)
+	const stepCaches = new Map<string, StepCache>()
 
 	function context(
 		queueName: string,
 		extras?: Partial<JobContext>
 	): JobContext {
+		const jobId = extras?.jobId ?? 'test-job'
+		const span = extras?.span ?? createNoopSpan()
 		return {
-			jobId: extras?.jobId ?? 'test-job',
+			jobId,
 			queue: extras?.queue ?? queueName,
 			attempt: extras?.attempt ?? 1,
 			maxAttempts: extras?.maxAttempts ?? 4,
 			logger: extras?.logger ?? logger,
-			span: extras?.span ?? createNoopSpan(),
+			span,
 			helpers: extras?.helpers ?? fakeHelpers(queueName, extras),
 			signal: extras?.signal ?? new AbortController().signal,
 			createJob: extras?.createJob ?? (async () => null),
 			createJobs: extras?.createJobs ?? (async () => []),
-			cron: extras?.cron
+			cron: extras?.cron,
+			step:
+				extras?.step ??
+				createStepRunner({
+					store: createHarnessStepStore(jobId, stepCaches),
+					span
+				})
 		}
 	}
 
