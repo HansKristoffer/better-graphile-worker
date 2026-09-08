@@ -1,6 +1,6 @@
 {
 	"name": "better-graphile-worker",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Typed Graphile Worker queues with Zod schemas, cron-init, and optional OpenTelemetry.",
 	"type": "module",
 	"license": "MIT",
@@ -56,9 +56,9 @@
 		"lint:write": "bun run typecheck && biome check --write",
 		"attw": "attw --pack . --profile esm-only",
 		"publint": "publint",
-    "publish:patch": "npm version patch && npm publish",
-    "publish:minor": "npm version minor && npm publish",
-    "publish:major": "npm version major && npm publish"
+		"publish:patch": "npm version patch && npm publish",
+		"publish:minor": "npm version minor && npm publish",
+		"publish:major": "npm version major && npm publish"
 	},
 	"peerDependencies": {
 		"@opentelemetry/api": "^1.9.0",
