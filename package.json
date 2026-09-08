@@ -7,9 +7,9 @@
 	"sideEffects": false,
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/kristofferhansen/better-graphile-worker.git"
+		"url": "git+https://github.com/HansKristoffer/better-graphile-worker.git"
 	},
-	"homepage": "https://github.com/kristofferhansen/better-graphile-worker",
+	"homepage": "https://github.com/HansKristoffer/better-graphile-worker",
 	"keywords": [
 		"graphile-worker",
 		"postgres",
@@ -55,7 +55,10 @@
 		"lint": "bun run typecheck && biome check",
 		"lint:write": "bun run typecheck && biome check --write",
 		"attw": "attw --pack . --profile esm-only",
-		"publint": "publint"
+		"publint": "publint",
+    "publish:patch": "npm version patch && npm publish",
+    "publish:minor": "npm version minor && npm publish",
+    "publish:major": "npm version major && npm publish"
 	},
 	"peerDependencies": {
 		"@opentelemetry/api": "^1.9.0",

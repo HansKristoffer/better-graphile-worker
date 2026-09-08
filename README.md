@@ -1,6 +1,6 @@
 # better-graphile-worker
 
-Typed Graphile Worker queues with Zod schemas, cron and cron-init patterns, and optional OpenTelemetry. Extracted from the wrapper used in production at [lullu](https://github.com/lullu-ai/lullu).
+Typed Graphile Worker queues with Zod schemas, cron and cron-init patterns, and optional OpenTelemetry.
 
 This package does **not** fork Graphile Worker. It sits on top of `graphile-worker@0.17` and gives you a typed `createQueue` / `createJob` / `createJobs` API plus an instance-based runner.
 
@@ -219,7 +219,3 @@ declare global {
 	}
 }
 ```
-
-## Lullu
-
-Lullu still uses its in-tree wrapper. When it switches over, it will depend on this package via `file:` and wire logger, PostHog, and seed-skip through hooks.
