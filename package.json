@@ -1,6 +1,6 @@
 {
 	"name": "better-graphile-worker",
-	"version": "1.0.1",
+	"version": "2.0.0",
 	"description": "Typed Graphile Worker queues with Zod schemas, cron-init, and optional OpenTelemetry.",
 	"type": "module",
 	"license": "MIT",
