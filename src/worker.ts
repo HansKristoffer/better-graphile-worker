@@ -1,3 +1,4 @@
+import { compact } from './options.js'
 import {
 	run,
 	runOnce,
@@ -10,27 +11,38 @@ import {
 	type JobHelpers
 } from 'graphile-worker'
 import type { Pool } from 'pg'
-import { ZodError } from 'zod'
 import {
 	type JobContext,
-	type QueueAny,
-	isCronInitQueue,
 	CRON_INIT_SUFFIX,
 	getQueueType,
-	formatCronSchedule
-} from './create-queue'
-import type { CompletedJobsStore } from './completed-jobs-store'
-import type { BetterWorkerHooks, JobLogger, JobSpan } from './hooks'
-import type { CreateJobFn, CreateJobsFn } from './types'
-import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job'
-import { NonRetriableError } from './errors'
-import { extractCronMeta, extractProducerLink } from './payload'
-import { otelStatusCodes, withActiveSpan } from './otel'
-import { createConsoleLogger } from './default-logger'
-import { createPgStepStore, createStepRunner } from './steps'
+	formatCronSchedule,
+	resolveSerialQueueName,
+	type QueueContract
+} from './queue.js'
+import type { NormalizedQueue } from './registry.js'
+import type { CompletedJobsStore } from './completed-jobs-store.js'
+import type { BetterWorkerHooks, JobLogger, JobSpan } from './hooks.js'
+import type { CreateJobFn, CreateJobsFn } from './types.js'
+import {
+	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+	parseQueuePayload,
+	resolveEnqueueSpec
+} from './create-job.js'
+import { NonRetriableError } from './errors.js'
+import {
+	extractCronMeta,
+	extractProducerLink,
+	isPayloadEnvelope,
+	assertPayloadEnvelope,
+	injectTraceContext
+} from './payload.js'
+import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
+import { jobLogger, observe } from './observers.js'
+import { retainPermanentFailure } from './private-jobs.js'
+import { createPgStepStore, createStepRunner } from './steps.js'
 
 export type TaskListRuntime<
-	TQueues extends readonly QueueAny[] = readonly QueueAny[]
+	TQueues extends readonly QueueContract[] = readonly QueueContract[]
 > = {
 	hooks: BetterWorkerHooks
 	completedJobs: CompletedJobsStore
@@ -38,21 +50,22 @@ export type TaskListRuntime<
 	createJobs: CreateJobsFn<TQueues>
 	logger: JobLogger
 	schema: string
+	otel?: OtelApi | null
+	permanentFailure?: 'discard' | 'retain' | undefined
 }
 
-export { extractProducerLink } from './payload'
+export { extractProducerLink } from './payload.js'
 
-function createJobContext<TQueues extends readonly QueueAny[]>(
+function createJobContext(
 	jobId: string,
 	queueName: string,
 	span: JobSpan,
 	helpers: JobHelpers,
 	hooks: BetterWorkerHooks,
-	runtime: TaskListRuntime<TQueues>,
+	runtime: TaskListRuntime,
 	cron: JobContext['cron'],
 	rawPayload: unknown
 ): JobContext {
-	const createLogger = hooks.createLogger ?? createConsoleLogger
 	return {
 		jobId,
 		queue: queueName,
@@ -61,10 +74,10 @@ function createJobContext<TQueues extends readonly QueueAny[]>(
 		span,
 		helpers,
 		signal: helpers.abortSignal,
-		createJob: runtime.createJob as JobContext['createJob'],
-		createJobs: runtime.createJobs as JobContext['createJobs'],
+		createJob: runtime.createJob,
+		createJobs: runtime.createJobs,
 		cron,
-		logger: createLogger({
+		logger: jobLogger(hooks, {
 			queue: queueName,
 			jobId,
 			attempt: helpers.job.attempts,
@@ -75,7 +88,9 @@ function createJobContext<TQueues extends readonly QueueAny[]>(
 				helpers,
 				schema: runtime.schema,
 				jobId,
-				rawPayload
+				rawPayload: isPayloadEnvelope(rawPayload)
+					? rawPayload
+					: injectTraceContext(undefined, null)
 			}),
 			span
 		})
@@ -95,7 +110,7 @@ type ExecuteTaskOptions = {
 }
 
 function isNonRetriable(error: unknown): boolean {
-	return error instanceof NonRetriableError || error instanceof ZodError
+	return error instanceof NonRetriableError
 }
 
 async function executeTask(options: ExecuteTaskOptions) {
@@ -110,14 +125,16 @@ async function executeTask(options: ExecuteTaskOptions) {
 	} = options
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
-	const { link, cleanPayload } = extractProducerLink(payload)
-	const cron = extractCronMeta(cleanPayload)
-	const statusCodes = otelStatusCodes()
+	const { link, cleanPayload } = isPayloadEnvelope(payload)
+		? extractProducerLink(payload)
+		: { link: null, cleanPayload: undefined }
+	const cron = extractCronMeta(payload)
+	const statusCodes = otelStatusCodes(runtime.otel)
 
 	await withActiveSpan(
 		'graphile-worker',
 		spanName,
-		{ kind: 'consumer', links: link ? [link] : undefined },
+		compact({ kind: 'consumer' as const, links: link ? [link] : undefined }),
 		async (span) => {
 			const startTime = Date.now()
 
@@ -151,9 +168,10 @@ async function executeTask(options: ExecuteTaskOptions) {
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
-			let swallowed = false
+			let permanent = false
 
 			try {
+				assertPayloadEnvelope(payload)
 				await executor(ctx, cleanPayload)
 
 				const durationMs = Date.now() - startTime
@@ -188,12 +206,12 @@ async function executeTask(options: ExecuteTaskOptions) {
 					'error.type': errorType
 				})
 
-				const permanentlyFailed =
+				permanent =
 					isNonRetriable(error) ||
 					helpers.job.attempts >= helpers.job.max_attempts
 
-				if (permanentlyFailed) {
-					runtime.hooks.onPermanentFailure?.({
+				if (permanent) {
+					await observe(runtime.hooks.onPermanentFailure, {
 						error,
 						queue: queueName,
 						jobId,
@@ -216,17 +234,18 @@ async function executeTask(options: ExecuteTaskOptions) {
 				}
 
 				if (isNonRetriable(error)) {
-					swallowed = true
+					if (runtime.permanentFailure !== 'discard') {
+						await retainPermanentFailure(helpers, runtime.schema)
+						throw error
+					}
 					return
 				}
 
 				throw error
 			} finally {
 				const durationMs = Date.now() - startTime
-				const permanentlyFailed =
-					status === 'failed' &&
-					(swallowed || helpers.job.attempts >= helpers.job.max_attempts)
-				runtime.hooks.onJobFinished?.({
+				const permanentlyFailed = status === 'failed' && permanent
+				await observe(runtime.hooks.onJobFinished, {
 					queue: queueName,
 					status,
 					durationMs,
@@ -250,19 +269,22 @@ async function executeTask(options: ExecuteTaskOptions) {
 					...(errorType ? { error_type: errorType } : {})
 				})
 			}
-		}
+		},
+		runtime.otel
 	)
 }
 
-export function buildTaskList<TQueues extends readonly QueueAny[]>(
-	queues: TQueues,
+export function buildTaskList<TQueues extends readonly QueueContract[]>(
+	queues: readonly NormalizedQueue[],
 	runtime: TaskListRuntime<TQueues>
 ): TaskList {
-	const taskList: TaskList = {}
+	const taskList: TaskList = Object.create(null)
+	const erasedRuntime = runtime as unknown as TaskListRuntime
 
 	for (const queue of queues) {
-		const q = queue as QueueAny
-		if (isCronInitQueue(q)) {
+		const q = queue
+		if (q.initFn) {
+			const initFn = q.initFn
 			const processingTaskName = q.name
 			const cronInitTaskName = `${q.name}${CRON_INIT_SUFFIX}`
 
@@ -273,16 +295,9 @@ export function buildTaskList<TQueues extends readonly QueueAny[]>(
 					payload,
 					operation: 'init',
 					extraAttributes: { 'graphile.target_queue': processingTaskName },
-					runtime,
+					runtime: erasedRuntime,
 					executor: async (ctx, _cleanPayload) => {
-						const items = await q.initFn(ctx)
-						const parsed = q.inputSchema.array().safeParse(items)
-						if (!parsed.success) {
-							throw new NonRetriableError(
-								`initFn for "${q.name}" returned invalid items`,
-								{ cause: parsed.error }
-							)
-						}
+						const items = await initFn(ctx)
 
 						ctx.logger.info('Init function returned items', {
 							count: items.length
@@ -290,9 +305,9 @@ export function buildTaskList<TQueues extends readonly QueueAny[]>(
 						ctx.span.setAttribute('graphile.init_items_count', items.length)
 
 						if (items.length > 0) {
-							const jobIds = await runtime.createJobs(
-								processingTaskName as never,
-								items as never,
+							const jobIds = await erasedRuntime.createJobs(
+								processingTaskName,
+								items,
 								{ validateOnEnqueue: true }
 							)
 							ctx.logger.info('Enqueued items for processing', {
@@ -308,9 +323,9 @@ export function buildTaskList<TQueues extends readonly QueueAny[]>(
 					helpers,
 					payload,
 					operation: 'process',
-					runtime,
+					runtime: erasedRuntime,
 					executor: async (ctx, cleanPayload) => {
-						const validatedPayload = q.inputSchema.parse(cleanPayload)
+						const validatedPayload = await parseQueuePayload(q, cleanPayload)
 						await q.processFn(validatedPayload, ctx)
 					}
 				})
@@ -321,10 +336,10 @@ export function buildTaskList<TQueues extends readonly QueueAny[]>(
 					helpers,
 					payload,
 					operation: 'process',
-					runtime,
+					runtime: erasedRuntime,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = q.inputSchema
-							? q.inputSchema.parse(cleanPayload)
+							? await parseQueuePayload(q, cleanPayload)
 							: undefined
 						await q.processFn(validatedPayload, ctx)
 					}
@@ -335,55 +350,64 @@ export function buildTaskList<TQueues extends readonly QueueAny[]>(
 	return taskList
 }
 
-function cronMatches(cron: QueueAny['cron']): Array<string | CronMatcher> {
+function cronMatches(cron: QueueContract['cron']): Array<string | CronMatcher> {
 	if (cron === undefined) return []
 	if (typeof cron === 'string' || typeof cron === 'function') return [cron]
 	return [...cron]
 }
 
-export function buildCronItems(queues: readonly QueueAny[]): CronItem[] {
+export function buildCronItems(
+	queues: readonly QueueContract[],
+	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
+): CronItem[] {
 	const cronItems: CronItem[] = []
 
 	for (const queue of queues) {
-		const q = queue as QueueAny
+		const q = queue
 		if (!q.cron) continue
 
-		const taskName = isCronInitQueue(q)
-			? `${q.name}${CRON_INIT_SUFFIX}`
-			: q.name
+		const taskName =
+			getQueueType(q) === 'cron-init' ? `${q.name}${CRON_INIT_SUFFIX}` : q.name
 		const matches = cronMatches(q.cron)
 		const options = q.cronOptions
+		resolveEnqueueSpec(q, undefined, defaultMaxAttempts, true)
 
 		for (const [index, match] of matches.entries()) {
 			const identifier =
-				options?.identifier ??
-				(matches.length > 1 ? `${taskName}:${index}` : taskName)
+				matches.length > 1
+					? `${options?.identifier ?? taskName}:${index}`
+					: (options?.identifier ?? taskName)
 
 			cronItems.push({
 				task: taskName,
 				match,
-				payload: {},
+				payload: injectTraceContext(undefined, null),
 				identifier,
-				options: {
+				options: compact({
 					maxAttempts:
-						options?.maxAttempts ??
-						q.maxAttempts ??
-						DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+						options?.maxAttempts ?? q.maxAttempts ?? defaultMaxAttempts,
 					backfillPeriod: options?.backfillPeriod,
-					queueName: options?.queueName,
-					priority: options?.priority,
+					queueName:
+						options?.queueName ?? resolveSerialQueueName(q.serial, q.name),
+					priority: options?.priority ?? q.priority,
 					jobKey: options?.jobKey,
 					jobKeyMode: options?.jobKeyMode
-				}
+				})
 			})
 		}
 	}
 
+	const identifiers = new Set<string>()
+	for (const item of cronItems) {
+		if (identifiers.has(item.identifier!))
+			throw new Error(`Duplicate cron identifier: ${item.identifier}`)
+		identifiers.add(item.identifier!)
+	}
 	return cronItems
 }
 
 export function logRegisteredQueues(
-	queues: readonly QueueAny[],
+	queues: readonly QueueContract[],
 	logger: JobLogger
 ): void {
 	if (queues.length === 0) {
@@ -393,7 +417,7 @@ export function logRegisteredQueues(
 
 	logger.info('Registered queues:')
 	for (const queue of queues) {
-		const q = queue as QueueAny
+		const q = queue
 		const type = getQueueType(q)
 		if (type === 'cron-init') {
 			logger.info(
@@ -419,6 +443,11 @@ export type GraphileRunnerOverrides = Omit<
 	| 'parsedCronItems'
 	| 'crontab'
 	| 'crontabFile'
+	| 'connectionString'
+	| 'taskDirectory'
+	| 'noHandleSignals'
+	| 'concurrency'
+	| 'pollInterval'
 >
 
 export async function startRunner(options: {
@@ -429,21 +458,23 @@ export async function startRunner(options: {
 	concurrency: number
 	pollInterval: number
 	noHandleSignals: boolean
-	graphile?: GraphileRunnerOverrides
+	graphile?: GraphileRunnerOverrides | undefined
 }): Promise<Runner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
 
-	return run({
-		...options.graphile,
-		pgPool: options.pgPool,
-		schema: options.schema,
-		taskList: options.taskList,
-		parsedCronItems,
-		noHandleSignals: options.noHandleSignals,
-		concurrency: options.concurrency,
-		pollInterval: options.pollInterval
-	})
+	return run(
+		compact({
+			...options.graphile,
+			pgPool: options.pgPool,
+			schema: options.schema,
+			taskList: options.taskList,
+			parsedCronItems,
+			noHandleSignals: options.noHandleSignals,
+			concurrency: options.concurrency,
+			pollInterval: options.pollInterval
+		})
+	)
 }
 
 export async function runOnceTasks(options: {
@@ -451,7 +482,7 @@ export async function runOnceTasks(options: {
 	schema: string
 	taskList: TaskList
 	noHandleSignals: boolean
-	graphile?: GraphileRunnerOverrides
+	graphile?: GraphileRunnerOverrides | undefined
 }): Promise<void> {
 	await runOnce({
 		...options.graphile,

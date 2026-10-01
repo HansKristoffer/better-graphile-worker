@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test'
-import { assertValidSchemaName } from './schema-name'
-import { InvalidSchemaNameError } from './errors'
+import { assertValidSchemaName } from './schema-name.js'
+import { InvalidSchemaNameError } from './errors.js'
 
 describe('assertValidSchemaName', () => {
 	test('accepts a simple identifier', () => {
@@ -15,4 +15,10 @@ describe('assertValidSchemaName', () => {
 			InvalidSchemaNameError
 		)
 	})
+})
+
+test('rejects schema names PostgreSQL would truncate', () => {
+	expect(() => assertValidSchemaName('a'.repeat(64))).toThrow(
+		InvalidSchemaNameError
+	)
 })

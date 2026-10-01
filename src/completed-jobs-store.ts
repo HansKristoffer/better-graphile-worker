@@ -1,3 +1,4 @@
+import { assertInteger } from './validation.js'
 export type CompletedJobStatus = 'completed' | 'failed'
 
 export type CompletedJob = {
@@ -29,6 +30,7 @@ export type CompletedJobsStore = {
 export function createCompletedJobsStore(
 	maxJobsPerQueue = DEFAULT_MAX_JOBS_PER_QUEUE
 ): CompletedJobsStore {
+	assertInteger(maxJobsPerQueue, 'maxPerQueue', 1)
 	const completedJobsMap = new Map<string, CompletedJob[]>()
 
 	return {
@@ -52,7 +54,7 @@ export function createCompletedJobsStore(
 			return allJobs
 		},
 		getStats() {
-			const stats: CompletedJobStats = {}
+			const stats: CompletedJobStats = Object.create(null)
 			for (const [queueName, jobs] of completedJobsMap.entries()) {
 				const completed = jobs.filter((j) => j.status === 'completed').length
 				const failed = jobs.filter((j) => j.status === 'failed').length

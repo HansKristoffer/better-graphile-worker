@@ -1,32 +1,24 @@
+import type { QueueHandlers } from './queue.js'
 import { describe, test, expect, expectTypeOf } from 'bun:test'
 import { z } from 'zod'
 import type { JobHelpers } from 'graphile-worker'
 import type { Pool } from 'pg'
 import {
-	extractProducerLink,
 	buildTaskList,
 	buildCronItems,
 	type TaskListRuntime
-} from './worker'
-import {
-	TRACE_CONTEXT_KEY,
-	TRACEPARENT_KEY,
-	BGW_ENVELOPE_KEY,
-	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
-} from './create-job'
-import {
-	createQueue,
-	CRON_INIT_SUFFIX,
-	getQueueType,
-	type QueueAny
-} from './create-queue'
+} from './worker.js'
+import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job.js'
+import { injectTraceContext, extractProducerLink } from './payload.js'
+import { normalizeWorkerQueues } from './registry.js'
+import { defineQueue, CRON_INIT_SUFFIX, getQueueType } from './queue.js'
 import {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA
-} from './create-better-worker'
-import { createCompletedJobsStore } from './completed-jobs-store'
-import type { JobLogger } from './hooks'
-import { NonRetriableError } from './errors'
+} from './create-better-worker.js'
+import { createCompletedJobsStore } from './completed-jobs-store.js'
+import type { JobLogger } from './hooks.js'
+import { NonRetriableError } from './errors.js'
 
 const silentLogger: JobLogger = {
 	debug() {},
@@ -35,27 +27,40 @@ const silentLogger: JobLogger = {
 	error() {}
 }
 
-const regularQueue = createQueue({
+const regularQueue = defineQueue({
 	name: 'testRegular',
-	inputSchema: z.object({ id: z.string() }),
-	processFn: async () => {}
+	inputSchema: z.object({ id: z.string() })
 })
+const regularQueueHandler: QueueHandlers<
+	readonly [typeof regularQueue]
+>['testRegular'] = async () => {}
 
-const cronQueue = createQueue({
+const cronQueue = defineQueue({
 	name: 'testCron',
-	cron: '0 * * * *',
-	processFn: async () => {}
+	cron: '0 * * * *'
 })
+const cronQueueHandler: QueueHandlers<readonly [typeof cronQueue]>['testCron'] =
+	async () => {}
 
-const cronInitQueue = createQueue({
+const cronInitQueue = defineQueue({
 	name: 'testCronInit',
 	cron: '0 * * * *',
-	inputSchema: z.object({ itemId: z.string() }),
+	inputSchema: z.object({ itemId: z.string() })
+})
+const cronInitQueueHandler: QueueHandlers<
+	readonly [typeof cronInitQueue]
+>['testCronInit'] = {
 	initFn: async () => [{ itemId: 'test' }],
 	processFn: async () => {}
-})
+}
 
 const testQueues = [regularQueue, cronQueue, cronInitQueue] as const
+const handlers: QueueHandlers<typeof testQueues> = {
+	testRegular: regularQueueHandler,
+	testCron: cronQueueHandler,
+	testCronInit: cronInitQueueHandler
+}
+const normalized = normalizeWorkerQueues(testQueues, handlers)
 
 function testRuntime(): TaskListRuntime<typeof testQueues> {
 	return {
@@ -72,139 +77,49 @@ function testRuntime(): TaskListRuntime<typeof testQueues> {
 	}
 }
 
-describe('extractProducerLink', () => {
-	test('returns null link for payload without trace context', () => {
-		const payload = { userId: 'test', action: 'test' }
-		const result = extractProducerLink(payload)
-
+describe('current payload protocol', () => {
+	test.each([
+		undefined,
+		null,
+		'text',
+		12,
+		['a'],
+		{ __trace: 'business', traceparent: 'business', steps: 'business' }
+	])('round-trips business values: %p', (value) => {
+		const result = extractProducerLink(injectTraceContext(value, null))
 		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toEqual({ userId: 'test', action: 'test' })
+		expect(result.cleanPayload).toEqual(value)
 	})
-
-	test('returns null link for null payload', () => {
-		const result = extractProducerLink(null)
-
-		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toBeNull()
+	test.each([
+		{},
+		null,
+		'raw',
+		{ __bgw: 1, payload: {} },
+		{ __bgw: 3, payload: {} },
+		{ __bgw: 2 },
+		{ __bgw: 2, payload: 'not null', payloadUndefined: true }
+	])('rejects unsupported payloads: %p', (value) => {
+		expect(() => extractProducerLink(value)).toThrow(NonRetriableError)
 	})
-
-	test('returns null link for non-object payload', () => {
-		const result = extractProducerLink('string payload')
-
-		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toBe('string payload')
-	})
-
-	test('returns null link for undefined trace context values', () => {
-		const payload = { userId: 'test', [TRACE_CONTEXT_KEY]: {} }
-		const result = extractProducerLink(payload)
-
-		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toEqual({ userId: 'test' })
-	})
-
-	test('returns null link for partial trace context (missing spanId)', () => {
-		const payload = {
-			userId: 'test',
-			[TRACE_CONTEXT_KEY]: { traceId: 'abc123' }
+	test('reads a valid W3C producer link, including unsampled flags', () => {
+		const envelope = {
+			...injectTraceContext({ id: '1' }, null),
+			traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-00`
 		}
-		const result = extractProducerLink(payload)
-
-		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toEqual({ userId: 'test' })
-	})
-
-	test('returns null link for partial trace context (missing traceId)', () => {
-		const payload = {
-			userId: 'test',
-			[TRACE_CONTEXT_KEY]: { spanId: 'def456' }
-		}
-		const result = extractProducerLink(payload)
-
-		expect(result.link).toBeNull()
-		expect(result.cleanPayload).toEqual({ userId: 'test' })
-	})
-
-	test('extracts valid trace context and returns link', () => {
-		const traceId = '0af7651916cd43dd8448eb211c80319c'
-		const spanId = 'b7ad6b7169203331'
-		const payload = {
-			userId: 'test',
-			action: 'process',
-			[TRACE_CONTEXT_KEY]: { traceId, spanId }
-		}
-
-		const result = extractProducerLink(payload)
-
-		expect(result.link).not.toBeNull()
-		expect(result.link?.context.traceId).toBe(traceId)
-		expect(result.link?.context.spanId).toBe(spanId)
-		expect(result.link?.context.traceFlags).toBe(1)
-		expect(result.link?.attributes).toEqual({ 'link.type': 'producer' })
-		expect(result.cleanPayload).toEqual({ userId: 'test', action: 'process' })
-		expect(
-			(result.cleanPayload as Record<string, unknown>)[TRACE_CONTEXT_KEY]
-		).toBeUndefined()
-	})
-
-	test('unwraps an envelope that includes a step cache', () => {
-		const result = extractProducerLink({
-			[BGW_ENVELOPE_KEY]: 1,
-			payload: { userId: 'u1' },
-			steps: { 'fetch-user': { output: { id: 'u1' } } }
+		expect(extractProducerLink(envelope).link?.context).toEqual({
+			traceId: 'a'.repeat(32),
+			spanId: 'b'.repeat(16),
+			traceFlags: 0
 		})
-
-		expect(result.cleanPayload).toEqual({ userId: 'u1' })
-		expect(result.link).toBeNull()
 	})
-
-	test('unwraps a non-object envelope payload', () => {
-		const result = extractProducerLink({
-			[BGW_ENVELOPE_KEY]: 1,
-			payload: 'hello',
-			[TRACE_CONTEXT_KEY]: {
-				traceId: '0af7651916cd43dd8448eb211c80319c',
-				spanId: 'b7ad6b7169203331'
-			}
-		})
-
-		expect(result.cleanPayload).toBe('hello')
-		expect(result.link?.context.traceId).toBe(
-			'0af7651916cd43dd8448eb211c80319c'
-		)
-	})
-
-	test('reads W3C traceparent from an object payload', () => {
-		const result = extractProducerLink({
-			userId: 'test',
-			[TRACEPARENT_KEY]:
-				'00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
-		})
-
-		expect(result.cleanPayload).toEqual({ userId: 'test' })
-		expect(result.link?.context.traceId).toBe(
-			'0af7651916cd43dd8448eb211c80319c'
-		)
-		expect(result.link?.context.spanId).toBe('b7ad6b7169203331')
-	})
-
-	test('preserves all other payload fields when extracting trace context', () => {
-		const payload = {
-			id: '123',
-			nested: { a: 1, b: { c: 2 } },
-			array: [1, 2, 3],
-			nullField: null,
-			[TRACE_CONTEXT_KEY]: { traceId: 'abc', spanId: 'def' }
-		}
-
-		const result = extractProducerLink(payload)
-
-		expect(result.cleanPayload).toEqual({
-			id: '123',
-			nested: { a: 1, b: { c: 2 } },
-			array: [1, 2, 3],
-			nullField: null
-		})
+	test.each([
+		'invalid',
+		`00-${'0'.repeat(32)}-${'b'.repeat(16)}-01`,
+		`00-${'a'.repeat(32)}-${'0'.repeat(16)}-01`
+	])('ignores invalid trace metadata: %s', (traceparent) => {
+		const envelope = { ...injectTraceContext({ id: '1' }, null), traceparent }
+		expect(extractProducerLink(envelope).link).toBeNull()
+		expect(extractProducerLink(envelope).cleanPayload).toEqual({ id: '1' })
 	})
 })
 
@@ -231,35 +146,35 @@ describe('getQueueType', () => {
 
 describe('buildTaskList', () => {
 	test('returns a TaskList object', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		expect(typeof taskList).toBe('object')
 		expect(taskList).not.toBeNull()
 	})
 
 	test('contains all registered regular queues', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		expect(taskList.testRegular).toBeDefined()
 		expect(typeof taskList.testRegular).toBe('function')
 	})
 
 	test('contains both init and process tasks for cron-init queues', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		expect(taskList.testCronInit).toBeDefined()
 		expect(taskList[`testCronInit${CRON_INIT_SUFFIX}`]).toBeDefined()
 	})
 
 	test('task functions are callable', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		for (const taskName of Object.keys(taskList)) {
 			expect(typeof taskList[taskName]).toBe('function')
 		}
 	})
 
 	test('number of tasks matches expected based on queue types', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		let expectedCount = 0
 		for (const queue of testQueues) {
-			if ('initFn' in queue && 'cron' in queue && 'inputSchema' in queue) {
+			if (getQueueType(queue) === 'cron-init') {
 				expectedCount += 2
 			} else {
 				expectedCount += 1
@@ -306,9 +221,13 @@ describe('buildCronItems', () => {
 		expect(matchingItem).toBeDefined()
 	})
 
-	test('cron items have empty payload', () => {
+	test('cron items use a versioned empty payload', () => {
 		for (const item of buildCronItems(testQueues)) {
-			expect(item.payload).toEqual({})
+			expect(item.payload).toEqual({
+				__bgw: 2,
+				payload: null,
+				payloadUndefined: true
+			})
 		}
 	})
 
@@ -316,7 +235,7 @@ describe('buildCronItems', () => {
 		for (const queue of testQueues) {
 			if (!('cron' in queue) || !queue.cron) continue
 			const taskName =
-				'initFn' in queue && 'inputSchema' in queue
+				getQueueType(queue) === 'cron-init'
 					? `${queue.name}${CRON_INIT_SUFFIX}`
 					: queue.name
 			const matchingItem = buildCronItems(testQueues).find(
@@ -330,10 +249,9 @@ describe('buildCronItems', () => {
 })
 
 describe('simple cron queue handling', () => {
-	const simpleCronQueue = createQueue({
+	const simpleCronQueue = defineQueue({
 		name: 'testSimpleCron',
-		cron: '*/5 * * * *',
-		processFn: async () => {}
+		cron: '*/5 * * * *'
 	})
 
 	test('getQueueType correctly identifies simple cron vs cron-init', () => {
@@ -342,7 +260,7 @@ describe('simple cron queue handling', () => {
 	})
 
 	test('simple cron queue creates only one task (no suffix)', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		expect(taskList.testCron).toBeDefined()
 		expect(taskList[`testCron${CRON_INIT_SUFFIX}`]).toBeUndefined()
 	})
@@ -353,6 +271,7 @@ describe('start / stop', () => {
 		const worker = createBetterWorker({
 			pgPool: {} as Pool,
 			queues: testQueues,
+			handlers,
 			hooks: { createLogger: () => silentLogger }
 		})
 		await expect(worker.stop()).resolves.toBeUndefined()
@@ -369,12 +288,12 @@ describe('type exports', () => {
 	})
 
 	test('buildTaskList returns TaskList compatible type', () => {
-		const taskList = buildTaskList(testQueues, testRuntime())
+		const taskList = buildTaskList(normalized, testRuntime())
 		expectTypeOf(taskList).toMatchTypeOf<Record<string, unknown>>()
 	})
 
 	test('buildCronItems returns array of CronItem compatible objects', () => {
-		const cronItems = buildCronItems(testQueues as readonly QueueAny[])
+		const cronItems = buildCronItems(testQueues)
 		expectTypeOf(cronItems).toBeArray()
 		for (const item of cronItems) {
 			expectTypeOf(item.task).toMatchTypeOf<string>()
@@ -387,38 +306,46 @@ function fakeJobHelpers(): JobHelpers {
 	return {
 		job: {
 			id: '1',
+			locked_by: 'test-worker',
 			attempts: 1,
 			max_attempts: 4,
 			task_identifier: 'testRegular',
 			created_at: new Date()
 		},
+		withPgClient: async (fn: (client: unknown) => Promise<unknown>) =>
+			fn({ query: async () => ({ rowCount: 1 }) }),
 		abortSignal: new AbortController().signal
 	} as unknown as JobHelpers
 }
 
 describe('non-retriable failures', () => {
-	test('invalid payload is swallowed as a permanent failure', async () => {
+	test('invalid input is retained as a permanent failure', async () => {
 		let permanent = 0
 		const runtime = testRuntime()
 		runtime.hooks.onPermanentFailure = () => {
 			permanent += 1
 		}
-		const taskList = buildTaskList(testQueues, runtime)
+		const taskList = buildTaskList(normalized, runtime)
 		await expect(
-			taskList.testRegular?.({ not: 'valid' }, fakeJobHelpers())
-		).resolves.toBeUndefined()
+			taskList.testRegular?.(
+				injectTraceContext({ not: 'valid' }, null),
+				fakeJobHelpers()
+			)
+		).rejects.toBeInstanceOf(NonRetriableError)
 		expect(permanent).toBe(1)
 		expect(runtime.completedJobs.getStats().testRegular?.failed).toBe(1)
 	})
 
-	test('NonRetriableError from processFn is swallowed', async () => {
-		const failing = createQueue({
+	test('NonRetriableError is retained by default', async () => {
+		const failing = defineQueue({
 			name: 'failOnce',
-			inputSchema: z.object({ id: z.string() }),
-			processFn: async () => {
+			inputSchema: z.object({ id: z.string() })
+		})
+		const failingHandler: QueueHandlers<readonly [typeof failing]>['failOnce'] =
+			async () => {
 				throw new NonRetriableError('nope')
 			}
-		})
+
 		const queues = [failing] as const
 		const runtime: TaskListRuntime<typeof queues> = {
 			...testRuntime(),
@@ -429,9 +356,53 @@ describe('non-retriable failures', () => {
 				typeof queues
 			>['createJobs']
 		}
-		const taskList = buildTaskList(queues, runtime)
+		const taskList = buildTaskList(
+			normalizeWorkerQueues(queues, { failOnce: failingHandler }),
+			runtime
+		)
 		await expect(
-			taskList.failOnce?.({ id: '1' }, fakeJobHelpers())
+			taskList.failOnce?.(
+				injectTraceContext({ id: '1' }, null),
+				fakeJobHelpers()
+			)
+		).rejects.toBeInstanceOf(NonRetriableError)
+	})
+})
+
+describe('explicit failure policy', () => {
+	test('unsupported payloads are permanent failures and do not invoke handlers', async () => {
+		let calls = 0
+		const queues = [
+			defineQueue({ name: 'strict', inputSchema: z.string() })
+		] as const
+		const normalized = normalizeWorkerQueues(queues, {
+			strict: () => {
+				calls++
+			}
+		})
+		const runtime = testRuntime()
+		let permanent = 0
+		runtime.hooks.onPermanentFailure = () => {
+			permanent++
+		}
+		const tasks = buildTaskList(normalized, runtime)
+		for (const payload of ['raw', { __bgw: 1, payload: 'old' }]) {
+			await expect(tasks.strict!(payload, fakeJobHelpers())).rejects.toThrow(
+				'version-2 envelope'
+			)
+		}
+		expect(calls).toBe(0)
+		expect(permanent).toBe(2)
+	})
+	test('discard remains an explicit choice for permanent failures', async () => {
+		const runtime = testRuntime()
+		runtime.permanentFailure = 'discard'
+		const tasks = buildTaskList(normalized, runtime)
+		await expect(
+			tasks.testRegular!(
+				injectTraceContext({ not: 'valid' }, null),
+				fakeJobHelpers()
+			)
 		).resolves.toBeUndefined()
 	})
 })

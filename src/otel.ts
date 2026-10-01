@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module'
-import type { JobSpan } from './hooks'
+import type { JobSpan } from './hooks.js'
 
 type OtelSpan = {
 	setAttribute(key: string, value: string | number | boolean): unknown
@@ -39,7 +39,7 @@ export type OtelApi = {
 		getTracer(name: string): {
 			startActiveSpan<T>(
 				name: string,
-				options: { kind?: number; links?: OtelLink[] },
+				options: { kind?: number; links?: OtelLink[] | undefined },
 				fn: (span: OtelSpan) => Promise<T>
 			): Promise<T>
 		}
@@ -74,16 +74,9 @@ export type OtelApi = {
 	}
 }
 
-let injected: OtelApi | null | undefined
 let cached: OtelApi | null | undefined
 
-export function setOtelApi(api: OtelApi | null): void {
-	injected = api
-	cached = api
-}
-
 export function getOtel(): OtelApi | null {
-	if (injected !== undefined) return injected
 	if (cached !== undefined) return cached
 	try {
 		const require = createRequire(import.meta.url)
@@ -108,25 +101,23 @@ export function createNoopSpan(): JobSpan {
 }
 
 export function wrapOtelSpan(span: OtelSpan): JobSpan {
-	return {
-		setAttribute(key, value) {
-			span.setAttribute(key, value)
-		},
-		setAttributes(attributes) {
-			span.setAttributes(attributes)
-		},
-		setStatus(status) {
-			span.setStatus(status)
-		},
-		addEvent(name, attributes) {
-			span.addEvent?.(name, compactSpanEventAttributes(attributes))
-		},
-		recordException(error) {
-			span.recordException(error)
-		},
-		end() {
-			span.end()
+	function safe(fn: () => unknown) {
+		try {
+			const result = fn()
+			if (result && typeof (result as PromiseLike<unknown>).then === 'function')
+				void Promise.resolve(result).catch(() => {})
+		} catch {
+			/* Observational tracing must not change job outcomes. */
 		}
+	}
+	return {
+		setAttribute: (key, value) => safe(() => span.setAttribute(key, value)),
+		setAttributes: (attributes) => safe(() => span.setAttributes(attributes)),
+		setStatus: (status) => safe(() => span.setStatus(status)),
+		addEvent: (name, attributes) =>
+			safe(() => span.addEvent?.(name, compactSpanEventAttributes(attributes))),
+		recordException: (error) => safe(() => span.recordException(error)),
+		end: () => safe(() => span.end())
 	}
 }
 
@@ -145,9 +136,10 @@ export async function withActiveSpan<T>(
 	tracerName: string,
 	spanName: string,
 	options: { kind: SpanKindName; links?: ProducerLink[] },
-	fn: (span: JobSpan) => Promise<T>
+	fn: (span: JobSpan) => Promise<T>,
+	api: OtelApi | null = getOtel()
 ): Promise<T> {
-	const otel = getOtel()
+	const otel = api
 	if (!otel) {
 		const span = createNoopSpan()
 		try {
@@ -157,54 +149,65 @@ export async function withActiveSpan<T>(
 		}
 	}
 
-	const kind =
-		options.kind === 'consumer'
-			? otel.SpanKind.CONSUMER
-			: options.kind === 'producer'
-				? otel.SpanKind.PRODUCER
-				: otel.SpanKind.INTERNAL
-
-	return otel.trace.getTracer(tracerName).startActiveSpan(
-		spanName,
-		{
-			kind,
-			links: options.links
-		},
-		async (otelSpan) => {
-			const span = wrapOtelSpan(otelSpan)
-			try {
-				return await fn(span)
-			} finally {
-				span.end()
+	let execution: Promise<T> | undefined
+	try {
+		return await otel.trace.getTracer(tracerName).startActiveSpan(
+			spanName,
+			{
+				kind:
+					options.kind === 'consumer'
+						? otel.SpanKind.CONSUMER
+						: options.kind === 'producer'
+							? otel.SpanKind.PRODUCER
+							: otel.SpanKind.INTERNAL,
+				links: options.links
+			},
+			async (rawSpan) => {
+				const span = wrapOtelSpan(rawSpan)
+				execution ??= Promise.resolve()
+					.then(() => fn(span))
+					.finally(() => span.end())
+				return execution
 			}
-		}
-	)
+		)
+	} catch {
+		// Never invoke a handler again if an adapter throws after it started.
+		if (execution) return execution
+		return fn(createNoopSpan())
+	}
 }
 
-export function getActiveTraceContext(): {
+export function getActiveTraceContext(api: OtelApi | null = getOtel()): {
 	traceId: string
 	spanId: string
+	traceFlags: number
 } | null {
-	const otel = getOtel()
+	const otel = api
 	if (!otel) return null
 	const span = otel.trace.getActiveSpan()
 	if (!span) return null
 	const ctx = span.spanContext()
 	if (!otel.isSpanContextValid(ctx)) return null
-	return { traceId: ctx.traceId, spanId: ctx.spanId }
+	return {
+		traceId: ctx.traceId,
+		spanId: ctx.spanId,
+		traceFlags: ctx.traceFlags
+	}
 }
 
-export function getActiveTraceparent(): string | null {
-	const otel = getOtel()
+export function getActiveTraceparent(
+	api: OtelApi | null = getOtel()
+): string | null {
+	const otel = api
 	if (otel?.propagation && otel.context) {
 		const carrier: Record<string, string> = {}
 		otel.propagation.inject(otel.context.active(), carrier)
 		if (carrier.traceparent) return carrier.traceparent
 	}
 
-	const ctx = getActiveTraceContext()
+	const ctx = getActiveTraceContext(api)
 	if (!ctx) return null
-	return formatTraceparent(ctx.traceId, ctx.spanId, OTEL_SAMPLED)
+	return formatTraceparent(ctx.traceId, ctx.spanId, ctx.traceFlags)
 }
 
 export function formatTraceparent(
@@ -221,20 +224,27 @@ export function parseTraceparent(traceparent: string): {
 	spanId: string
 	traceFlags: number
 } | null {
-	const parts = traceparent.split('-')
-	if (parts.length !== 4 || parts[0] !== '00') return null
-	const [, traceId, spanId, flags] = parts
-	if (!traceId || !spanId || !flags) return null
-	if (traceId.length !== 32 || spanId.length !== 16) return null
-	const traceFlags = Number.parseInt(flags, 16)
-	if (Number.isNaN(traceFlags)) return null
-	return { traceId, spanId, traceFlags }
+	if (!/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(traceparent))
+		return null
+	const [, traceId, spanId, flags] = traceparent.split('-')
+	if (
+		!traceId ||
+		!spanId ||
+		!flags ||
+		/^0+$/.test(traceId) ||
+		/^0+$/.test(spanId)
+	)
+		return null
+	return { traceId, spanId, traceFlags: Number.parseInt(flags, 16) }
 }
 
-export function otelStatusCodes() {
-	const otel = getOtel()
-	return {
-		OK: otel?.SpanStatusCode.OK ?? 1,
-		ERROR: otel?.SpanStatusCode.ERROR ?? 2
+export function otelStatusCodes(api: OtelApi | null = getOtel()) {
+	try {
+		return {
+			OK: api?.SpanStatusCode.OK ?? 1,
+			ERROR: api?.SpanStatusCode.ERROR ?? 2
+		}
+	} catch {
+		return { OK: 1, ERROR: 2 }
 	}
 }

@@ -1,18 +1,16 @@
 import { describe, test, expect } from 'bun:test'
 import { z } from 'zod'
-import { createQueue } from './create-queue'
-import { getQueueDefinitions, mergeJobStats } from './admin'
+import { defineQueue } from './queue.js'
+import { getQueueDefinitions, mergeJobStats } from './admin.js'
 
-const sendEmail = createQueue({
+const sendEmail = defineQueue({
 	name: 'sendEmail',
-	inputSchema: z.object({ to: z.string() }),
-	processFn: async () => {}
+	inputSchema: z.object({ to: z.string() })
 })
 
-const dailySweep = createQueue({
+const dailySweep = defineQueue({
 	name: 'dailySweep',
-	cron: '0 3 * * *',
-	processFn: async () => {}
+	cron: '0 3 * * *'
 })
 
 describe('getQueueDefinitions', () => {
@@ -38,15 +36,17 @@ describe('mergeJobStats', () => {
 				taskIdentifier: 'sendEmail',
 				pending: 2,
 				running: 1,
-				completed: 4,
-				failed: 1
+				recentCompleted: 4,
+				failed: 9,
+				recentFailed: 1
 			},
 			{
 				taskIdentifier: 'dailySweep',
 				pending: 0,
 				running: 0,
-				completed: 0,
-				failed: 0
+				recentCompleted: 0,
+				failed: 0,
+				recentFailed: 0
 			}
 		])
 	})
@@ -58,7 +58,7 @@ describe('mergeJobStats', () => {
 			['sendEmail']
 		)
 		expect(stats[0]?.failed).toBe(3)
-		expect(stats[0]?.completed).toBe(0)
+		expect(stats[0]?.recentCompleted).toBe(0)
 	})
 
 	test('includes ring-only task identifiers', () => {
@@ -72,8 +72,9 @@ describe('mergeJobStats', () => {
 				taskIdentifier: 'leftover',
 				pending: 0,
 				running: 0,
-				completed: 2,
-				failed: 1
+				recentCompleted: 2,
+				failed: 0,
+				recentFailed: 1
 			}
 		])
 	})

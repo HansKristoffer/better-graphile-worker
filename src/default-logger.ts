@@ -1,4 +1,4 @@
-import type { CreateLoggerOptions, JobLogger, LogAttributes } from './hooks'
+import type { CreateLoggerOptions, JobLogger, LogAttributes } from './hooks.js'
 
 function formatAttributes(attributes?: LogAttributes): string {
 	if (!attributes || Object.keys(attributes).length === 0) return ''

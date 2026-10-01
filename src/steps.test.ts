@@ -5,23 +5,22 @@ import {
 	createPgStepStore,
 	createStepRunner,
 	serializeStepOutput
-} from './steps'
+} from './steps.js'
 import {
-	BGW_ENVELOPE_KEY,
-	TRACE_CONTEXT_KEY,
-	TRACEPARENT_KEY,
+	injectTraceContext,
 	extractCronMeta,
 	extractProducerLink,
-	extractStepCache,
-	withStepCache
-} from './payload'
-import { createNoopSpan } from './otel'
-import { NonRetriableError, StepSerializationError } from './errors'
-import type { JobSpan } from './hooks'
+	extractStepCache
+} from './payload.js'
+import { createNoopSpan } from './otel.js'
+import { NonRetriableError, StepSerializationError } from './errors.js'
+import type { JobSpan } from './hooks.js'
 
 function recordingSpan() {
-	const events: Array<{ name: string; attributes?: Record<string, unknown> }> =
-		[]
+	const events: Array<{
+		name: string
+		attributes?: Record<string, unknown> | undefined
+	}> = []
 	const span: JobSpan = {
 		...createNoopSpan(),
 		addEvent(name, attributes) {
@@ -32,8 +31,8 @@ function recordingSpan() {
 }
 
 describe('serializeStepOutput', () => {
-	test('stores undefined as null', () => {
-		expect(serializeStepOutput('void', undefined)).toBeNull()
+	test('preserves void', () => {
+		expect(serializeStepOutput('void', undefined)).toBeUndefined()
 	})
 
 	test('round-trips JSON-safe values', () => {
@@ -41,9 +40,11 @@ describe('serializeStepOutput', () => {
 		expect(serializeStepOutput('obj', { id: 'u1' })).toEqual({ id: 'u1' })
 	})
 
-	test('turns Date into an ISO string', () => {
+	test('rejects Date without an explicit codec', () => {
 		const date = new Date('2020-01-02T03:04:05.000Z')
-		expect(serializeStepOutput('when', date)).toBe(date.toISOString())
+		expect(() => serializeStepOutput('when', date)).toThrow(
+			StepSerializationError
+		)
 	})
 
 	test('throws StepSerializationError for non-JSON values', () => {
@@ -78,13 +79,13 @@ describe('createStepRunner', () => {
 		])
 	})
 
-	test('stores undefined results as null', async () => {
+	test('restores void on fresh and cached execution', async () => {
 		const step = createStepRunner({
 			store: createMemoryStepStore(),
 			span: createNoopSpan()
 		})
-		expect(await step.run('noop', async () => undefined)).toBeNull()
-		expect(await step.run('noop', async () => 'again')).toBeNull()
+		expect(await step.run('noop', async () => undefined)).toBeUndefined()
+		expect(await step.run('noop', async () => undefined)).toBeUndefined()
 	})
 
 	test('rejects an empty step id', async () => {
@@ -114,103 +115,70 @@ describe('createStepRunner', () => {
 	})
 })
 
-describe('payload step envelope', () => {
-	test('wraps a flat payload and keeps _cron plus trace fields', () => {
-		const wrapped = withStepCache(
-			{
-				userId: 'u1',
-				_cron: { ts: '2020-01-01T00:00:00.000Z', backfilled: true },
-				[TRACE_CONTEXT_KEY]: {
-					traceId: '0af7651916cd43dd8448eb211c80319c',
-					spanId: 'b7ad6b7169203331'
-				},
-				[TRACEPARENT_KEY]:
-					'00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
-			},
-			{ 'fetch-user': { output: { id: 'u1' } } }
-		)
-
-		expect(wrapped).toMatchObject({
-			[BGW_ENVELOPE_KEY]: 1,
-			payload: {
-				userId: 'u1',
-				_cron: { ts: '2020-01-01T00:00:00.000Z', backfilled: true }
-			},
-			steps: { 'fetch-user': { output: { id: 'u1' } } },
-			[TRACE_CONTEXT_KEY]: {
-				traceId: '0af7651916cd43dd8448eb211c80319c',
-				spanId: 'b7ad6b7169203331'
-			}
-		})
+describe('payload metadata', () => {
+	test('keeps cron metadata and checkpoints outside the business payload', () => {
+		const wrapped = {
+			...injectTraceContext({ userId: 'u1', _cron: { ts: 'business' } }, null),
+			_cron: { ts: '2020-01-01T00:00:00.000Z', backfilled: true },
+			steps: { 'fetch-user': { output: { id: 'u1' } } }
+		}
 		expect(extractCronMeta(wrapped)).toEqual({
 			ts: new Date('2020-01-01T00:00:00.000Z'),
 			backfilled: true
 		})
 		expect(extractProducerLink(wrapped).cleanPayload).toEqual({
 			userId: 'u1',
-			_cron: { ts: '2020-01-01T00:00:00.000Z', backfilled: true }
+			_cron: { ts: 'business' }
 		})
 		expect(extractStepCache(wrapped)).toEqual({
 			'fetch-user': { output: { id: 'u1' } }
 		})
 	})
-
-	test('extractCronMeta reads _cron from clean payloads', () => {
+	test('does not interpret business _cron fields as scheduler metadata', () => {
 		expect(
-			extractCronMeta({
-				_cron: { ts: '2021-02-03T04:05:06.000Z' }
-			})
-		).toEqual({ ts: new Date('2021-02-03T04:05:06.000Z') })
-	})
-
-	test('wraps a non-object payload', () => {
-		const wrapped = withStepCache('hello', { a: { output: 1 } })
-		expect(wrapped.payload).toBe('hello')
-		expect(extractProducerLink(wrapped).cleanPayload).toBe('hello')
+			extractCronMeta(
+				injectTraceContext({ _cron: { ts: '2021-02-03T04:05:06.000Z' } }, null)
+			)
+		).toBeUndefined()
 	})
 })
 
 describe('createPgStepStore', () => {
-	test('writes an envelope with steps onto the job payload', async () => {
-		let updated: unknown
+	test('sends only the new checkpoint and verifies the lock owner', async () => {
+		let params: unknown[] = []
 		const helpers = {
-			withPgClient: async (
-				fn: (client: {
-					query: (sql: string, params: unknown[]) => Promise<unknown>
-				}) => Promise<unknown>
-			) =>
+			job: { locked_by: 'worker-1' },
+			withPgClient: async (fn: (client: unknown) => Promise<unknown>) =>
 				fn({
-					query: async (_sql, params) => {
-						updated = JSON.parse(String(params[1]))
-						return { rows: [] }
+					query: async (_sql: string, values: unknown[]) => {
+						params = values
+						return { rows: [], rowCount: 1 }
 					}
 				})
 		} as unknown as JobHelpers
-
 		const store = createPgStepStore({
 			helpers,
 			schema: 'graphile_worker',
 			jobId: '1',
-			rawPayload: {
-				userId: 'u1',
-				_cron: { ts: '2020-01-01T00:00:00.000Z' },
-				[TRACE_CONTEXT_KEY]: { traceId: 'abc', spanId: 'def' }
-			}
+			rawPayload: injectTraceContext({ userId: 'u1' }, null)
 		})
-
 		await store.set('fetch-user', { id: 'u1' })
-
-		expect(updated).toMatchObject({
-			[BGW_ENVELOPE_KEY]: 1,
-			payload: {
-				userId: 'u1',
-				_cron: { ts: '2020-01-01T00:00:00.000Z' }
-			},
-			steps: { 'fetch-user': { output: { id: 'u1' } } }
-		})
-		expect(extractCronMeta(updated)).toEqual({
-			ts: new Date('2020-01-01T00:00:00.000Z')
-		})
+		expect(params).toEqual([
+			'1',
+			'fetch-user',
+			JSON.stringify({ output: { id: 'u1' } }),
+			'worker-1'
+		])
 		expect(store.get('fetch-user')).toEqual({ output: { id: 'u1' } })
+	})
+	test('rejects old payloads instead of converting them during a checkpoint', () => {
+		expect(() =>
+			createPgStepStore({
+				helpers: {} as JobHelpers,
+				schema: 'graphile_worker',
+				jobId: '1',
+				rawPayload: { userId: 'u1' }
+			})
+		).toThrow(NonRetriableError)
 	})
 })

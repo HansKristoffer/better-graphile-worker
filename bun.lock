@@ -20,8 +20,8 @@
       "peerDependencies": {
         "@opentelemetry/api": "^1.9.0",
         "graphile-worker": "^0.17.3",
-        "pg": ">=8",
-        "zod": ">=4",
+        "pg": "^8.16.0",
+        "zod": "^4.0.0",
       },
       "optionalPeers": [
         "@opentelemetry/api",

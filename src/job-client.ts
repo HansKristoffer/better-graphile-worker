@@ -1,14 +1,15 @@
+import { compact } from './options.js'
 import type { Pool } from 'pg'
 import type { WorkerUtils } from 'graphile-worker'
-import type { QueueAny } from './create-queue'
-import type { BetterWorkerHooks } from './hooks'
-import { bindCreateJob, createJobsApi } from './create-job'
-import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client'
-import { assertUniqueQueueNames } from './define-queues'
-import { setOtelApi, type OtelApi } from './otel'
-import type { CreateJobFn, CreateJobsFn, JobsApi } from './types'
+import type { QueueContract } from './queue.js'
+import type { BetterWorkerHooks } from './hooks.js'
+import { bindCreateJob, createJobsApi } from './create-job.js'
+import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
+import { assertUniqueQueueNames } from './define-queues.js'
+import { getOtel, type OtelApi } from './otel.js'
+import type { CreateJobFn, CreateJobsFn, JobsApi } from './types.js'
 
-export type JobClientOptions<TQueues extends readonly QueueAny[]> = {
+export type JobClientOptions<TQueues extends readonly QueueContract[]> = {
 	pgPool: Pool
 	queues: TQueues
 	schema?: string
@@ -18,7 +19,7 @@ export type JobClientOptions<TQueues extends readonly QueueAny[]> = {
 	otel?: { api: OtelApi | null }
 }
 
-export type JobClient<TQueues extends readonly QueueAny[]> = {
+export type JobClient<TQueues extends readonly QueueContract[]> = {
 	readonly schema: string
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
@@ -29,13 +30,10 @@ export type JobClient<TQueues extends readonly QueueAny[]> = {
 	getWorkerUtils(): Promise<WorkerUtils>
 }
 
-export function createJobClient<TQueues extends readonly QueueAny[]>(
+export function createJobClient<const TQueues extends readonly QueueContract[]>(
 	options: JobClientOptions<TQueues>
 ): JobClient<TQueues> {
 	assertUniqueQueueNames(options.queues)
-	if (options.otel) {
-		setOtelApi(options.otel.api)
-	}
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const client = createWorkerClient({
@@ -43,11 +41,14 @@ export function createJobClient<TQueues extends readonly QueueAny[]>(
 		schema
 	})
 	const { createJob, createJobs } = bindCreateJob<TQueues>({
-		getWorkerUtils: () => client.getUtils(),
+		enqueue: client.enqueue,
+		otel: options.otel ? options.otel.api : getOtel(),
 		queues: options.queues,
-		hooks: options.hooks,
-		validateOnEnqueue: options.validateOnEnqueue,
-		defaultMaxAttempts: options.defaultMaxAttempts
+		...compact({
+			hooks: options.hooks,
+			validateOnEnqueue: options.validateOnEnqueue,
+			defaultMaxAttempts: options.defaultMaxAttempts
+		})
 	})
 
 	return {
@@ -55,7 +56,7 @@ export function createJobClient<TQueues extends readonly QueueAny[]>(
 		queues: options.queues,
 		createJob,
 		createJobs,
-		jobs: createJobsApi(createJob),
+		jobs: createJobsApi(createJob, options.queues),
 		migrate() {
 			return client.migrate()
 		},

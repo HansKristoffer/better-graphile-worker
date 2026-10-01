@@ -1,23 +1,23 @@
-import type { CronItem, Runner, TaskList, WorkerUtils } from 'graphile-worker'
+import { compact } from './options.js'
+import type { CronItem, TaskList, WorkerUtils } from 'graphile-worker'
 import type { Pool } from 'pg'
 import {
 	CRON_INIT_SUFFIX,
-	isCronInitQueue,
-	isCronQueue,
-	type QueueAny
-} from './create-queue'
-import type { BetterWorkerHooks, JobLogger } from './hooks'
-import type { CompletedJob, CompletedJobStats } from './completed-jobs-store'
-import {
-	bindCreateJob,
-	createJobsApi,
-	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
-} from './create-job'
-import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client'
+	getQueueType,
+	type QueueContract,
+	type HandlerFreeQueueContract,
+	type InlineQueues,
+	type RunnableQueue,
+	type QueueHandlers
+} from './queue.js'
+import type { BetterWorkerHooks, JobLogger } from './hooks.js'
+import type { CompletedJob, CompletedJobStats } from './completed-jobs-store.js'
+import { bindCreateJob, createJobsApi } from './create-job.js'
+import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import {
 	createCompletedJobsStore,
 	createNoopCompletedJobsStore
-} from './completed-jobs-store'
+} from './completed-jobs-store.js'
 import {
 	getQueueDefinitions,
 	mergeJobStats,
@@ -27,7 +27,7 @@ import {
 	type ListJobsOptions,
 	type QueueDefinition,
 	type WorkerJobStatsRow
-} from './admin'
+} from './admin.js'
 import {
 	buildCronItems,
 	buildTaskList,
@@ -37,22 +37,25 @@ import {
 	runOnceTasks,
 	startRunner,
 	type GraphileRunnerOverrides
-} from './worker'
-import { createConsoleLogger } from './default-logger'
-import { createNoopSpan, setOtelApi, type OtelApi } from './otel'
-import { assertUniqueQueueNames } from './define-queues'
+} from './worker.js'
+import { jobLogger } from './observers.js'
+import { createLifecycle } from './lifecycle.js'
+import { normalizeWorkerQueues } from './registry.js'
+import { assertInteger } from './validation.js'
+import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
+import { assertUniqueQueueNames } from './define-queues.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
 	CronQueueName,
 	JobsApi,
 	QueueName
-} from './types'
-import type { JobOptions, StopOptions } from './job-options'
+} from './types.js'
+import type { JobOptions, StopOptions } from './job-options.js'
 
 export type CompletedJobsOption = false | { maxPerQueue?: number }
 
-export type BetterWorkerOptions<TQueues extends readonly QueueAny[]> = {
+type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	pgPool: Pool
 	queues: TQueues
 	schema?: string
@@ -63,11 +66,22 @@ export type BetterWorkerOptions<TQueues extends readonly QueueAny[]> = {
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
 	completedJobs?: CompletedJobsOption
-	graphile?: GraphileRunnerOverrides
+	graphile?: GraphileRunnerOverrides | undefined
 	otel?: { api: OtelApi | null }
+	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
+	permanentFailure?: 'discard' | 'retain' | undefined
 }
 
-export type BetterWorker<TQueues extends readonly QueueAny[]> = {
+export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
+	BaseWorkerOptions<TQueues> &
+		(TQueues extends readonly RunnableQueue[]
+			? { queues: TQueues & NoInfer<InlineQueues<TQueues>>; handlers?: never }
+			: {
+					queues: TQueues & readonly HandlerFreeQueueContract[]
+					handlers: NoInfer<QueueHandlers<TQueues>>
+				})
+
+export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly schema: string
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
@@ -96,15 +110,7 @@ export type BetterWorker<TQueues extends readonly QueueAny[]> = {
 }
 
 function createStartupLogger(hooks?: BetterWorkerHooks): JobLogger {
-	if (hooks?.createLogger) {
-		return hooks.createLogger({
-			queue: 'worker',
-			jobId: 'startup',
-			attempt: 0,
-			span: createNoopSpan()
-		})
-	}
-	return createConsoleLogger({
+	return jobLogger(hooks ?? {}, {
 		queue: 'worker',
 		jobId: 'startup',
 		attempt: 0,
@@ -119,13 +125,19 @@ function resolveCompletedJobsStore(option: CompletedJobsOption | undefined) {
 	return createCompletedJobsStore(option.maxPerQueue)
 }
 
-export function createBetterWorker<TQueues extends readonly QueueAny[]>(
-	options: BetterWorkerOptions<TQueues>
-): BetterWorker<TQueues> {
+export function createBetterWorker<
+	const TQueues extends readonly QueueContract[]
+>(options: BetterWorkerOptions<TQueues>): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
-	if (options.otel) {
-		setOtelApi(options.otel.api)
-	}
+	const queues = normalizeWorkerQueues(options.queues, options.handlers)
+	const otel = options.otel ? options.otel.api : getOtel()
+	assertInteger(options.concurrency ?? DEFAULT_CONCURRENCY, 'concurrency', 1)
+	assertInteger(
+		options.pollInterval ?? DEFAULT_POLL_INTERVAL,
+		'pollInterval',
+		1,
+		2147483647
+	)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const hooks = options.hooks ?? {}
@@ -134,60 +146,50 @@ export function createBetterWorker<TQueues extends readonly QueueAny[]>(
 		schema
 	})
 	const completedJobs = resolveCompletedJobsStore(options.completedJobs)
-	const { createJob, createJobs } = bindCreateJob<TQueues>({
-		getWorkerUtils: () => client.getUtils(),
+	const producer = bindCreateJob<TQueues>({
+		enqueue: client.enqueue,
+		otel,
 		queues: options.queues,
-		hooks,
-		validateOnEnqueue: options.validateOnEnqueue,
-		defaultMaxAttempts: options.defaultMaxAttempts
+		...compact({
+			hooks,
+			validateOnEnqueue: options.validateOnEnqueue,
+			defaultMaxAttempts: options.defaultMaxAttempts
+		})
 	})
-	const jobs = createJobsApi(createJob)
+	const { createJob, createJobs } = producer
+	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
 	const runtime = {
 		hooks,
 		completedJobs,
-		createJob,
-		createJobs,
+		createJob: producer.enqueueOne,
+		createJobs: producer.enqueueMany,
 		logger,
-		schema
+		schema,
+		otel,
+		permanentFailure: options.permanentFailure
 	}
 
-	let runner: Runner | null = null
-	let signalHandlers: (() => void) | null = null
-
-	function installSignalHandlers(stop: () => Promise<void>) {
-		const onSignal = () => {
-			void stop()
-		}
-		process.on('SIGINT', onSignal)
-		process.on('SIGTERM', onSignal)
-		signalHandlers = () => {
-			process.off('SIGINT', onSignal)
-			process.off('SIGTERM', onSignal)
-		}
-	}
-
-	async function stop(stopOptions?: StopOptions): Promise<void> {
-		if (signalHandlers) {
-			signalHandlers()
-			signalHandlers = null
-		}
-		if (runner) {
-			const stopPromise = runner.stop()
-			if (stopOptions?.timeout !== undefined) {
-				await Promise.race([
-					stopPromise,
-					new Promise<void>((resolve) => {
-						setTimeout(resolve, stopOptions.timeout)
-					})
-				])
-			} else {
-				await stopPromise
-			}
-			runner = null
-		}
-		await client.release()
-	}
+	const lifecycle = createLifecycle({
+		start: async () => {
+			logger.info('Starting graphile-worker')
+			logRegisteredQueues(queues, logger)
+			return startRunner({
+				pgPool: options.pgPool,
+				schema,
+				taskList: buildTaskList(queues, runtime),
+				cronItems: buildCronItems(queues, options.defaultMaxAttempts),
+				concurrency: options.concurrency ?? DEFAULT_CONCURRENCY,
+				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
+				noHandleSignals: true,
+				graphile: options.graphile
+			})
+		},
+		release: () => client.release(),
+		onError: (error) =>
+			logger.error('worker.lifecycle.failed', { error: String(error) }),
+		handleSignals: options.handleSignals
+	})
 
 	return {
 		schema,
@@ -196,88 +198,32 @@ export function createBetterWorker<TQueues extends readonly QueueAny[]>(
 		createJobs,
 		jobs,
 		get promise() {
-			return runner ? runner.promise : Promise.resolve()
+			return lifecycle.promise
 		},
-		async migrate() {
-			await client.migrate()
-		},
-		async start() {
-			if (runner) {
-				throw new Error('Worker is already running')
-			}
-			logger.info('Starting graphile-worker')
-			const taskList = buildTaskList(options.queues, runtime)
-			const cronItems = buildCronItems(options.queues)
-			logRegisteredQueues(options.queues, logger)
+		migrate: () => client.migrate(),
+		start: () => lifecycle.start(),
+		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
+		waitUntilStopped: () => lifecycle.waitUntilStopped(),
+		runOnce: () =>
+			lifecycle.runOnce(() =>
+				runOnceTasks({
+					pgPool: options.pgPool,
+					schema,
+					taskList: buildTaskList(queues, runtime),
+					noHandleSignals: true,
+					graphile: options.graphile
+				})
+			),
+		triggerCron: (name, opts) => producer.triggerCron(name, opts),
 
-			if (options.handleSignals) {
-				installSignalHandlers(() => stop())
-			}
-
-			runner = await startRunner({
-				pgPool: options.pgPool,
-				schema,
-				taskList,
-				cronItems,
-				concurrency: options.concurrency ?? DEFAULT_CONCURRENCY,
-				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
-				noHandleSignals: true,
-				graphile: options.graphile
-			})
-		},
-		stop,
-		async waitUntilStopped() {
-			if (runner) {
-				await runner.promise
-			}
-		},
-		async runOnce() {
-			await runOnceTasks({
-				pgPool: options.pgPool,
-				schema,
-				taskList: buildTaskList(options.queues, runtime),
-				noHandleSignals: true,
-				graphile: options.graphile
-			})
-		},
-		async triggerCron(queueName, jobOptions) {
-			const queue = options.queues.find((item) => item.name === queueName)
-			if (!queue || (!isCronQueue(queue) && !isCronInitQueue(queue))) {
-				throw new Error(`"${String(queueName)}" is not a cron queue`)
-			}
-			const taskName = isCronInitQueue(queue)
-				? `${queue.name}${CRON_INIT_SUFFIX}`
-				: queue.name
-			if (hooks.shouldSkipEnqueue?.()) {
-				return null
-			}
-			const workerUtils = await client.getUtils()
-			const job = await workerUtils.addJob(
-				taskName,
-				{},
-				{
-					maxAttempts:
-						jobOptions?.maxAttempts ??
-						queue.maxAttempts ??
-						options.defaultMaxAttempts ??
-						DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
-					priority: jobOptions?.priority ?? queue.priority,
-					flags: jobOptions?.flags ?? queue.flags,
-					runAt: jobOptions?.runAt,
-					jobKey: jobOptions?.jobKey,
-					jobKeyMode: jobOptions?.jobKeyMode
-				}
-			)
-			return String(job.id)
-		},
 		getWorkerUtils() {
 			return client.getUtils()
 		},
 		buildTaskList() {
-			return buildTaskList(options.queues, runtime)
+			return buildTaskList(queues, runtime)
 		},
 		buildCronItems() {
-			return buildCronItems(options.queues)
+			return buildCronItems(queues, options.defaultMaxAttempts)
 		},
 		getCompletedJobs() {
 			return completedJobs.getAll()
@@ -286,34 +232,27 @@ export function createBetterWorker<TQueues extends readonly QueueAny[]>(
 			return completedJobs.getStats()
 		},
 		async getJobStats() {
-			const utils = await client.getUtils()
+			const utils = client
 			const rows = await queryJobCounts(utils, schema)
 			const taskIdentifiers = options.queues.flatMap((queue) =>
-				isCronInitQueue(queue)
+				getQueueType(queue) === 'cron-init'
 					? [queue.name, `${queue.name}${CRON_INIT_SUFFIX}`]
 					: [queue.name]
 			)
 			return mergeJobStats(rows, completedJobs.getStats(), taskIdentifiers)
 		},
 		async listJobs(listOptions) {
-			const utils = await client.getUtils()
+			const utils = client
 			return queryRecentJobs(utils, schema, listOptions)
 		},
-		async retryJobs(ids) {
-			const utils = await client.getUtils()
-			const jobs = await utils.rescheduleJobs(ids, {
-				attempts: 0,
-				runAt: new Date()
-			})
-			return jobs.map((job) => String(job.id))
-		},
+		retryJobs: (ids) => client.retryJobs(ids),
 		async failJobs(ids, reason) {
 			const utils = await client.getUtils()
 			const jobs = await utils.permanentlyFailJobs(ids, reason)
 			return jobs.map((job) => String(job.id))
 		},
 		getQueueDefinitions() {
-			return getQueueDefinitions(options.queues)
+			return getQueueDefinitions(options.queues, options.defaultMaxAttempts)
 		}
 	}
 }
@@ -324,5 +263,5 @@ export {
 	DEFAULT_POLL_INTERVAL
 }
 
-export type EnqueueableQueueName<TQueues extends readonly QueueAny[]> =
+export type EnqueueableQueueName<TQueues extends readonly QueueContract[]> =
 	QueueName<TQueues>
