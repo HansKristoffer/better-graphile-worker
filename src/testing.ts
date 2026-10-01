@@ -1,41 +1,81 @@
 import type { JobHelpers } from 'graphile-worker'
 import {
-	hasInputSchema,
-	isCronInitQueue,
 	type JobContext,
-	type QueueAny
-} from './create-queue'
-import type { JobLogger, LogAttributes } from './hooks'
-import { createNoopSpan } from './otel'
-import type { QueueInput, QueueName } from './types'
-import { createStepRunner, type StepStore } from './steps'
-import type { StepCache } from './payload'
+	type QueueContract,
+	type HandlerFreeQueueContract,
+	type InlineQueues,
+	type RunnableQueue,
+	type QueueHandlers,
+	CRON_INIT_SUFFIX
+} from './queue.js'
+import type { JobLogger, LogAttributes } from './hooks.js'
+import { createNoopSpan } from './otel.js'
+import type {
+	QueueInput,
+	QueueName,
+	CronInitQueueName,
+	InferInput
+} from './types.js'
+import {
+	createStepRunner,
+	createMemoryStepStore,
+	type StepStore
+} from './steps.js'
+import { extractProducerLink } from './payload.js'
+import { bindCreateJob, parseQueuePayload } from './create-job.js'
+import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
+import type { JobOptions } from './job-options.js'
 
 export type CapturedLog = {
 	level: keyof JobLogger
 	message: string
-	attributes?: LogAttributes
+	attributes?: LogAttributes | undefined
 }
 
-export type TestHarness<TQueues extends readonly QueueAny[]> = {
+export type CapturedEnqueue<
+	T extends readonly QueueContract[] = readonly QueueContract[]
+> = T[number] extends infer Q
+	? Q extends QueueContract
+		? {
+				id: string
+				queue: Q['name']
+				payload: InferInput<Q>
+				options?: JobOptions | undefined
+			}
+		: never
+	: never
+
+type ProcessArgs<T extends readonly QueueContract[]> = T[number] extends infer Q
+	? Q extends QueueContract
+		? [
+				queueName: Q['name'],
+				payload: InferInput<Q>,
+				extras?: Partial<JobContext<T, Q['name']>>
+			]
+		: never
+	: never
+
+export type TestHarness<T extends readonly QueueContract[]> = {
 	logs: CapturedLog[]
+	enqueued: CapturedEnqueue<T>[]
 	clearLogs(): void
-	process<T extends QueueName<TQueues>>(
-		queueName: T,
-		payload: QueueInput<T, TQueues>,
-		extras?: Partial<JobContext>
-	): Promise<{ ctx: JobContext; logs: CapturedLog[] }>
-	init<T extends QueueName<TQueues>>(
-		queueName: T,
-		extras?: Partial<JobContext>
-	): Promise<unknown[]>
-	context(queueName: string, extras?: Partial<JobContext>): JobContext
+	process<const Args extends ProcessArgs<T>>(
+		...args: Args
+	): Promise<{ ctx: JobContext<T, Args[0]>; logs: CapturedLog[] }>
+	init<N extends CronInitQueueName<T>>(
+		queueName: N,
+		extras?: Partial<JobContext<T, `${NoInfer<N>}_cron-init`>>
+	): Promise<readonly QueueInput<N, T>[]>
+	context<const N extends QueueName<T>>(
+		queueName: N,
+		extras?: Partial<JobContext<T, NoInfer<N>>>
+	): JobContext<T, N>
 }
 
 function createCapturingLogger(logs: CapturedLog[]): JobLogger {
 	const write =
 		(level: keyof JobLogger) =>
-		(message: string, attributes?: LogAttributes) => {
+		(message: string, attributes?: LogAttributes | undefined) => {
 			logs.push({ level, message, attributes })
 		}
 	return {
@@ -101,38 +141,62 @@ function fakeHelpers(
 	} as unknown as JobHelpers
 }
 
-function createHarnessStepStore(
-	jobId: string,
-	caches: Map<string, StepCache>
-): StepStore {
-	if (!caches.has(jobId)) {
-		caches.set(jobId, {})
-	}
-	return {
-		get(id) {
-			return caches.get(jobId)?.[id]
-		},
-		async set(id, output) {
-			const cache = caches.get(jobId) ?? {}
-			cache[id] = { output }
-			caches.set(jobId, cache)
-		}
-	}
-}
-
-export function createTestHarness<const TQueues extends readonly QueueAny[]>(
-	queues: TQueues
-): TestHarness<TQueues> {
+export function createTestHarness<
+	const TQueues extends readonly RunnableQueue[]
+>(queues: TQueues & NoInfer<InlineQueues<TQueues>>): TestHarness<TQueues>
+export function createTestHarness<
+	const TQueues extends readonly QueueContract[]
+>(
+	contracts: TQueues & readonly HandlerFreeQueueContract[],
+	handlers: NoInfer<QueueHandlers<TQueues>>
+): TestHarness<TQueues>
+export function createTestHarness<
+	const TQueues extends readonly QueueContract[]
+>(contracts: TQueues, handlers?: QueueHandlers<TQueues>): TestHarness<TQueues> {
+	const queues = normalizeWorkerQueues(contracts, handlers)
 	const logs: CapturedLog[] = []
 	const logger = createCapturingLogger(logs)
-	const stepCaches = new Map<string, StepCache>()
+	const stepCaches = new Map<string, StepStore>()
+	let invocation = 0
+	const enqueued: CapturedEnqueue[] = []
+	const producer = bindCreateJob({
+		queues: contracts,
+		otel: null,
+		enqueue: {
+			async addJob(queue, payload, options) {
+				const id = `child-${enqueued.length + 1}`
+				enqueued.push({
+					id,
+					queue,
+					payload: extractProducerLink(payload).cleanPayload,
+					options
+				})
+				return { ...fakeHelpers(queue).job, id }
+			},
+			async addJobs(specs) {
+				const result = []
+				for (const spec of specs)
+					result.push(await this.addJob(spec.identifier, spec.payload, spec))
+				return result
+			}
+		}
+	})
 
 	function context(
 		queueName: string,
 		extras?: Partial<JobContext>
 	): JobContext {
-		const jobId = extras?.jobId ?? 'test-job'
+		const jobId = extras?.jobId ?? `test-job-${++invocation}`
+		const cacheId = JSON.stringify([queueName, jobId])
+		if (!stepCaches.has(cacheId))
+			stepCaches.set(cacheId, createMemoryStepStore())
 		const span = extras?.span ?? createNoopSpan()
+		const signal =
+			extras?.signal ??
+			extras?.helpers?.abortSignal ??
+			new AbortController().signal
+		const helpers =
+			extras?.helpers ?? fakeHelpers(queueName, { ...extras, jobId, signal })
 		return {
 			jobId,
 			queue: extras?.queue ?? queueName,
@@ -140,21 +204,21 @@ export function createTestHarness<const TQueues extends readonly QueueAny[]>(
 			maxAttempts: extras?.maxAttempts ?? 4,
 			logger: extras?.logger ?? logger,
 			span,
-			helpers: extras?.helpers ?? fakeHelpers(queueName, extras),
-			signal: extras?.signal ?? new AbortController().signal,
-			createJob: extras?.createJob ?? (async () => null),
-			createJobs: extras?.createJobs ?? (async () => []),
+			helpers,
+			signal,
+			createJob: extras?.createJob ?? producer.enqueueOne,
+			createJobs: extras?.createJobs ?? producer.enqueueMany,
 			cron: extras?.cron,
 			step:
 				extras?.step ??
 				createStepRunner({
-					store: createHarnessStepStore(jobId, stepCaches),
+					store: stepCaches.get(cacheId)!,
 					span
 				})
 		}
 	}
 
-	function getQueue(queueName: string): QueueAny {
+	function getQueue(queueName: string): NormalizedQueue {
 		const queue = queues.find((item) => item.name === queueName)
 		if (!queue) {
 			throw new Error(`Unknown queue "${queueName}"`)
@@ -162,27 +226,33 @@ export function createTestHarness<const TQueues extends readonly QueueAny[]>(
 		return queue
 	}
 
-	return {
+	const harness = {
 		logs,
+		enqueued,
 		clearLogs() {
 			logs.length = 0
 		},
-		async process(queueName, payload, extras) {
+		async process(
+			queueName: string,
+			payload: unknown,
+			extras?: Partial<JobContext>
+		) {
 			const queue = getQueue(String(queueName))
 			const ctx = context(String(queueName), extras)
-			const parsed = hasInputSchema(queue)
-				? queue.inputSchema.parse(payload)
-				: undefined
+			const parsed = await parseQueuePayload(queue, payload)
 			await queue.processFn(parsed, ctx)
 			return { ctx, logs: [...logs] }
 		},
-		async init(queueName, extras) {
+		async init(queueName: string, extras?: Partial<JobContext>) {
 			const queue = getQueue(String(queueName))
-			if (!isCronInitQueue(queue)) {
+			if (!queue.initFn) {
 				throw new Error(`Queue "${String(queueName)}" is not a cron-init queue`)
 			}
-			return queue.initFn(context(String(queueName), extras))
+			return queue.initFn(
+				context(`${String(queueName)}${CRON_INIT_SUFFIX}`, extras)
+			)
 		},
 		context
 	}
+	return harness as unknown as TestHarness<TQueues>
 }

@@ -1,221 +1,257 @@
 # better-graphile-worker
 
-Typed Graphile Worker queues with Zod schemas, cron and cron-init patterns, and optional OpenTelemetry.
-
-This package does **not** fork Graphile Worker. It sits on top of `graphile-worker@0.17` and gives you a typed `createQueue` / `createJob` / `createJobs` API plus an instance-based runner.
+Typed Graphile Worker queues with Zod schemas, cron and cron-init, durable step checkpoints, and optional OpenTelemetry. You own the PostgreSQL pool.
 
 ## Install
 
-```bash
+```sh
 bun add better-graphile-worker graphile-worker pg zod
 ```
 
-`@opentelemetry/api` is an optional peer. Install it if you want producer/consumer span linking; otherwise tracing is a no-op.
+ESM, Node 20+, TypeScript 5.7+, Graphile Worker 0.17.3–0.17.x, pg 8.16+ (8.x) and Zod 4.x. CI exercises Node 20/22/24/26, minimum/latest peers, NodeNext and bundler resolution. `@opentelemetry/api@^1.9` is optional; tracing is a no-op when absent. The minimum pg version is exercised against native Node and PostgreSQL.
 
-## Usage
+## Define queues and handlers together
+
+Keep each schema, its options and its handler in one `defineQueue` call. Payloads infer from schema output; enqueue inputs infer from schema input. No handler registry or type annotations are required.
 
 ```ts
-import {
-	createQueue,
-	defineQueues,
-	createBetterWorker
-} from 'better-graphile-worker'
-import { Pool } from 'pg'
+import pg from 'pg'
+import { defineQueue, defineQueues, createBetterWorker } from 'better-graphile-worker'
 import { z } from 'zod'
 
-const sendEmail = createQueue({
-	name: 'sendEmail',
-	inputSchema: z.object({ to: z.string().email() }),
-	maxAttempts: 5,
-	processFn: async (payload, ctx) => {
-		ctx.logger.info('sending', { to: payload.to })
-	}
+const countCharacters = defineQueue({
+  name: 'countCharacters',
+  inputSchema: z.string().transform(value => value.length),
+  processFn: (length, ctx) => {
+    ctx.logger.info('counted', { length }) // length: number
+  }
 })
 
-const dailySweep = createQueue({
-	name: 'dailySweep',
-	cron: '0 3 * * *',
-	processFn: async (_payload, ctx) => {
-		ctx.logger.info('running daily sweep')
-	}
+const sendEmail = defineQueue({
+  name: 'sendEmail',
+  inputSchema: z.object({ to: z.string().email() }),
+  maxAttempts: 5,
+  processFn: async (payload, ctx) => {
+    ctx.logger.info('sending', { to: payload.to })
+    await ctx.createJob(countCharacters, payload.to)
+    // The target queue reference checks producer input: string, not number.
+  }
 })
 
-const syncOrders = createQueue({
-	name: 'syncOrders',
-	cron: '0 * * * *',
-	inputSchema: z.object({ orderId: z.string() }),
-	initFn: async () => [{ orderId: '1' }],
-	processFn: async (payload, ctx) => {
-		ctx.logger.info('syncing order', { orderId: payload.orderId })
-	}
+const dailySweep = defineQueue({
+  name: 'dailySweep',
+  cron: '0 3 * * *',
+  serial: true,
+  processFn: (_payload, ctx) => {
+    ctx.logger.info('sweeping') // payload: undefined
+  }
 })
 
-const queues = defineQueues([sendEmail, dailySweep, syncOrders])
-
-const pgPool = new Pool({ connectionString: process.env.DATABASE_URL })
-
-const worker = createBetterWorker({
-	pgPool,
-	queues,
-	schema: 'graphile_worker',
-	concurrency: 10,
-	pollInterval: 250,
-	completedJobs: { maxPerQueue: 50 },
-	hooks: {
-		createLogger: ({ queue, jobId }) => console,
-		onJobFinished: ({ queue, status, durationMs }) => {
-			void queue
-			void status
-			void durationMs
-		},
-		onPermanentFailure: ({ error, queue, jobId }) => {
-			void error
-			void queue
-			void jobId
-		},
-		onEnqueueFail: ({ queue, error }) => {
-			void queue
-			void error
-		},
-		shouldSkipEnqueue: () => process.env.SEEDING === '1'
-	}
+const syncOrders = defineQueue({
+  name: 'syncOrders',
+  cron: '0 * * * *',
+  inputSchema: z.object({ orderId: z.string() }),
+  initFn: () => [{ orderId: '1' }] as const,
+  processFn: (payload, ctx) => {
+    ctx.logger.info('syncing', { orderId: payload.orderId })
+  }
 })
+
+const queues = defineQueues([sendEmail, countCharacters, dailySweep, syncOrders])
+const pgPool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
+const worker = createBetterWorker({ pgPool, queues })
 
 await worker.migrate()
-await worker.createJob('sendEmail', { to: 'a@b.com' })
-await worker.createJobs('sendEmail', [{ to: 'b@c.com' }, { to: 'c@d.com' }])
-await worker.jobs.sendEmail({ to: 'd@e.com' })
+await worker.jobs.sendEmail({ to: 'person@example.com' })
+await worker.createJobs('countCharacters', ['hello', 'world'] as const)
 await worker.start()
 ```
 
-You own the `pg.Pool`. The package does not construct or close it.
+Inside inline handlers, `ctx.createJob(queue, input)` and `ctx.createJobs(queue, inputs)` take queue definitions. This checks payloads without circular registry inference, including mutually referring queues. Pass the same definition object that was registered; an unregistered reference is rejected before enqueue. Worker/client methods continue to use typed names, such as `worker.createJob('sendEmail', input)`. If a reference can select several queues, its input type must fit every possible target; narrow the reference by `name` when payload types differ.
 
-`createJob` / `createJobs` are bound to the instance, so queue names and payloads are inferred from the `queues` array you passed in. Job IDs are plain `string`. `createJob` returns `null` (and `createJobs` returns `[]`) when `shouldSkipEnqueue` is true.
+`defineQueues` preserves the tuple and checks literal names for duplicates, empty names, reserved `then`, and collisions with generated cron-init tasks. Dynamic names and arrays are validated at runtime too. Process handlers and initializers can be synchronous or asynchronous; initializer results can be readonly arrays. Definitions expose readonly names, schemas, options and handlers. Create a new definition when changing configuration.
 
-### Producer vs worker process
+### Shared producer contracts
 
-API servers should enqueue without loading handlers. Pass the same queue objects (or a `QueueContract[]` with `name` + `inputSchema`) to `createJobClient`:
+When an API server needs definitions without importing worker implementations, omit handlers in a shared module and supply them when constructing the worker. This is optional; use one registration style per worker.
 
 ```ts
+// contracts.ts
+export const queues = defineQueues([
+  defineQueue({ name: 'sendEmail', inputSchema: z.object({ to: z.string() }) }),
+  defineQueue({ name: 'countCharacters', inputSchema: z.string().transform(value => value.length) })
+])
+
+// worker.ts
+const worker = createBetterWorker({
+  pgPool,
+  queues,
+  handlers: {
+    sendEmail: async (payload, ctx) => {
+      await ctx.createJob('countCharacters', payload.to)
+    },
+    countCharacters: (length, ctx) => {
+      ctx.logger.info('counted', { length })
+    }
+  }
+})
+
+// api.ts
 import { createJobClient } from 'better-graphile-worker/client'
+import { queues } from './contracts.js'
 
-const jobs = createJobClient({ pgPool, queues })
-await jobs.migrate()
-await jobs.createJob('sendEmail', { to: 'a@b.com' })
+const producer = createJobClient({ pgPool, queues })
+await producer.jobs.countCharacters('hello')
+await producer.release()
 ```
 
-Call `migrate()` explicitly. `createJob` no longer runs Graphile migrations as a side effect.
+Separate handlers infer context enqueue methods from the complete registry and use queue names. Use `satisfies QueueHandlers<typeof queues>` for a reusable handler registry. Handler-free contracts require a handler registry on workers and harnesses. Inline definitions cannot also supply a registry.
 
-## Queue types
+Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. Concurrent utility requests share one initialization. Release/stop never close your pool.
 
-| Kind | Config | Tasks |
-| --- | --- | --- |
-| Regular | `inputSchema` + `processFn` | One task named after the queue |
-| Cron | `cron` + `processFn` (no payload) | One scheduled task. Trigger manually with `createJob('dailySweep')` or `worker.triggerCron('dailySweep')` |
-| Cron-init | `cron` + `inputSchema` + `initFn` + `processFn` | `{name}_cron-init` gathers items; `{name}` processes each. `triggerCron` fires the init task |
+`isRegularQueue`, `isCronQueue`, `isCronInitQueue` and `hasInputSchema` preserve literal names, concrete schemas and any inline handlers while narrowing variants. Contract guards do not invent handler functions; worker construction checks the required functions.
 
-A "queue" here is a Graphile **task identifier**, not Graphile's serialization `queueName`. Use `serial: true` (or a custom string) when jobs for a task must run one at a time.
+## Queues, defaults and batching
 
-`cron` accepts a crontab string, an array of strings, or a Graphile `CronMatcher`. Extra cron fields (`backfillPeriod`, `identifier`, `priority`, `jobKey`) go on `cronOptions`. Cron uses the **database clock** unless you set `graphile: { useNodeTime: true }`.
+| Kind | Contract | Handler | Manual trigger |
+| --- | --- | --- | --- |
+| Regular | `inputSchema` | Function or `{ processFn }` | `createJob(name, input)` |
+| Cron | `cron`, no schema | Function or `{ processFn }` | `createJob(name)` or `triggerCron(name)` |
+| Cron-init | `cron` and `inputSchema` | `{ initFn, processFn }` | `triggerCron(name)` runs `{name}_cron-init`; `createJob(name, input)` runs the processor |
 
-## Payloads
+A library queue is a Graphile task identifier. `serial: true` sets its Graphile serialization queue name to the task name; a string selects a shared serialization queue. `cron` accepts a string, readonly string array or Graphile matcher. Multiple schedules have distinct identifiers, including with a custom `cronOptions.identifier`.
 
-- Producer types use `z.input`; handlers receive `z.output` after `parse`.
-- Payloads must be JSON-round-trippable. A `z.date()` output will not survive the jobs table.
-- `createJob` always enqueues one job. A schema of `z.array(...)` is still a single payload — use `createJobs` for fan-out.
-- Enqueue validation is on by default (`validateOnEnqueue: false` to skip).
-- Schema parse failures and `NonRetriableError` are treated as permanent failures (no retries).
+Defaults follow explicit job options, then cron options for cron operations, then queue defaults, then `defaultMaxAttempts`, then the library default of 4. Native schedules and manual cron triggers inherit serial queues, priority and retry defaults. Native Graphile cron does not support queue flags; manual triggers do. `backfillPeriod` belongs to native scheduling. Graphile uses the database clock unless `graphile.useNodeTime` is enabled.
 
-## JobContext
+`createJob` creates one job even for array schemas. `createJobs` accepts a readonly array and performs one atomic `addJobs` call after validating every input; failures include the item index. Shared `jobKey` and `jobKeyMode` are unavailable in batch options. Use individual `createJob` calls for keyed items. Batches are never automatically chunked, since that would change atomicity. Keyed array jobs replace a single payload consistently, regardless of tracing.
 
-`processFn` / `initFn` receive:
+`shouldSkipEnqueue()` returning true produces `null` for one job and `[]` for a batch. Named functions in `jobs` are stable, enumerable and frozen.
 
-- `jobId`, `queue`, `attempt`, `maxAttempts`
-- `logger`, `span`
-- `signal` (Graphile abort signal)
-- `createJob` / `createJobs` (bound to the same worker)
-- `cron` (`{ ts, backfilled }`) when Graphile injected a `_cron` payload
-- `helpers` for the raw Graphile API
-- `step.run(id, fn)` — memoizes JSON-serializable results across retries
+## Payloads and failure policy
+
+Producer inputs use `z.input`; consumers receive `z.output`. Both use async parsing, including async refinements and transforms. Validation runs before enqueue by default and again on the consumer because other producers can write jobs. Cron-init validates each returned input once during enqueue; it never enqueues transformed outputs.
+
+Wire inputs must contain plain JSON values: strings, finite numbers, booleans, null, arrays and plain objects. Dates, bigints, functions, class instances, cycles and nested undefined values are rejected. Encode dates as strings at the producer; a schema can transform those strings into Dates in the handler. Root `undefined` is supported for optional/defaulted inputs and restored before parsing. `validateOnEnqueue: false` skips schema checks, but still enforces the JSON wire format.
+
+All new jobs, including scheduled cron, use a version-2 envelope with payload, trace metadata and optional checkpoints in separate fields. Business fields named `__trace`, `traceparent`, `__bgw` or `steps` survive inside the payload. Only this format is accepted. Raw Graphile producers must supply the current envelope; prefer instance enqueue methods.
+
+Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown by your handler, such as validating a downstream response, follows normal retry behavior.
+
+- `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
+- `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
+
+Retention, checkpointing and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+
+## Context and durable steps
+
+Contexts include `jobId`, the task `queue`, `attempt`, `maxAttempts`, `logger`, `span`, `signal`, raw Graphile `helpers`, typed `createJob`/`createJobs`, and `cron` metadata (`ts: Date`, optional `backfilled`). Cron-init contexts use the suffixed task name.
 
 ```ts
-processFn: async (payload, ctx) => {
-	const user = await ctx.step.run('fetch-user', async () => {
-		return await db.users.find(payload.userId)
-	})
-
-	await ctx.step.run('send-email', async () => {
-		await sendEmail(user.email)
-	})
-}
+const user = await ctx.step.run('fetch-user-v1', async () => {
+  return { id: payload.userId, email: 'person@example.com' }
+})
+await ctx.step.run('send-email-v1', async () => {
+  await sendEmail(user.email) // void is restored as undefined on replay
+})
 ```
 
-On retry the handler runs from the top again, but completed steps return the cached output and do not re-run `fn`. Use unique ids in loops (`send-email-${i}`). `undefined` is stored as `null`. This is replay-with-cache, not Trigger.dev-style sleep/wait checkpointing.
+Completed steps return their cached result on retry. Concurrent calls with the same ID share pending work. Different checkpoints are serialized and patched atomically in PostgreSQL, and writes require the worker's current lock. A failed checkpoint is never treated as completed. Step IDs such as `toString` and `__proto__` work normally.
 
-## Hooks
-
-All hooks are optional:
-
-- `createLogger({ queue, jobId, attempt, span })` — default: console
-- `onJobFinished` — success/fail metrics
-- `onPermanentFailure` — last-attempt or non-retriable failures
-- `onEnqueueFail` — `createJob` / `createJobs` database failures
-- `shouldSkipEnqueue` — return `true` to skip enqueue (e.g. while seeding)
-
-`span` is always present: a real OpenTelemetry span when `@opentelemetry/api` is installed (or injected via `otel: { api }`), otherwise a no-op. `JobSpan` includes `addEvent` so host loggers can attach events without casting. Producer spans use `PRODUCER` kind and W3C `traceparent`; the legacy `__trace` payload field is still read.
-
-## Admin helpers
+Default results must preserve their type through JSON. TypeScript rejects Date and unsupported result types, and runtime validation catches unsafe JavaScript values. To preserve richer values, pass a codec whose decode validates stored data:
 
 ```ts
-worker.getQueueDefinitions()
+import { z } from 'zod'
+const when = await ctx.step.run('timestamp-v1', () => new Date(), {
+  encode: date => date.toISOString(),
+  decode: wire => new Date(z.string().parse(wire))
+}) // Date on both fresh execution and replay
+```
+
+Use the same result type and codec for every use of an ID. Version IDs when the stored format changes. Checkpoints cannot guarantee exactly-once external effects: a process can crash after an effect but before its checkpoint. External effects must be idempotent. Steps memoize results; they do not implement suspended workflows or durable sleeps.
+
+## Lifecycle and observability
+
+Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
+
+`stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`.
+
+Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
+
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+
+## Administration, CLI and testing
+
+```ts
 await worker.getJobStats()
-await worker.listJobs({ limit: 50, queue: 'sendEmail', state: 'pending' })
+const first = await worker.listJobs({ limit: 50, state: 'failed', includePayload: false })
+const last = first.at(-1)
+if (last) await worker.listJobs({ limit: 50, state: 'failed', includePayload: false, before: last.cursor })
 await worker.retryJobs(['123'])
 await worker.failJobs(['123'], 'gave up')
-worker.getCompletedJobs()
+worker.getQueueDefinitions()
 ```
 
-Completed jobs are an **opt-in** in-memory ring (`completedJobs: { maxPerQueue: 50 }`) so they remain visible after Graphile deletes them. `getQueueDefinitions()` includes the Zod `inputSchema` when present. `getJobStats()` returns `{ pending, running, completed, failed }` per task: pending/running from Postgres, completed (and ring `failed`) from the in-memory store when enabled.
+`pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. Database failures cannot be hidden by local history.
 
-## CLI
+Metadata uses Graphile's public `jobs` view. `includePayload` defaults to false and returns null payloads. Set it to true to add the private-table debugging join and inspect business payloads. Listing validates integer limits (0–1000), offsets and states. Use the returned `cursor` to retain PostgreSQL timestamp precision; the display `createdAt` loses sub-millisecond precision. Cursor and offset cannot be combined. Counts scan current jobs; avoid unnecessary high-frequency polling on large queues. Schema identifiers, including uppercase names, are quoted consistently.
 
 ```ts
 import { createCli } from 'better-graphile-worker/cli'
-
 await createCli(worker)(process.argv.slice(2))
 ```
 
-Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `retry <id>`, `fail <id>`, `run-once`. Add `--json` for machine-readable output.
-
-## Testing
+Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `retry <id>`, `fail <id>`, `run-once`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
 
 ```ts
 import { createTestHarness } from 'better-graphile-worker/testing'
-
 const harness = createTestHarness(queues)
-await harness.process('sendEmail', { to: 'a@b.com' })
-expect(harness.logs[0]?.message).toBe('sending')
+await harness.process('sendEmail', { to: 'person@example.com' })
+console.log(harness.logs, harness.enqueued)
 ```
 
-No Postgres required.
+The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; different queues never share checkpoints. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
 
-## Types
+## Types and major-version migration
 
-```ts
-import type {
-	InferInput,
-	InferPayload,
-	QueueInput,
-	QueueNames,
-	TasksOf
-} from 'better-graphile-worker'
+`QueueName`, `QueueInput`, `QueuePayload`, `InputsOf` and `PayloadsOf` preserve names and input/output inference. An unknown queue resolves to `never`. Enqueue calls correlate names with payloads; uncorrelated unions fail compilation. `TasksOf` requires current payload envelopes around producer input, before transforms. Worker and harness constructors check schema/handler agreement even for manually constructed inline definitions. Instance methods need no global augmentation. Augment `GraphileWorker.Tasks` only when using Graphile's raw typed API.
 
-type Names = QueueNames<typeof queues>
-type EmailInput = InferInput<typeof sendEmail>
+Low-level builders, SQL adapters and payload helpers are available exclusively from `better-graphile-worker/advanced`. Application code should use instance methods. The package root exports constructors, contract helpers, public types and errors.
 
-declare global {
-	namespace GraphileWorker {
-		interface Tasks extends TasksOf<typeof queues> {}
-	}
-}
+This implementation requires a **major release**. There are no deprecated aliases or readers for the previous wire format:
+
+1. Pause old producers and cron scheduling. Drain old queued jobs before switching versions. Delayed or failed jobs that need to survive the upgrade must be explicitly re-enqueued through the new client with their business input and scheduling options. Resubmission can repeat work; preserve application idempotency keys.
+2. Stop the old workers and upgrade producers and workers together. New workers accept only version-2 envelopes; raw, flat and version-1 jobs are rejected as permanent failures.
+3. Rename `createQueue` to `defineQueue`; keep `processFn` and cron-init `initFn` in their definitions:
+
+   ```ts
+   const sendEmail = defineQueue({
+     name: 'sendEmail',
+     inputSchema: z.object({ to: z.string() }),
+     processFn: (payload, ctx) => {
+       ctx.logger.info('sending', { to: payload.to })
+     }
+   })
+   const queues = defineQueues([sendEmail])
+   const worker = createBetterWorker({ pgPool, queues })
+   const harness = createTestHarness(queues)
+   ```
+
+   Inline context enqueues now take queue references: replace `ctx.createJob('sendEmail', input)` with `ctx.createJob(sendEmail, input)`, and do the same for `ctx.createJobs`. Instance methods still use typed names. For separately shared producer contracts, supply a typed `handlers` registry instead.
+4. Move low-level imports to `/advanced`. Remove `setOtelApi` and pass `otel: { api }` to each instance. Use `QueueName` in place of `QueueNames`. Advanced `bindCreateJob` requires an enqueue adapter, and `createJobsApi` requires an explicit registry.
+5. Use `recentCompleted` and `recentFailed` for bounded local history; `failed` always means current database failures. Job listing returns metadata by default; request `includePayload: true` for payload debugging. Permanent failures are retained by default; explicitly choose `'discard'` if deletion is desired.
+
+JSON-changing step outputs such as Dates require codecs; void replays as undefined. The pg peer requires 8.16+. Batch keys/modes, lossy wire values, malformed numeric options and reserved queue names are rejected. Handler-thrown Zod errors retry; use `NonRetriableError` for intentional permanent failures. Shutdown timeouts reject while retaining the pending shutdown.
+
+## Development
+
+```sh
+bun install --frozen-lockfile
+bun run lint
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/bgw_test bun test
+bun run build
+bun run test:consumers
+bun run attw
+bun run publint
 ```
+
+The PostgreSQL tests create/drop their own schema; the existing baseline integration tests also use the default Graphile schema. Use a disposable test database. Packed consumers exercise NodeNext/bundler compilation, optional-peer absence and native Node runtime behavior; set `PEER_PROFILE=minimum|latest`, `TYPESCRIPT_VERSION=5.7.3` and optionally `NODE_VERSION=20` to select a profile.

@@ -1,52 +1,47 @@
 export {
-	createQueue,
+	defineQueue,
+	type RegularQueue,
+	type CronQueue,
+	type CronInitQueue,
+	type InlineJobContext,
+	type RegularQueueContract,
+	type CronQueueContract,
+	type CronInitQueueContract,
+	type QueueHandlers,
 	isCronInitQueue,
 	isRegularQueue,
 	isCronQueue,
 	getQueueType,
 	hasInputSchema,
-	CRON_INIT_SUFFIX,
-	formatCronSchedule,
-	resolveSerialQueueName,
-	type RegularQueueConfig,
-	type CronQueueConfig,
-	type CronInitQueueConfig,
-	type QueueConfig,
-	type QueueAny,
 	type QueueContract,
 	type QueueCronOptions,
 	type CronSchedule,
 	type JobContext,
 	type JobCronMeta,
 	type JobLogger,
-	type JobSpan,
-	type CreateJobFnLike,
-	type CreateJobsFnLike
-} from './create-queue'
-
-export {
-	defineQueues,
-	assertUniqueQueueNames,
-	type UniqueQueueNames
-} from './define-queues'
-
+	type JobSpan
+} from './queue.js'
+export { defineQueues, type UniqueQueueNames } from './define-queues.js'
 export type {
 	QueueName,
-	QueueNames,
 	QueueInput,
 	QueuePayload,
 	InferInput,
 	InferPayload,
 	TasksOf,
+	InputsOf,
+	PayloadsOf,
+	CronInitQueueName,
+	BatchJobOptions,
 	CreateJobFn,
 	CreateJobsFn,
+	CreateJobForQueueFn,
+	CreateJobsForQueueFn,
 	JobsApi,
 	CronQueueName,
 	JobOptions
-} from './types'
-
-export type { StopOptions } from './job-options'
-
+} from './types.js'
+export type { StopOptions } from './job-options.js'
 export {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA,
@@ -55,54 +50,18 @@ export {
 	type BetterWorker,
 	type BetterWorkerOptions,
 	type CompletedJobsOption
-} from './create-better-worker'
-
+} from './create-better-worker.js'
 export {
 	createJobClient,
 	type JobClient,
 	type JobClientOptions
-} from './job-client'
-
-export {
-	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
-	TRACE_CONTEXT_KEY,
-	TRACEPARENT_KEY,
-	BGW_ENVELOPE_KEY,
-	bindCreateJob,
-	createJobsApi,
-	injectTraceContext,
-	type JobTraceContext,
-	type BindCreateJobOptions
-} from './create-job'
-
-export {
-	extractProducerLink,
-	buildTaskList,
-	buildCronItems,
-	type TaskListRuntime,
-	type GraphileRunnerOverrides
-} from './worker'
-
-export {
-	extractCronMeta,
-	isPayloadEnvelope,
-	isPlainObject,
-	extractStepCache,
-	withStepCache,
-	type StepCache
-} from './payload'
-
-export type { JobStep, StepStore } from './steps'
-
-export {
-	createCompletedJobsStore,
-	createNoopCompletedJobsStore,
-	type CompletedJob,
-	type CompletedJobStatus,
-	type CompletedJobStats,
-	type CompletedJobsStore
-} from './completed-jobs-store'
-
+} from './job-client.js'
+export type { JobStep, StepCodec } from './steps.js'
+export type {
+	CompletedJob,
+	CompletedJobStatus,
+	CompletedJobStats
+} from './completed-jobs-store.js'
 export type {
 	BetterWorkerHooks,
 	CreateLoggerOptions,
@@ -111,25 +70,16 @@ export type {
 	EnqueueFailEvent,
 	LogAttributes,
 	SpanEventAttributes
-} from './hooks'
-
-export {
-	getQueueDefinitions,
-	mergeJobStats,
-	queryJobCounts,
-	queryRecentJobs,
-	type QueueDefinition,
-	type JobCountRow,
-	type WorkerJobStatsRow,
-	type ListedJob,
-	type ListJobsOptions,
-	type JobListState
-} from './admin'
-
-export { createWorkerClient, type WorkerClient } from './client'
-
-export { createCli } from './cli'
-
+} from './hooks.js'
+export type {
+	QueueDefinition,
+	JobCountRow,
+	WorkerJobStatsRow,
+	ListedJob,
+	ListJobsOptions,
+	JobListState
+} from './admin.js'
+export type { GraphileRunnerOverrides } from './worker.js'
 export {
 	NonRetriableError,
 	UnknownQueueError,
@@ -137,12 +87,10 @@ export {
 	DuplicateQueueError,
 	QueueNameCollisionError,
 	InvalidSchemaNameError,
+	StepPersistenceError,
+	ShutdownTimeoutError,
 	StepSerializationError
-} from './errors'
-
-export {
-	setOtelApi,
-	getOtel,
-	createNoopSpan,
-	type OtelApi
-} from './otel'
+} from './errors.js'
+export type { OtelApi } from './otel.js'
+export type { JsonValue, JsonCompatible } from './validation.js'
+export type { PayloadEnvelope } from './payload.js'

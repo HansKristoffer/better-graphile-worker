@@ -1,297 +1,125 @@
+import { compact } from './options.js'
 import { parseArgs } from 'node:util'
 import { z } from 'zod'
-import type { QueueAny } from './create-queue'
-import {
-	CRON_INIT_SUFFIX,
-	formatCronSchedule,
-	getQueueType,
-	hasInputSchema,
-	isCronQueue
-} from './create-queue'
-import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job'
-import type { BetterWorker } from './create-better-worker'
-import type { JobOptions } from './job-options'
+import type { QueueContract } from './queue.js'
+import type { BetterWorker } from './create-better-worker.js'
+import type { JobOptions } from './job-options.js'
+import { assertInteger } from './validation.js'
 
-const HELP = `
-better-graphile-worker CLI
-
-Usage:
-  <cli> <command> [options]
-
-Commands:
-  list-queues                 List all registered queues
-  schema <queueName>          Show the input schema for a queue
-  create-job <queue> [json]   Create a job in a queue
-  stats                       Show pending/running/failed counts
-  list-jobs                   List recent jobs
-  retry <id>                  Reset attempts and run a job again
-  fail <id> [reason]          Permanently fail a job
-  run-once                    Process available jobs once and exit
-
-Options:
-  -h, --help                  Show this help message
-  --json                      Print machine-readable JSON
-  --priority <n>              Job priority (lower = higher priority)
-  --run-at <iso>              Schedule job for later (ISO date string)
-  --max-attempts <n>          Override max retry attempts
-  --job-key <key>             Dedupe/replace jobs with same key
-  --queue <name>              Filter list-jobs by queue
-  --state <state>             Filter list-jobs: pending | running | failed
-  --limit <n>                 list-jobs limit (default 100, max 1000)
-  --offset <n>                list-jobs offset
-`
-
-function formatSchema(schema: z.ZodType): string {
-	try {
-		return JSON.stringify(z.toJSONSchema(schema), null, 2)
-	} catch {
-		return '(schema present; JSON Schema conversion failed)'
-	}
-}
-
-function writeJson(value: unknown): void {
-	console.log(JSON.stringify(value, null, 2))
-}
-
-function parseNumber(
+const HELP = `better-graphile-worker CLI
+Commands: list-queues | schema <queue> | create-job <queue> [json] | stats | list-jobs | retry <id> | fail <id> [reason] | run-once
+Options: --json --priority <n> --run-at <iso> --max-attempts <n> --job-key <key> --queue <name> --state <pending|running|failed> --limit <n> --offset <n> -h, --help`
+function number(
 	value: string | undefined,
-	label: string
-): number | undefined {
+	label: string,
+	min = 0,
+	max = Number.MAX_SAFE_INTEGER
+) {
 	if (value === undefined) return undefined
-	const parsed = Number.parseInt(value, 10)
-	if (Number.isNaN(parsed)) {
-		throw new Error(`Invalid ${label}: ${value}`)
-	}
+	if (!/^-?\d+$/.test(value)) throw new RangeError(`Invalid ${label}: ${value}`)
+	const parsed = Number(value)
+	assertInteger(parsed, label, min, max)
 	return parsed
 }
-
-export function createCli<TQueues extends readonly QueueAny[]>(
-	worker: BetterWorker<TQueues>
+function required(value: string | undefined, label: string): string {
+	if (!value) throw new Error(`${label} required`)
+	return value
+}
+export function createCli<T extends readonly QueueContract[]>(
+	worker: BetterWorker<T>
 ): (argv?: string[]) => Promise<void> {
+	// Dynamic input always goes through the same registry and runtime validation as typed calls.
+	const enqueue = worker.createJob as (
+		name: string,
+		payload?: unknown,
+		options?: JobOptions
+	) => Promise<string | null>
 	return async (argv = process.argv.slice(2)) => {
-		const { values, positionals } = parseArgs({
-			args: argv,
-			allowPositionals: true,
-			options: {
-				help: { type: 'boolean', short: 'h' },
-				json: { type: 'boolean' },
-				priority: { type: 'string' },
-				'run-at': { type: 'string' },
-				'max-attempts': { type: 'string' },
-				'job-key': { type: 'string' },
-				queue: { type: 'string' },
-				state: { type: 'string' },
-				limit: { type: 'string' },
-				offset: { type: 'string' }
-			}
-		})
-
-		const [command, ...args] = positionals
-		const queues = worker.queues
-		const json = values.json === true
-
-		if (values.help || !command) {
-			console.log(HELP)
-			return
-		}
-
-		const getQueueByName = (name: string) => queues.find((q) => q.name === name)
-
+		const json = argv.includes('--json')
+		const print = (value: unknown) =>
+			console.log(JSON.stringify(value, null, json ? 2 : undefined))
 		try {
+			const {
+				values,
+				positionals: [command, ...args]
+			} = parseArgs({
+				args: argv,
+				allowPositionals: true,
+				options: {
+					help: { type: 'boolean', short: 'h' },
+					json: { type: 'boolean' },
+					priority: { type: 'string' },
+					'run-at': { type: 'string' },
+					'max-attempts': { type: 'string' },
+					'job-key': { type: 'string' },
+					queue: { type: 'string' },
+					state: { type: 'string' },
+					limit: { type: 'string' },
+					offset: { type: 'string' }
+				}
+			})
+			if (values.help || !command) {
+				console.log(HELP)
+				return
+			}
 			switch (command) {
-				case 'list-queues': {
-					const defs = worker.getQueueDefinitions()
-					if (json) {
-						writeJson(defs)
-						return
-					}
-					console.log('\nRegistered queues:\n')
-					for (const queue of queues) {
-						const type = getQueueType(queue)
-						const maxAttempts =
-							queue.maxAttempts ?? DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
-
-						if (type === 'cron-init') {
-							console.log(`  ${queue.name}${CRON_INIT_SUFFIX}`)
-							console.log(
-								`    Type: cron-init (${formatCronSchedule(queue.cron)})`
-							)
-							console.log('    Purpose: Gathers items via initFn')
-							console.log()
-							console.log(`  ${queue.name}`)
-							console.log('    Type: processor')
-							console.log('    Purpose: Processes items from cron-init')
-							console.log(`    Max Attempts: ${maxAttempts}`)
-							console.log('    Has Input Schema: yes')
-						} else if (type === 'cron') {
-							console.log(`  ${queue.name}`)
-							console.log(`    Type: cron (${formatCronSchedule(queue.cron)})`)
-							console.log(`    Max Attempts: ${maxAttempts}`)
-						} else {
-							console.log(`  ${queue.name}`)
-							console.log('    Type: regular')
-							console.log(`    Max Attempts: ${maxAttempts}`)
-							if (hasInputSchema(queue)) {
-								console.log('    Has Input Schema: yes')
-							}
-						}
-						console.log()
-					}
+				case 'list-queues':
+					print(
+						worker
+							.getQueueDefinitions()
+							.map(({ inputSchema, ...definition }) => ({
+								...definition,
+								inputSchema: inputSchema
+									? z.toJSONSchema(inputSchema, { io: 'input' })
+									: null
+							}))
+					)
 					break
-				}
-
 				case 'schema': {
-					const [queueName] = args
-					if (!queueName) {
-						console.error('Error: Queue name required')
-						console.error('Usage: schema <queueName>')
-						process.exitCode = 1
-						return
-					}
-
-					const queue = getQueueByName(queueName)
-					if (!queue) {
-						console.error(`Error: Queue "${queueName}" not found`)
-						process.exitCode = 1
-						return
-					}
-
-					const type = getQueueType(queue)
-					if (json) {
-						writeJson({
-							name: queueName,
-							type,
-							cron: formatCronSchedule(queue.cron),
-							schema: hasInputSchema(queue)
-								? z.toJSONSchema(queue.inputSchema)
-								: null
-						})
-						return
-					}
-
-					console.log(`\nSchema for queue: ${queueName}\n`)
-
-					if (type === 'cron') {
-						console.log('  This is a simple cron queue (no input schema)')
-						console.log(`  Schedule: ${formatCronSchedule(queue.cron)}`)
-					} else if (type === 'cron-init' && hasInputSchema(queue)) {
-						console.log('  Type: cron-init queue')
-						console.log(`  Schedule: ${formatCronSchedule(queue.cron)}`)
-						console.log()
-						console.log('Input schema (for processFn / createJob):')
-						console.log(formatSchema(queue.inputSchema))
-					} else if (hasInputSchema(queue)) {
-						console.log('JSON Schema:')
-						console.log(formatSchema(queue.inputSchema))
-					}
-					console.log()
+					const name = required(args[0], 'Queue name')
+					const queue = worker
+						.getQueueDefinitions()
+						.find((q) => q.name === name)
+					if (!queue) throw new Error(`Queue "${name}" not found`)
+					print({
+						name,
+						type: queue.type,
+						cron: queue.cron,
+						schema: queue.inputSchema
+							? z.toJSONSchema(queue.inputSchema, { io: 'input' })
+							: null
+					})
 					break
 				}
-
 				case 'create-job': {
-					const [queueName, payloadJson] = args
-					if (!queueName) {
-						console.error('Error: Queue name required')
-						console.error('Usage: create-job <queueName> [payloadJson]')
-						process.exitCode = 1
-						return
-					}
-
-					const queue = getQueueByName(queueName)
-					if (!queue) {
-						console.error(`Error: Queue "${queueName}" not found`)
-						process.exitCode = 1
-						return
-					}
-
-					const jobOptions: JobOptions = {}
-					const priority = parseNumber(values.priority, 'priority')
-					if (priority !== undefined) jobOptions.priority = priority
-					if (values['run-at']) {
-						jobOptions.runAt = new Date(values['run-at'])
-					}
-					const maxAttempts = parseNumber(
+					const name = required(args[0], 'Queue name')
+					const queue = worker.queues.find((q) => q.name === name)
+					if (!queue) throw new Error(`Queue "${name}" not found`)
+					const options: JobOptions = {}
+					const priority = number(values.priority, 'priority', -32768, 32767)
+					const maxAttempts = number(
 						values['max-attempts'],
-						'max-attempts'
+						'max-attempts',
+						1,
+						32767
 					)
-					if (maxAttempts !== undefined) jobOptions.maxAttempts = maxAttempts
-					if (values['job-key']) {
-						jobOptions.jobKey = values['job-key']
+					if (priority !== undefined) options.priority = priority
+					if (maxAttempts !== undefined) options.maxAttempts = maxAttempts
+					if (values['job-key'] !== undefined)
+						options.jobKey = values['job-key']
+					if (values['run-at'] !== undefined) {
+						options.runAt = new Date(values['run-at'])
+						if (!Number.isFinite(options.runAt.getTime()))
+							throw new RangeError('Invalid run-at timestamp')
 					}
-
-					if (isCronQueue(queue)) {
-						const jobId = await worker.createJob(
-							queueName as never,
-							undefined as never,
-							jobOptions
-						)
-						if (json) {
-							writeJson({ jobId })
-							return
-						}
-						console.log(`Job created: ${jobId}`)
-						return
-					}
-
-					if (!hasInputSchema(queue)) {
-						console.error(`Error: Queue "${queueName}" has no input schema`)
-						process.exitCode = 1
-						return
-					}
-
-					if (!payloadJson) {
-						console.error('Error: Payload JSON required')
-						console.error(`Usage: create-job ${queueName} '<json>'`)
-						console.error('\nExpected schema:')
-						console.log(formatSchema(queue.inputSchema))
-						process.exitCode = 1
-						return
-					}
-
-					let payload: unknown
-					try {
-						payload = JSON.parse(payloadJson)
-					} catch {
-						console.error('Error: Invalid JSON payload')
-						process.exitCode = 1
-						return
-					}
-
-					const jobId = await worker.createJob(
-						queueName as never,
-						payload as never,
-						jobOptions
-					)
-					if (json) {
-						writeJson({ jobId })
-						return
-					}
-					console.log(`Creating job in queue "${queueName}"...`)
-					console.log(`Job created: ${jobId}`)
+					const payload: unknown =
+						args[1] === undefined ? undefined : JSON.parse(args[1])
+					print({ jobId: await enqueue(name, payload, options) })
 					break
 				}
-
-				case 'stats': {
-					const stats = await worker.getJobStats()
-					if (json) {
-						writeJson(stats)
-						return
-					}
-					console.log('\nJob stats:\n')
-					if (stats.length === 0) {
-						console.log('  (no jobs)')
-						return
-					}
-					for (const row of stats) {
-						console.log(`  ${row.taskIdentifier}`)
-						console.log(
-							`    pending: ${row.pending}  running: ${row.running}  completed: ${row.completed}  failed: ${row.failed}`
-						)
-					}
-					console.log()
+				case 'stats':
+					print(await worker.getJobStats())
 					break
-				}
-
 				case 'list-jobs': {
 					const state = values.state
 					if (
@@ -299,91 +127,44 @@ export function createCli<TQueues extends readonly QueueAny[]>(
 						state !== 'pending' &&
 						state !== 'running' &&
 						state !== 'failed'
-					) {
-						console.error('Error: --state must be pending, running, or failed')
-						process.exitCode = 1
-						return
-					}
-					const jobs = await worker.listJobs({
-						queue: values.queue,
-						state,
-						limit: parseNumber(values.limit, 'limit'),
-						offset: parseNumber(values.offset, 'offset')
-					})
-					if (json) {
-						writeJson(jobs)
-						return
-					}
-					console.log(`\n${jobs.length} job(s):\n`)
-					for (const job of jobs) {
-						console.log(`  ${job.id}  ${job.queueName}`)
-						console.log(
-							`    attempts: ${job.attempts}/${job.maxAttempts}  runAt: ${job.runAt}`
+					)
+						throw new Error('--state must be pending, running, or failed')
+					print(
+						await worker.listJobs(
+							compact({
+								queue: values.queue,
+								state,
+								limit: number(values.limit, 'limit', 0, 1000),
+								offset: number(values.offset, 'offset')
+							})
 						)
-						if (job.lastError) {
-							console.log(`    lastError: ${job.lastError}`)
-						}
-					}
-					console.log()
+					)
 					break
 				}
-
-				case 'retry': {
-					const [id] = args
-					if (!id) {
-						console.error('Error: Job id required')
-						process.exitCode = 1
-						return
-					}
-					const ids = await worker.retryJobs([id])
-					if (json) {
-						writeJson({ retried: ids })
-						return
-					}
-					console.log(`Retried: ${ids.join(', ') || '(none)'}`)
+				case 'retry':
+					print({
+						retried: await worker.retryJobs([required(args[0], 'Job id')])
+					})
 					break
-				}
-
-				case 'fail': {
-					const [id, ...reasonParts] = args
-					if (!id) {
-						console.error('Error: Job id required')
-						process.exitCode = 1
-						return
-					}
-					const reason = reasonParts.join(' ') || undefined
-					const ids = await worker.failJobs([id], reason)
-					if (json) {
-						writeJson({ failed: ids })
-						return
-					}
-					console.log(`Failed: ${ids.join(', ') || '(none)'}`)
+				case 'fail':
+					print({
+						failed: await worker.failJobs(
+							[required(args[0], 'Job id')],
+							args.slice(1).join(' ') || undefined
+						)
+					})
 					break
-				}
-
-				case 'run-once': {
+				case 'run-once':
 					await worker.runOnce()
-					if (json) {
-						writeJson({ ok: true })
-						return
-					}
-					console.log('run-once complete')
+					print({ ok: true })
 					break
-				}
-
-				default: {
-					console.error(`Unknown command: ${command}`)
-					console.log(HELP)
-					process.exitCode = 1
-				}
+				default:
+					throw new Error(`Unknown command: ${command}`)
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
-			if (json) {
-				writeJson({ error: message })
-			} else {
-				console.error(`Error: ${message}`)
-			}
+			if (json) print({ error: message })
+			else console.error(`Error: ${message}`)
 			process.exitCode = 1
 		}
 	}

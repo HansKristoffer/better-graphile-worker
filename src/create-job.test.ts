@@ -1,3 +1,5 @@
+import type { QueueHandlers } from './queue.js'
+import { extractProducerLink } from './payload.js'
 import {
 	describe,
 	test,
@@ -8,21 +10,16 @@ import {
 } from 'bun:test'
 import { Pool } from 'pg'
 import { z } from 'zod'
-import type { WorkerUtils } from 'graphile-worker'
-import {
-	TRACE_CONTEXT_KEY,
-	BGW_ENVELOPE_KEY,
-	injectTraceContext,
-	bindCreateJob,
-	type JobTraceContext
-} from './create-job'
-import { createQueue } from './create-queue'
-import { createBetterWorker } from './create-better-worker'
-import type { QueueName, QueueInput } from './types'
-import { DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client'
-import type { JobLogger } from './hooks'
-import { JobValidationError, UnknownQueueError } from './errors'
-import { setOtelApi } from './otel'
+import { bindCreateJob } from './create-job.js'
+import { BGW_ENVELOPE_KEY, injectTraceContext } from './payload.js'
+import { defineQueue } from './queue.js'
+import { createBetterWorker } from './create-better-worker.js'
+import type { QueueName, QueueInput } from './types.js'
+import { DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
+import type { JobLogger } from './hooks.js'
+import { JobValidationError, UnknownQueueError } from './errors.js'
+import type { OtelApi } from './otel.js'
+import type { EnqueueAdapter } from './client.js'
 
 const silentLogger: JobLogger = {
 	debug() {},
@@ -31,32 +28,28 @@ const silentLogger: JobLogger = {
 	error() {}
 }
 
-const testQueue = createQueue({
+const testQueue = defineQueue({
 	name: 'bgwTestQueue',
 	inputSchema: z.object({
 		organizationId: z.string(),
 		websiteUrl: z.string()
 	}),
-	maxAttempts: 7,
-	processFn: async () => {}
+	maxAttempts: 7
 })
 
-const arrayQueue = createQueue({
+const arrayQueue = defineQueue({
 	name: 'bgwArrayQueue',
-	inputSchema: z.array(z.string()),
-	processFn: async () => {}
+	inputSchema: z.array(z.string())
 })
 
-const stringQueue = createQueue({
+const stringQueue = defineQueue({
 	name: 'bgwStringQueue',
-	inputSchema: z.string(),
-	processFn: async () => {}
+	inputSchema: z.string()
 })
 
-const cronQueue = createQueue({
+const cronQueue = defineQueue({
 	name: 'bgwCronQueue',
-	cron: '0 * * * *',
-	processFn: async () => {}
+	cron: '0 * * * *'
 })
 
 const testQueues = [testQueue, arrayQueue, stringQueue, cronQueue] as const
@@ -92,7 +85,7 @@ function mockUtils() {
 				return { id: String(added.length) }
 			})
 		}
-	} as unknown as WorkerUtils
+	} as unknown as EnqueueAdapter
 
 	return { utils, added }
 }
@@ -107,6 +100,12 @@ const pool = hasRealDatabase
 const worker = createBetterWorker({
 	pgPool: pool,
 	queues: testQueues,
+	handlers: {
+		bgwTestQueue: () => {},
+		bgwArrayQueue: () => {},
+		bgwStringQueue: () => {},
+		bgwCronQueue: () => {}
+	},
 	hooks: { createLogger: () => silentLogger }
 })
 
@@ -128,26 +127,6 @@ if (hasRealDatabase) {
 		await pool.end()
 	})
 }
-
-describe('TRACE_CONTEXT_KEY constant', () => {
-	test('equals "__trace"', () => {
-		expect(TRACE_CONTEXT_KEY).toBe('__trace')
-	})
-
-	test('is a string literal type', () => {
-		expectTypeOf(TRACE_CONTEXT_KEY).toEqualTypeOf<'__trace'>()
-	})
-})
-
-describe('JobTraceContext type', () => {
-	test('has correct shape', () => {
-		const ctx: JobTraceContext = {
-			traceId: 'abc123',
-			spanId: 'def456'
-		}
-		expectTypeOf(ctx).toEqualTypeOf<{ traceId: string; spanId: string }>()
-	})
-})
 
 describe('createJob type inference', () => {
 	test('single job returns string | null', () => {
@@ -173,7 +152,7 @@ describe('bindCreateJob unit behavior', () => {
 	test('rejects unknown queue names', async () => {
 		const { utils } = mockUtils()
 		const { createJob } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
@@ -185,7 +164,7 @@ describe('bindCreateJob unit behavior', () => {
 	test('rejects invalid payloads at enqueue time', async () => {
 		const { utils } = mockUtils()
 		const { createJob } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
@@ -197,20 +176,24 @@ describe('bindCreateJob unit behavior', () => {
 	test('enqueues an array-schema payload as a single job', async () => {
 		const { utils, added } = mockUtils()
 		const { createJob } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
 		const jobId = await createJob('bgwArrayQueue', ['a', 'b', 'c'])
 		expect(jobId).toBe('1')
 		expect(added).toHaveLength(1)
-		expect(added[0]?.payload).toEqual(['a', 'b', 'c'])
+		expect(extractProducerLink(added[0]?.payload).cleanPayload).toEqual([
+			'a',
+			'b',
+			'c'
+		])
 	})
 
 	test('createJobs enqueues each item via addJobs', async () => {
 		const { utils, added } = mockUtils()
 		const { createJobs } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
@@ -225,7 +208,7 @@ describe('bindCreateJob unit behavior', () => {
 	test('honours queue-level maxAttempts', async () => {
 		const { utils, added } = mockUtils()
 		const { createJob } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
@@ -235,13 +218,15 @@ describe('bindCreateJob unit behavior', () => {
 		).toBe(7)
 	})
 
-	test('does not wrap a string payload unless a span is active', () => {
-		setOtelApi(null)
-		expect(injectTraceContext('hello')).toBe('hello')
+	test('wraps payloads consistently without tracing', () => {
+		expect(injectTraceContext('hello', null)).toEqual({
+			__bgw: 2,
+			payload: 'hello'
+		})
 	})
 
 	test('wraps a non-object payload in an envelope when a span is active', () => {
-		setOtelApi({
+		const api: OtelApi = {
 			trace: {
 				getTracer() {
 					return {
@@ -283,17 +268,13 @@ describe('bindCreateJob unit behavior', () => {
 			SpanStatusCode: { OK: 1, ERROR: 2 },
 			SpanKind: { INTERNAL: 0, CONSUMER: 1, PRODUCER: 2 },
 			TraceFlags: { SAMPLED: 1 }
-		})
-
-		try {
-			const wrapped = injectTraceContext('hello')
-			expect(wrapped).toMatchObject({
-				[BGW_ENVELOPE_KEY]: 1,
-				payload: 'hello'
-			})
-		} finally {
-			setOtelApi(null)
 		}
+
+		const wrapped = injectTraceContext('hello', api)
+		expect(wrapped).toMatchObject({
+			[BGW_ENVELOPE_KEY]: 2,
+			payload: 'hello'
+		})
 	})
 })
 
@@ -301,11 +282,12 @@ describe('createJob - batch jobKeyMode guard', () => {
 	test('throws when jobKeyMode is set on batch input', async () => {
 		const { utils } = mockUtils()
 		const { createJobs } = bindCreateJob({
-			getWorkerUtils: async () => utils,
+			enqueue: utils,
 			queues: testQueues
 		})
 
 		await expect(
+			// @ts-expect-error Runtime defense for callers bypassing TypeScript
 			createJobs('bgwTestQueue', [testInput('batch-key-2')], {
 				jobKeyMode: 'replace'
 			})
@@ -351,7 +333,8 @@ integrationDescribe('createJob - single job', () => {
 		})
 
 		expect(jobs.length).toBe(1)
-		const payload = jobs[0]!.payload as Record<string, unknown>
+		const payload = extractProducerLink(jobs[0]!.payload)
+			.cleanPayload as Record<string, unknown>
 		expect(payload.organizationId).toBe(input.organizationId)
 		expect(payload.websiteUrl).toBe(input.websiteUrl)
 	})
@@ -439,32 +422,36 @@ integrationDescribe('createJob - with options', () => {
 			return result.rows
 		})
 		expect(jobs.length).toBe(1)
-		const payload = jobs[0]!.payload as Record<string, unknown>
+		const payload = extractProducerLink(jobs[0]!.payload)
+			.cleanPayload as Record<string, unknown>
 		expect(payload.organizationId).toBe('org_test_dedup-second')
 	})
 })
 
 integrationDescribe('step cache', () => {
 	const counts = { fetch: 0, send: 0 }
-	const stepQueue = createQueue({
+	const stepQueue = defineQueue({
 		name: 'bgwStepQueue',
 		inputSchema: z.object({ userId: z.string() }),
-		maxAttempts: 3,
-		processFn: async (payload, ctx) => {
-			await ctx.step.run('fetch-user', async () => {
-				counts.fetch += 1
-				return { id: payload.userId }
-			})
-			await ctx.step.run('send-email', async () => {
-				counts.send += 1
-				throw new Error('smtp down')
-			})
-		}
+		maxAttempts: 3
 	})
+	const stepQueueHandler: QueueHandlers<
+		readonly [typeof stepQueue]
+	>['bgwStepQueue'] = async (payload, ctx) => {
+		await ctx.step.run('fetch-user', async () => {
+			counts.fetch += 1
+			return { id: payload.userId }
+		})
+		await ctx.step.run('send-email', async () => {
+			counts.send += 1
+			throw new Error('smtp down')
+		})
+	}
 
 	const stepWorker = createBetterWorker({
 		pgPool: pool,
 		queues: [stepQueue],
+		handlers: { bgwStepQueue: stepQueueHandler },
 		hooks: { createLogger: () => silentLogger }
 	})
 
@@ -495,12 +482,15 @@ integrationDescribe('step cache', () => {
 		})
 
 		expect(stored).toMatchObject({
-			[BGW_ENVELOPE_KEY]: 1,
+			[BGW_ENVELOPE_KEY]: 2,
 			payload: { userId: 'u1' },
 			steps: { 'fetch-user': { output: { id: 'u1' } } }
 		})
 
-		const listed = await stepWorker.listJobs({ queue: 'bgwStepQueue' })
+		const listed = await stepWorker.listJobs({
+			queue: 'bgwStepQueue',
+			includePayload: true
+		})
 		expect(listed[0]?.payload).toEqual({ userId: 'u1' })
 
 		await utils.rescheduleJobs([jobId!], { runAt: new Date() })

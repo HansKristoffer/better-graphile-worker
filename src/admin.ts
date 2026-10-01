@@ -1,20 +1,14 @@
+import { payloadDebugJoin } from './private-jobs.js'
+import { assertInteger } from './validation.js'
 import type { WorkerUtils } from 'graphile-worker'
 import type z from 'zod'
-import type { QueueAny } from './create-queue'
-import type { CompletedJobStats } from './completed-jobs-store'
-import {
-	formatCronSchedule,
-	getQueueType,
-	hasInputSchema
-} from './create-queue'
-import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job'
-import { assertValidSchemaName } from './schema-name'
-import { extractProducerLink } from './payload'
+import type { QueueContract } from './queue.js'
+import type { CompletedJobStats } from './completed-jobs-store.js'
+import { formatCronSchedule, getQueueType, hasInputSchema } from './queue.js'
+import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job.js'
+import { quoteSchemaName } from './schema-name.js'
+import { extractProducerLink } from './payload.js'
 
-/**
- * Queries Graphile Worker's internal `_private_jobs` / `_private_tasks` tables.
- * These names are not a public API and may change between graphile-worker versions.
- */
 export type QueueDefinition = {
 	name: string
 	type: 'regular' | 'cron' | 'cron-init'
@@ -34,11 +28,16 @@ export type JobCountRow = {
 }
 
 export type WorkerJobStatsRow = JobCountRow & {
-	completed: number
+	/** Completed entries in this instance’s bounded history. */
+	recentCompleted: number
+	/** Failed entries in this instance’s bounded history; separate from database failures. */
+	recentFailed: number
 }
 
 export type ListedJob = {
 	id: string
+	/** Preserve PostgreSQL timestamp precision when paginating. */
+	cursor: { createdAt: string; id: string }
 	queueName: string
 	payload: unknown
 	priority: number
@@ -58,20 +57,24 @@ export type ListJobsOptions = {
 	offset?: number
 	queue?: string
 	state?: JobListState
+	/** Defaults to false. Opt in to the private-table payload debugging join. */
+	includePayload?: boolean
+	before?: { createdAt: string; id: string }
 }
 
 const DEFAULT_LIST_LIMIT = 100
 const MAX_LIST_LIMIT = 1000
 
 export function getQueueDefinitions(
-	queues: readonly QueueAny[]
+	queues: readonly QueueContract[],
+	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
 ): QueueDefinition[] {
 	return queues.map((queue) => ({
 		name: queue.name,
 		type: getQueueType(queue),
 		cron: formatCronSchedule(queue.cron),
 		serial: queue.serial ?? null,
-		maxAttempts: queue.maxAttempts ?? DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+		maxAttempts: queue.maxAttempts ?? defaultMaxAttempts,
 		priority: queue.priority ?? null,
 		hasInputSchema: hasInputSchema(queue),
 		inputSchema: hasInputSchema(queue) ? queue.inputSchema : null
@@ -97,17 +100,18 @@ export function mergeJobStats(
 			taskIdentifier,
 			pending: pg?.pending ?? 0,
 			running: pg?.running ?? 0,
-			completed: mem?.completed ?? 0,
-			failed: mem?.failed ?? pg?.failed ?? 0
+			recentCompleted: mem?.completed ?? 0,
+			failed: pg?.failed ?? 0,
+			recentFailed: mem?.failed ?? 0
 		}
 	})
 }
 
 export async function queryJobCounts(
-	utils: WorkerUtils,
+	utils: Pick<WorkerUtils, 'withPgClient'>,
 	schema: string
 ): Promise<JobCountRow[]> {
-	const safeSchema = assertValidSchemaName(schema)
+	const safeSchema = quoteSchemaName(schema)
 	const result = await utils.withPgClient(async (pgClient) => {
 		return pgClient.query<{
 			task_identifier: string
@@ -116,7 +120,7 @@ export async function queryJobCounts(
 			failed: string
 		}>(`
 			SELECT
-				tasks.identifier as task_identifier,
+				jobs.task_identifier,
 				COUNT(*) FILTER (
 					WHERE jobs.locked_at IS NULL AND jobs.attempts < jobs.max_attempts
 				) as pending,
@@ -124,9 +128,8 @@ export async function queryJobCounts(
 				COUNT(*) FILTER (
 					WHERE jobs.locked_at IS NULL AND jobs.attempts >= jobs.max_attempts
 				) as failed
-			FROM ${safeSchema}._private_jobs jobs
-			INNER JOIN ${safeSchema}._private_tasks tasks ON tasks.id = jobs.task_id
-			GROUP BY tasks.identifier
+			FROM ${safeSchema}.jobs jobs
+			GROUP BY jobs.task_identifier
 		`)
 	})
 
@@ -139,16 +142,33 @@ export async function queryJobCounts(
 }
 
 export async function queryRecentJobs(
-	utils: WorkerUtils,
+	utils: Pick<WorkerUtils, 'withPgClient'>,
 	schema: string,
 	options: ListJobsOptions = {}
 ): Promise<ListedJob[]> {
-	const safeSchema = assertValidSchemaName(schema)
-	const limit = Math.min(
-		Math.max(options.limit ?? DEFAULT_LIST_LIMIT, 0),
-		MAX_LIST_LIMIT
+	const safeSchema = quoteSchemaName(schema)
+	const limit = options.limit ?? DEFAULT_LIST_LIMIT
+	const offset = options.offset ?? 0
+	assertInteger(limit, 'limit', 0, MAX_LIST_LIMIT)
+	assertInteger(offset, 'offset', 0)
+	if (
+		options.state !== undefined &&
+		!['pending', 'running', 'failed'].includes(options.state)
 	)
-	const offset = Math.max(options.offset ?? 0, 0)
+		throw new RangeError('Invalid job state')
+	if (options.before && options.offset !== undefined)
+		throw new RangeError('before and offset cannot be combined')
+	if (
+		options.before &&
+		(!Number.isFinite(Date.parse(options.before.createdAt)) ||
+			!/^[1-9][0-9]*$/.test(options.before.id))
+	)
+		throw new RangeError('Invalid job cursor')
+
+	const debug =
+		options.includePayload === true
+			? payloadDebugJoin(safeSchema)
+			: { column: 'NULL::json', join: '' }
 	const queue = options.queue ?? null
 	const state = options.state ?? null
 
@@ -162,6 +182,7 @@ export async function queryRecentJobs(
 			max_attempts: number
 			run_at: Date
 			created_at: Date
+			cursor_created_at: string
 			locked_at: Date | null
 			locked_by: string | null
 			last_error: string | null
@@ -169,20 +190,21 @@ export async function queryRecentJobs(
 			`
 			SELECT
 				jobs.id,
-				tasks.identifier as task_identifier,
-				jobs.payload,
+				jobs.task_identifier,
+				${debug.column} as payload,
 				jobs.priority,
 				jobs.attempts,
 				jobs.max_attempts,
 				jobs.run_at,
 				jobs.created_at,
+				to_char(jobs.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as cursor_created_at,
 				jobs.locked_at,
 				jobs.locked_by,
 				jobs.last_error
-			FROM ${safeSchema}._private_jobs jobs
-			INNER JOIN ${safeSchema}._private_tasks tasks ON tasks.id = jobs.task_id
+			FROM ${safeSchema}.jobs jobs
+			${debug.join}
 			WHERE
-				($2::text IS NULL OR tasks.identifier = $2)
+				($2::text IS NULL OR jobs.task_identifier = $2)
 				AND (
 					$3::text IS NULL
 					OR (
@@ -200,17 +222,29 @@ export async function queryRecentJobs(
 						AND jobs.attempts >= jobs.max_attempts
 					)
 				)
-			ORDER BY jobs.created_at DESC
+			AND ($5::timestamptz IS NULL OR (jobs.created_at, jobs.id) < ($5::timestamptz, $6::bigint))
+			ORDER BY jobs.created_at DESC, jobs.id DESC
 			LIMIT $1 OFFSET $4
 		`,
-			[limit, queue, state, offset]
+			[
+				limit,
+				queue,
+				state,
+				offset,
+				options.before?.createdAt ?? null,
+				options.before?.id ?? null
+			]
 		)
 	})
 
 	return result.rows.map((row) => ({
 		id: row.id,
+		cursor: { createdAt: row.cursor_created_at, id: row.id },
 		queueName: row.task_identifier,
-		payload: extractProducerLink(row.payload).cleanPayload,
+		payload:
+			options.includePayload === true
+				? extractProducerLink(row.payload).cleanPayload
+				: null,
 		priority: row.priority,
 		attempts: row.attempts,
 		maxAttempts: row.max_attempts,

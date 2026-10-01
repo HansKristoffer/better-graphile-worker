@@ -26,12 +26,31 @@ export class JobValidationError extends NonRetriableError {
 	) {
 		const details = issues
 			.map((issue) => {
-				const path = issue.path.length > 0 ? issue.path.join('.') : '(root)'
+				const path =
+					issue.path.length > 0 ? issue.path.map(String).join('.') : '(root)'
 				return `${path}: ${issue.message}`
 			})
 			.join('; ')
 		super(`Invalid payload for queue "${queueName}": ${details}`)
 		this.name = 'JobValidationError'
+	}
+}
+
+export class StepPersistenceError extends Error {
+	constructor(readonly jobId: string) {
+		super(
+			`Cannot checkpoint job "${jobId}": its worker no longer owns the lock`
+		)
+		this.name = 'StepPersistenceError'
+	}
+}
+
+export class ShutdownTimeoutError extends Error {
+	constructor(readonly timeout: number) {
+		super(
+			`Worker shutdown exceeded ${timeout}ms; shutdown is still in progress`
+		)
+		this.name = 'ShutdownTimeoutError'
 	}
 }
 
@@ -52,7 +71,7 @@ export class QueueNameCollisionError extends Error {
 export class InvalidSchemaNameError extends Error {
 	constructor(readonly schema: string) {
 		super(
-			`Invalid Graphile Worker schema name "${schema}". Use a simple SQL identifier (letters, digits, underscore).`
+			`Invalid Graphile Worker schema name "${schema}". Use a simple SQL identifier of at most 63 characters (letters, digits, underscore).`
 		)
 		this.name = 'InvalidSchemaNameError'
 	}

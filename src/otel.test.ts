@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { createNoopSpan, wrapOtelSpan } from './otel'
+import { createNoopSpan, wrapOtelSpan } from './otel.js'
 
 describe('JobSpan.addEvent', () => {
 	test('noop span accepts addEvent', () => {
@@ -8,7 +8,10 @@ describe('JobSpan.addEvent', () => {
 	})
 
 	test('wrapOtelSpan forwards compacted attributes', () => {
-		const events: { name: string; attributes?: Record<string, unknown> }[] = []
+		const events: {
+			name: string
+			attributes?: Record<string, unknown> | undefined
+		}[] = []
 		const span = wrapOtelSpan({
 			setAttribute() {},
 			setAttributes() {},

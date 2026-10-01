@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test'
 import {
 	createCompletedJobsStore,
 	type CompletedJob
-} from './completed-jobs-store'
+} from './completed-jobs-store.js'
 
 function job(overrides: Partial<CompletedJob> = {}): CompletedJob {
 	return {

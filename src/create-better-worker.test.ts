@@ -1,9 +1,9 @@
 import { describe, test, expect } from 'bun:test'
 import { z } from 'zod'
 import type { Pool } from 'pg'
-import { createQueue } from './create-queue'
-import { createBetterWorker } from './create-better-worker'
-import type { JobLogger } from './hooks'
+import { defineQueue } from './queue.js'
+import { createBetterWorker } from './create-better-worker.js'
+import type { JobLogger } from './hooks.js'
 
 const silentLogger: JobLogger = {
 	debug() {},
@@ -12,16 +12,14 @@ const silentLogger: JobLogger = {
 	error() {}
 }
 
-const sendEmail = createQueue({
+const sendEmail = defineQueue({
 	name: 'sendEmail',
-	inputSchema: z.object({ to: z.string() }),
-	processFn: async () => {}
+	inputSchema: z.object({ to: z.string() })
 })
 
-const dailySweep = createQueue({
+const dailySweep = defineQueue({
 	name: 'dailySweep',
-	cron: '0 3 * * *',
-	processFn: async () => {}
+	cron: '0 3 * * *'
 })
 
 const queues = [sendEmail, dailySweep] as const
@@ -32,6 +30,7 @@ function createTestWorker(
 	return createBetterWorker({
 		pgPool: {} as Pool,
 		queues,
+		handlers: { sendEmail: () => {}, dailySweep: () => {} },
 		hooks: { createLogger: () => silentLogger, ...hooks }
 	})
 }
@@ -82,6 +81,7 @@ describe('createBetterWorker', () => {
 		const worker = createBetterWorker({
 			pgPool: {} as Pool,
 			queues,
+			handlers: { sendEmail: () => {}, dailySweep: () => {} },
 			completedJobs: {},
 			hooks: { createLogger: () => silentLogger }
 		})
@@ -96,9 +96,16 @@ describe('createBetterWorker', () => {
 		await expect(worker.waitUntilStopped()).resolves.toBeUndefined()
 	})
 
-	test('jobs proxy exposes named enqueue helpers', () => {
+	test('named jobs exposes named enqueue helpers', () => {
 		const worker = createTestWorker()
 		expect(typeof worker.jobs.sendEmail).toBe('function')
 		expect(typeof worker.jobs.dailySweep).toBe('function')
 	})
+})
+
+test('handler-free contracts require a handler registry', () => {
+	expect(() =>
+		// @ts-expect-error A handler-free queue cannot run by itself.
+		createBetterWorker({ pgPool: {} as Pool, queues: [sendEmail] })
+	).toThrow('requires a processFn')
 })

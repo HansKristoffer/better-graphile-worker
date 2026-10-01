@@ -1,96 +1,134 @@
 import type { JobHelpers } from 'graphile-worker'
-import type { JobSpan } from './hooks'
-import { NonRetriableError, StepSerializationError } from './errors'
-import { extractStepCache, withStepCache, type StepCache } from './payload'
-import { assertValidSchemaName } from './schema-name'
+import type { JobSpan } from './hooks.js'
+import { NonRetriableError, StepSerializationError } from './errors.js'
+import {
+	extractStepCache,
+	type StepCache,
+	type StepCacheEntry
+} from './payload.js'
+import { writeCheckpoint } from './private-jobs.js'
+import {
+	assertJsonValue,
+	type JsonCompatible,
+	type JsonValue
+} from './validation.js'
 
-export type JobStep = {
-	run<T>(id: string, fn: () => Promise<T> | T): Promise<T>
+export type StepCodec<T> = {
+	encode(value: T): JsonValue
+	decode(value: unknown): T
 }
-
+export type JobStep = {
+	run<T>(
+		id: string,
+		fn: () => Promise<T> | T,
+		...check: [Exclude<T, void>] extends [JsonCompatible<Exclude<T, void>>]
+			? []
+			: [never]
+	): Promise<T>
+	run<T>(id: string, fn: () => Promise<T> | T, codec: StepCodec<T>): Promise<T>
+}
 export type StepStore = {
-	get(id: string): { output: unknown } | undefined
+	get(id: string): StepCacheEntry | undefined
 	set(id: string, output: unknown): Promise<void>
 }
-
 export function serializeStepOutput(stepId: string, value: unknown): unknown {
-	if (value === undefined) return null
 	try {
-		return JSON.parse(JSON.stringify(value))
+		assertJsonValue(value, true)
+		return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
 	} catch (error) {
-		throw new StepSerializationError(stepId, {
-			cause: error instanceof Error ? error : undefined
-		})
+		throw new StepSerializationError(stepId, { cause: error })
 	}
 }
-
 export function createStepRunner(options: {
 	store: StepStore
 	span: JobSpan
 }): JobStep {
-	return {
-		async run(id, fn) {
-			if (typeof id !== 'string' || id.length === 0) {
-				throw new NonRetriableError('Step id must be a non-empty string')
-			}
-
-			const cached = options.store.get(id)
-			if (cached) {
-				options.span.addEvent('step.cache_hit', { 'step.id': id })
-				return cached.output as never
-			}
-
-			try {
-				const result = await fn()
-				const serialized = serializeStepOutput(id, result)
-				await options.store.set(id, serialized)
-				options.span.addEvent('step.completed', { 'step.id': id })
-				return serialized as never
-			} catch (error) {
-				options.span.addEvent('step.failed', { 'step.id': id })
-				throw error
-			}
+	const pending = new Map<string, Promise<unknown>>()
+	function event(name: string, id: string) {
+		try {
+			options.span.addEvent(name, { 'step.id': id })
+		} catch {
+			/* Instrumentation is observational. */
 		}
 	}
+	async function run<T>(
+		id: string,
+		fn: () => Promise<T> | T,
+		codec?: StepCodec<T>
+	): Promise<T> {
+		if (typeof id !== 'string' || !id.length)
+			throw new NonRetriableError('Step id must be a non-empty string')
+		const decode = (output: unknown): T => {
+			if (codec) return codec.decode(serializeStepOutput(id, output))
+			return serializeStepOutput(id, output) as T
+		}
+		const cached = options.store.get(id)
+		if (cached) {
+			event('step.cache_hit', id)
+			return decode(cached.isVoid ? undefined : cached.output)
+		}
+		let work = pending.get(id)
+		if (!work) {
+			work = (async () => {
+				try {
+					const result = await fn()
+					const output = serializeStepOutput(
+						id,
+						codec ? codec.encode(result) : result
+					)
+					if (codec) decode(output)
+					await options.store.set(id, output)
+					event('step.completed', id)
+					return output
+				} catch (error) {
+					event('step.failed', id)
+					throw error
+				}
+			})()
+			pending.set(id, work)
+			void work.finally(() => pending.delete(id)).catch(() => {})
+		}
+		return decode(await work)
+	}
+	return { run }
 }
-
+function entry(output: unknown): StepCacheEntry {
+	return output === undefined ? { output: null, isVoid: true } : { output }
+}
 export function createMemoryStepStore(initial: StepCache = {}): StepStore {
-	const cache: StepCache = { ...initial }
+	const cache = new Map(Object.entries(initial))
 	return {
-		get(id) {
-			return cache[id]
-		},
+		get: (id) => cache.get(id),
 		async set(id, output) {
-			cache[id] = { output }
+			cache.set(id, entry(output))
 		}
 	}
 }
-
 export function createPgStepStore(options: {
 	helpers: JobHelpers
 	schema: string
 	jobId: string
 	rawPayload: unknown
 }): StepStore {
-	const schema = assertValidSchemaName(options.schema)
-	const cache: StepCache = { ...extractStepCache(options.rawPayload) }
-	const initialPayload = options.rawPayload
-
+	const cache = new Map(Object.entries(extractStepCache(options.rawPayload)))
+	let writes: Promise<void> = Promise.resolve()
 	return {
-		get(id) {
-			return cache[id]
-		},
-		async set(id, output) {
-			cache[id] = { output }
-			const nextPayload = withStepCache(initialPayload, cache)
-			await options.helpers.withPgClient(async (client) => {
-				await client.query(
-					`UPDATE ${schema}._private_jobs
-					SET payload = $2::jsonb, updated_at = NOW()
-					WHERE id = $1`,
-					[options.jobId, JSON.stringify(nextPayload)]
+		get: (id) => cache.get(id),
+		set(id, output) {
+			const checkpoint = entry(output)
+			const write = async () => {
+				await writeCheckpoint(
+					options.helpers,
+					options.schema,
+					options.jobId,
+					id,
+					checkpoint
 				)
-			})
+				cache.set(id, checkpoint)
+			}
+			const result = writes.then(write, write)
+			writes = result.catch(() => {})
+			return result
 		}
 	}
 }

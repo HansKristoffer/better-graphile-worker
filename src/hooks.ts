@@ -40,7 +40,7 @@ export type JobFinishedEvent = {
 	operation: 'process' | 'init'
 	attempt: number
 	maxAttempts: number
-	errorType?: string
+	errorType?: string | undefined
 }
 
 export type PermanentFailureEvent = {
@@ -59,8 +59,8 @@ export type EnqueueFailEvent = {
 
 export type BetterWorkerHooks = {
 	createLogger?: (options: CreateLoggerOptions) => JobLogger
-	onJobFinished?: (event: JobFinishedEvent) => void
-	onPermanentFailure?: (event: PermanentFailureEvent) => void
-	onEnqueueFail?: (event: EnqueueFailEvent) => void
+	onJobFinished?: (event: JobFinishedEvent) => void | Promise<void>
+	onPermanentFailure?: (event: PermanentFailureEvent) => void | Promise<void>
+	onEnqueueFail?: (event: EnqueueFailEvent) => void | Promise<void>
 	shouldSkipEnqueue?: () => boolean
 }

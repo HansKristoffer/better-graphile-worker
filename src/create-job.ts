@@ -1,319 +1,281 @@
-import type {
-	AddJobsJobSpec,
-	Job,
-	TaskSpec,
-	WorkerUtils
-} from 'graphile-worker'
+import { assertUniqueQueueNames } from './define-queues.js'
+import { compact } from './options.js'
+import type { AddJobsJobSpec, TaskSpec } from 'graphile-worker'
+import type { EnqueueAdapter } from './client.js'
 import {
-	hasInputSchema,
-	isCronQueue,
+	CRON_INIT_SUFFIX,
+	getQueueType,
 	resolveSerialQueueName,
-	type QueueAny
-} from './create-queue'
-import { JobValidationError, UnknownQueueError } from './errors'
-import type { BetterWorkerHooks, JobSpan } from './hooks'
-import type { JobOptions } from './job-options'
-import { injectTraceContext } from './payload'
-import { otelStatusCodes, withActiveSpan } from './otel'
-import type { CreateJobFn, CreateJobsFn } from './types'
+	type QueueContract
+} from './queue.js'
+import { JobValidationError, UnknownQueueError } from './errors.js'
+import type { BetterWorkerHooks, JobSpan } from './hooks.js'
+import type { BatchJobOptions, JobOptions } from './job-options.js'
+import { injectTraceContext } from './payload.js'
+import {
+	getOtel,
+	otelStatusCodes,
+	withActiveSpan,
+	type OtelApi
+} from './otel.js'
+import { observe } from './observers.js'
+import { assertInteger, assertJsonValue } from './validation.js'
+import type { CreateJobFn, CreateJobsFn, JobsApi } from './types.js'
 
-/** Applied when `createJob` is called without `maxAttempts` (Graphile's own default is 25). */
 export const DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS = 4
-
-const MAX_JOB_IDS_SPAN_ATTRIBUTE_COUNT = 50
-
-export {
-	TRACE_CONTEXT_KEY,
-	TRACEPARENT_KEY,
-	BGW_ENVELOPE_KEY,
-	type JobTraceContext,
-	injectTraceContext
-} from './payload'
-
-type AddJobFn = (
-	identifier: string,
-	payload: unknown,
-	spec?: TaskSpec
-) => Promise<Job>
-
-export type BindCreateJobOptions<TQueues extends readonly QueueAny[]> = {
-	getWorkerUtils: () => Promise<WorkerUtils>
-	queues: TQueues
+export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
+	queues: T
+	enqueue: EnqueueAdapter
 	hooks?: BetterWorkerHooks
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
+	otel?: OtelApi | null
 }
 
-function assertBatchJobKeyMode(options: JobOptions | undefined): void {
-	if (options?.jobKeyMode !== undefined) {
-		throw new Error(
-			'createJobs cannot use jobKeyMode; Graphile addJobs does not support it'
-		)
-	}
-}
-
-function setJobOptionSpanAttributes(
-	span: JobSpan,
-	options: JobOptions | undefined,
-	resolvedMaxAttempts: number
-): void {
-	if (options?.jobKey) {
-		span.setAttribute('job.key', options.jobKey)
-	}
-	if (options?.priority !== undefined) {
-		span.setAttribute('job.priority', options.priority)
-	}
-	if (options?.runAt) {
-		span.setAttribute(
-			'job.run_at',
-			options.runAt instanceof Date
-				? options.runAt.toISOString()
-				: String(options.runAt)
-		)
-	}
-	span.setAttribute('job.max_attempts', resolvedMaxAttempts)
-}
-
-function findQueue(queues: readonly QueueAny[], queueName: string): QueueAny {
-	const queue = queues.find((item) => item.name === queueName)
-	if (!queue) {
-		throw new UnknownQueueError(
-			queueName,
-			queues.map((item) => item.name)
-		)
-	}
-	return queue
-}
-
-function resolveEnqueueSpec(
-	queue: QueueAny,
-	options: JobOptions | undefined,
-	defaultMaxAttempts: number
-): {
-	maxAttempts: number
-	priority: number | undefined
-	flags: string[] | undefined
-	queueName: string | undefined
-} {
-	return {
-		maxAttempts:
-			options?.maxAttempts ?? queue.maxAttempts ?? defaultMaxAttempts,
-		priority: options?.priority ?? queue.priority,
-		flags: options?.flags ?? queue.flags,
-		queueName:
-			options?.queueName ?? resolveSerialQueueName(queue.serial, queue.name)
-	}
-}
-
-function validatePayload(
-	queue: QueueAny,
-	queueName: string,
+export async function parseQueuePayload(
+	queue: QueueContract,
 	data: unknown,
-	shouldValidate: boolean
-): unknown {
-	if (!shouldValidate) return data
-	if (isCronQueue(queue)) return data
-	if (!hasInputSchema(queue)) return data
-
-	const result = queue.inputSchema.safeParse(data)
-	if (!result.success) {
+	index?: number
+): Promise<unknown> {
+	if (!queue.inputSchema) return undefined
+	const result = await queue.inputSchema.safeParseAsync(data)
+	if (!result.success)
 		throw new JobValidationError(
-			queueName,
+			queue.name,
 			result.error.issues.map((issue) => ({
-				path: issue.path,
+				path: index === undefined ? issue.path : [index, ...issue.path],
 				message: issue.message
 			}))
 		)
-	}
-	return data
+	return result.data
 }
 
-function toTaskSpec(
-	resolved: ReturnType<typeof resolveEnqueueSpec>,
-	options: JobOptions | undefined
+export function resolveEnqueueSpec(
+	queue: QueueContract,
+	options: JobOptions | undefined,
+	defaultMaxAttempts: number,
+	cron = false
 ): TaskSpec {
-	return {
-		maxAttempts: resolved.maxAttempts,
-		priority: resolved.priority,
-		flags: resolved.flags,
-		queueName: resolved.queueName,
+	const cronOptions = cron ? queue.cronOptions : undefined
+	const maxAttempts =
+		options?.maxAttempts ??
+		cronOptions?.maxAttempts ??
+		queue.maxAttempts ??
+		defaultMaxAttempts
+	const priority = options?.priority ?? cronOptions?.priority ?? queue.priority
+	assertInteger(maxAttempts, 'maxAttempts', 1, 32767)
+	if (priority !== undefined) assertInteger(priority, 'priority', -32768, 32767)
+	if (options?.runAt && !Number.isFinite(new Date(options.runAt).getTime()))
+		throw new RangeError('runAt must be a valid timestamp')
+	return compact({
+		maxAttempts,
+		priority,
+		flags: options?.flags
+			? [...options.flags]
+			: queue.flags
+				? [...queue.flags]
+				: undefined,
+		queueName:
+			options?.queueName ??
+			cronOptions?.queueName ??
+			resolveSerialQueueName(queue.serial, queue.name),
 		runAt: options?.runAt,
-		jobKey: options?.jobKey,
-		jobKeyMode: options?.jobKeyMode
-	}
+		jobKey: options?.jobKey ?? cronOptions?.jobKey,
+		jobKeyMode: options?.jobKeyMode ?? cronOptions?.jobKeyMode
+	})
 }
 
-async function enqueueOne(
-	addJob: AddJobFn,
-	queueName: string,
-	payload: unknown,
-	spec: TaskSpec
-): Promise<string> {
-	const job = await addJob(queueName, injectTraceContext(payload), spec)
-	return String(job.id)
-}
-
-export function bindCreateJob<TQueues extends readonly QueueAny[]>(
-	options: BindCreateJobOptions<TQueues>
-): {
-	createJob: CreateJobFn<TQueues>
-	createJobs: CreateJobsFn<TQueues>
-} {
+export function bindCreateJob<const T extends readonly QueueContract[]>(
+	options: BindCreateJobOptions<T>
+) {
+	assertUniqueQueueNames(options.queues)
 	const hooks = options.hooks ?? {}
-	const validateOnEnqueue = options.validateOnEnqueue ?? true
+	const api = options.otel === undefined ? getOtel() : options.otel
 	const defaultMaxAttempts =
 		options.defaultMaxAttempts ?? DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
-
-	async function createJob(
-		queueName: string,
-		data?: unknown,
-		jobOptions?: JobOptions
-	): Promise<string | null> {
-		if (hooks.shouldSkipEnqueue?.()) {
-			return null
-		}
-
-		const queue = findQueue(options.queues, queueName)
-		const payload = validatePayload(
-			queue,
-			queueName,
-			data,
-			jobOptions?.validateOnEnqueue ?? validateOnEnqueue
-		)
-		const resolved = resolveEnqueueSpec(queue, jobOptions, defaultMaxAttempts)
-		const statusCodes = otelStatusCodes()
-
-		return withActiveSpan(
-			'worker',
-			`createJob: ${queueName}`,
-			{ kind: 'producer' },
-			async (span) => {
-				try {
-					span.setAttribute('job.queue', queueName)
-					span.setAttribute('job.batch', false)
-					setJobOptionSpanAttributes(span, jobOptions, resolved.maxAttempts)
-
-					const workerUtils = await options.getWorkerUtils()
-					const addJob = workerUtils.addJob as AddJobFn
-					const result = await enqueueOne(
-						addJob,
-						queueName,
-						isCronQueue(queue) ? {} : payload,
-						toTaskSpec(resolved, jobOptions)
-					)
-					span.setAttribute('job.id', result)
-					span.setStatus({ code: statusCodes.OK })
-					return result
-				} catch (error) {
-					const errorMessage =
-						error instanceof Error ? error.message : String(error)
-					hooks.onEnqueueFail?.({ queue: queueName, error })
-					span.setStatus({
-						code: statusCodes.ERROR,
-						message: errorMessage
-					})
-					span.recordException(
-						error instanceof Error ? error : new Error(errorMessage)
-					)
-					throw error
-				}
-			}
-		)
-	}
-
-	async function createJobs(
-		queueName: string,
-		data: unknown[],
-		jobOptions?: JobOptions
-	): Promise<string[]> {
-		if (hooks.shouldSkipEnqueue?.()) {
-			return []
-		}
-
-		const queue = findQueue(options.queues, queueName)
-		if (isCronQueue(queue)) {
-			throw new Error(
-				`createJobs cannot enqueue cron queue "${queueName}"; use createJob or triggerCron`
+	assertInteger(defaultMaxAttempts, 'defaultMaxAttempts', 1, 32767)
+	const registry = new Map(options.queues.map((queue) => [queue.name, queue]))
+	for (const queue of registry.values()) {
+		if (!queue.inputSchema && queue.cron === undefined)
+			throw new TypeError(
+				`Queue "${queue.name}" requires an inputSchema or cron schedule`
 			)
+		resolveEnqueueSpec(queue, undefined, defaultMaxAttempts)
+		if (queue.cron !== undefined) {
+			resolveEnqueueSpec(queue, undefined, defaultMaxAttempts, true)
+			if (queue.cronOptions?.backfillPeriod !== undefined)
+				assertInteger(queue.cronOptions.backfillPeriod, 'backfillPeriod', 0)
 		}
-
-		assertBatchJobKeyMode(jobOptions)
-
-		const shouldValidate = jobOptions?.validateOnEnqueue ?? validateOnEnqueue
-		const payloads = data.map((item) =>
-			validatePayload(queue, queueName, item, shouldValidate)
-		)
-		const resolved = resolveEnqueueSpec(queue, jobOptions, defaultMaxAttempts)
-		const statusCodes = otelStatusCodes()
-
+	}
+	function find(name: string) {
+		const queue = registry.get(name)
+		if (!queue) throw new UnknownQueueError(name, [...registry.keys()])
+		return queue
+	}
+	async function prepare(
+		queue: QueueContract,
+		data: unknown,
+		jobOptions?: JobOptions,
+		index?: number
+	) {
+		assertJsonValue(data, true)
+		// Validate the wire input; transforms are applied again by the consumer.
+		const snapshot =
+			data === undefined ? undefined : JSON.parse(JSON.stringify(data))
+		if (jobOptions?.validateOnEnqueue ?? options.validateOnEnqueue ?? true)
+			await parseQueuePayload(queue, snapshot, index)
+		return snapshot
+	}
+	async function observed<R>(
+		name: string,
+		operation: () => Promise<R>
+	): Promise<R> {
+		try {
+			return await operation()
+		} catch (error) {
+			await observe(hooks.onEnqueueFail, { queue: name, error })
+			throw error
+		}
+	}
+	async function producerSpan<R>(
+		name: string,
+		fn: (span: JobSpan) => Promise<R>
+	): Promise<R> {
 		return withActiveSpan(
 			'worker',
-			`createJobs: ${queueName}`,
+			name,
 			{ kind: 'producer' },
 			async (span) => {
+				const codes = otelStatusCodes(api)
 				try {
-					span.setAttribute('job.queue', queueName)
-					span.setAttribute('job.batch', true)
-					span.setAttribute('job.batch_size', payloads.length)
-					setJobOptionSpanAttributes(span, jobOptions, resolved.maxAttempts)
-
-					if (payloads.length === 0) {
-						span.setAttribute('job.created_count', 0)
-						span.setStatus({ code: statusCodes.OK })
-						return []
-					}
-
-					const workerUtils = await options.getWorkerUtils()
-					const specs: AddJobsJobSpec[] = payloads.map((item) => ({
-						identifier: queueName,
-						payload: injectTraceContext(item),
-						maxAttempts: resolved.maxAttempts,
-						priority: resolved.priority,
-						flags: resolved.flags,
-						queueName: resolved.queueName,
-						runAt: jobOptions?.runAt,
-						jobKey: jobOptions?.jobKey
-					}))
-					const jobs = await workerUtils.addJobs(specs)
-					const result = jobs.map((job) => String(job.id))
-
-					span.setAttribute('job.created_count', result.length)
-					if (result.length <= MAX_JOB_IDS_SPAN_ATTRIBUTE_COUNT) {
-						span.setAttribute('job.ids', result.join(','))
-					}
-					span.setStatus({ code: statusCodes.OK })
+					const result = await fn(span)
+					span.setStatus({ code: codes.OK })
 					return result
 				} catch (error) {
-					const errorMessage =
-						error instanceof Error ? error.message : String(error)
-					hooks.onEnqueueFail?.({ queue: queueName, error })
-					span.setStatus({
-						code: statusCodes.ERROR,
-						message: errorMessage
-					})
+					const message = error instanceof Error ? error.message : String(error)
+					span.setStatus({ code: codes.ERROR, message })
 					span.recordException(
-						error instanceof Error ? error : new Error(errorMessage)
+						error instanceof Error ? error : new Error(message)
 					)
 					throw error
 				}
-			}
+			},
+			api
 		)
 	}
-
+	async function enqueueOne(
+		name: string,
+		data?: unknown,
+		jobOptions?: JobOptions,
+		cron = false
+	): Promise<string | null> {
+		return observed(name, async () => {
+			if (hooks.shouldSkipEnqueue?.()) return null
+			const queue = find(name)
+			if (cron && queue.cron === undefined)
+				throw new Error(`"${name}" is not a cron queue`)
+			const type = getQueueType(queue)
+			const task =
+				cron && type === 'cron-init' ? `${name}${CRON_INIT_SUFFIX}` : name
+			const payload =
+				cron || type === 'cron'
+					? undefined
+					: await prepare(queue, data, jobOptions)
+			const spec = resolveEnqueueSpec(
+				queue,
+				jobOptions,
+				defaultMaxAttempts,
+				cron || type === 'cron'
+			)
+			return producerSpan(`createJob: ${task}`, async (span) => {
+				span.setAttributes({
+					'job.queue': task,
+					'job.batch': false,
+					'job.max_attempts': spec.maxAttempts ?? defaultMaxAttempts
+				})
+				const job = await options.enqueue.addJob(
+					task,
+					injectTraceContext(payload, api),
+					spec
+				)
+				span.setAttribute('job.id', String(job.id))
+				return String(job.id)
+			})
+		})
+	}
+	async function enqueueMany(
+		name: string,
+		data: readonly unknown[],
+		jobOptions?: BatchJobOptions
+	): Promise<string[]> {
+		return observed(name, async () => {
+			if (hooks.shouldSkipEnqueue?.()) return []
+			const queue = find(name)
+			if (!queue.inputSchema)
+				throw new Error(
+					`createJobs cannot enqueue cron queue "${name}"; use createJob or triggerCron`
+				)
+			if (
+				jobOptions?.jobKeyMode !== undefined ||
+				jobOptions?.jobKey !== undefined
+			)
+				throw new Error(
+					'createJobs cannot use jobKey or jobKeyMode; batch items must have independent keys'
+				)
+			const spec = resolveEnqueueSpec(queue, jobOptions, defaultMaxAttempts)
+			return producerSpan(`createJobs: ${name}`, async (span) => {
+				span.setAttributes({
+					'job.queue': name,
+					'job.batch': true,
+					'job.batch_size': data.length
+				})
+				const { jobKeyMode: _mode, jobKey: _key, ...batchSpec } = spec
+				const specs: AddJobsJobSpec[] = []
+				for (const [index, item] of data.entries())
+					specs.push({
+						identifier: name,
+						...batchSpec,
+						payload: injectTraceContext(
+							await prepare(queue, item, jobOptions, index),
+							api
+						)
+					})
+				if (!specs.length) return []
+				const jobs = await options.enqueue.addJobs(specs)
+				const ids = jobs.map((job) => String(job.id))
+				span.setAttribute('job.created_count', ids.length)
+				if (ids.length <= 50) span.setAttribute('job.ids', ids.join(','))
+				return ids
+			})
+		})
+	}
+	// All erased calls pass through this registry/validation boundary.
+	const createJob = enqueueOne as CreateJobFn<T>
+	const createJobs = enqueueMany as CreateJobsFn<T>
 	return {
-		createJob: createJob as CreateJobFn<TQueues>,
-		createJobs: createJobs as CreateJobsFn<TQueues>
+		createJob,
+		createJobs,
+		enqueueOne,
+		enqueueMany,
+		triggerCron: (name: string, opts?: JobOptions) =>
+			enqueueOne(name, undefined, opts, true)
 	}
 }
 
-export function createJobsApi<TQueues extends readonly QueueAny[]>(
-	createJob: CreateJobFn<TQueues>
-): import('./types').JobsApi<TQueues> {
-	return new Proxy({} as import('./types').JobsApi<TQueues>, {
-		get(_target, prop) {
-			if (typeof prop !== 'string') return undefined
-			return (data?: unknown, options?: JobOptions) =>
-				createJob(prop as never, data as never, options)
-		}
-	})
+export function createJobsApi<T extends readonly QueueContract[]>(
+	createJob: CreateJobFn<T>,
+	queues: T
+): JobsApi<T> {
+	const jobs: Record<
+		string,
+		(data?: unknown, options?: JobOptions) => Promise<string | null>
+	> = Object.create(null)
+	const enqueue = createJob as (
+		name: string,
+		data?: unknown,
+		opts?: JobOptions
+	) => Promise<string | null>
+	for (const { name } of queues)
+		jobs[name] = (data, opts) => enqueue(name, data, opts)
+	return Object.freeze(jobs) as JobsApi<T>
 }

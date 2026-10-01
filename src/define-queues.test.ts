@@ -1,20 +1,18 @@
 import { describe, test, expect, expectTypeOf } from 'bun:test'
 import { z } from 'zod'
-import { createQueue } from './create-queue'
-import { assertUniqueQueueNames, defineQueues } from './define-queues'
-import { DuplicateQueueError, QueueNameCollisionError } from './errors'
+import { defineQueue } from './queue.js'
+import { assertUniqueQueueNames, defineQueues } from './define-queues.js'
+import { DuplicateQueueError, QueueNameCollisionError } from './errors.js'
 
 describe('defineQueues', () => {
 	test('returns the same tuple and preserves name literals', () => {
-		const sendEmail = createQueue({
+		const sendEmail = defineQueue({
 			name: 'sendEmail',
-			inputSchema: z.object({ to: z.string() }),
-			processFn: async () => {}
+			inputSchema: z.object({ to: z.string() })
 		})
-		const sweep = createQueue({
+		const sweep = defineQueue({
 			name: 'sweep',
-			cron: '0 * * * *',
-			processFn: async () => {}
+			cron: '0 * * * *'
 		})
 		const queues = defineQueues([sendEmail, sweep])
 		expect(queues).toHaveLength(2)
@@ -23,34 +21,41 @@ describe('defineQueues', () => {
 	})
 
 	test('rejects duplicate names', () => {
-		const a = createQueue({
+		const a = defineQueue({
 			name: 'dup',
-			inputSchema: z.object({ id: z.string() }),
-			processFn: async () => {}
+			inputSchema: z.object({ id: z.string() })
 		})
-		const b = createQueue({
+		const b = defineQueue({
 			name: 'dup',
-			inputSchema: z.object({ id: z.string() }),
-			processFn: async () => {}
+			inputSchema: z.object({ id: z.string() })
 		})
 		expect(() => assertUniqueQueueNames([a, b])).toThrow(DuplicateQueueError)
 	})
 
 	test('rejects cron-init task name collisions', () => {
-		const processor = createQueue({
+		const processor = defineQueue({
 			name: 'sync_cron-init',
-			inputSchema: z.object({ id: z.string() }),
-			processFn: async () => {}
+			inputSchema: z.object({ id: z.string() })
 		})
-		const cronInit = createQueue({
+		const cronInit = defineQueue({
 			name: 'sync',
 			cron: '0 * * * *',
-			inputSchema: z.object({ id: z.string() }),
-			initFn: async () => [],
-			processFn: async () => {}
+			inputSchema: z.object({ id: z.string() })
 		})
 		expect(() => assertUniqueQueueNames([processor, cronInit])).toThrow(
 			QueueNameCollisionError
 		)
+		expect(() => assertUniqueQueueNames([cronInit, processor])).toThrow(
+			QueueNameCollisionError
+		)
+	})
+
+	test('checks names from dynamic arrays at runtime', () => {
+		const queues: import('./queue.js').QueueContract[] = [
+			defineQueue({ name: 'then', inputSchema: z.string() })
+		]
+		expect(() => defineQueues(queues)).toThrow('reserved')
+		queues[0] = defineQueue({ name: '', inputSchema: z.string() })
+		expect(() => defineQueues(queues)).toThrow('non-empty')
 	})
 })
