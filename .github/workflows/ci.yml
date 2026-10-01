@@ -19,7 +19,6 @@ jobs:
     name: PR title
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@v8
