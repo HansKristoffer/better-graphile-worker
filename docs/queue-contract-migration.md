@@ -1,6 +1,4 @@
----
-"better-graphile-worker": major
----
+# Queue contract migration
 
 Replace createQueue with defineQueue while keeping processFn and initFn alongside schemas and options. Inline contexts enqueue through typed queue references; worker/client methods retain correlated queue-name signatures. Shared handler-free contracts and registry-typed handlers remain available when producers need separate imports. Support async schemas, readonly definitions and initializer/batch inputs, and JSON-preserving steps with explicit codecs. Reject unsafe queue-reference/input unions, validate manually constructed inline handlers against their schemas, and preserve typed captured jobs and literal context names in the harness.
 
@@ -13,3 +11,5 @@ Retain permanent failures in PostgreSQL by default. Make payload inspection opt-
 Expose queue input schemas through admin definitions and support JobSpan.addEvent for tracing.
 
 Use ordinary ESM emission with source/declaration maps. Validate PostgreSQL behavior and packed declarations with minimum/latest peers and supported Node versions; include regression coverage. See README for the major-version migration.
+
+See [README migration instructions](../README.md#types-and-major-version-migration) before upgrading.
