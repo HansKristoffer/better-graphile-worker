@@ -41,6 +41,8 @@ export type JobFinishedEvent = {
 	attempt: number
 	maxAttempts: number
 	errorType?: string | undefined
+	/** The run ended with `ctx.continue()`; a continuation job was enqueued. */
+	continued?: boolean
 }
 
 export type PermanentFailureEvent = {

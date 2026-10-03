@@ -16,6 +16,7 @@ import {
 	CRON_INIT_SUFFIX,
 	getQueueType,
 	formatCronSchedule,
+	parseContinueRunAt,
 	resolveSerialQueueName,
 	type QueueContract
 } from './queue.js'
@@ -28,7 +29,7 @@ import {
 	parseQueuePayload,
 	resolveEnqueueSpec
 } from './create-job.js'
-import { NonRetriableError } from './errors.js'
+import { JobContinuedSignal, NonRetriableError } from './errors.js'
 import {
 	extractCronMeta,
 	extractProducerLink,
@@ -38,7 +39,7 @@ import {
 } from './payload.js'
 import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
-import { retainPermanentFailure } from './private-jobs.js'
+import { continueJob, retainPermanentFailure } from './private-jobs.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
 
 export type TaskListRuntime<
@@ -77,6 +78,7 @@ function createJobContext(
 		createJob: runtime.createJob,
 		createJobs: runtime.createJobs,
 		cron,
+		continue: createContinue(helpers, runtime, span),
 		logger: jobLogger(hooks, {
 			queue: queueName,
 			jobId,
@@ -94,6 +96,26 @@ function createJobContext(
 			}),
 			span
 		})
+	}
+}
+
+function createContinue(
+	helpers: JobHelpers,
+	runtime: TaskListRuntime,
+	span: JobSpan
+): JobContext['continue'] {
+	let called = false
+	return async (options) => {
+		if (called) throw new Error('ctx.continue() was already called')
+		called = true
+		const runAt = parseContinueRunAt(options)
+		const { traceparent } = injectTraceContext(undefined, runtime.otel)
+		const id = await continueJob(helpers, runtime.schema, runAt, traceparent)
+		span.setAttributes({
+			'graphile.continued': true,
+			'graphile.continuation_job_id': id
+		})
+		throw new JobContinuedSignal()
 	}
 }
 
@@ -169,10 +191,16 @@ async function executeTask(options: ExecuteTaskOptions) {
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
 			let permanent = false
+			let continued = false
 
 			try {
 				assertPayloadEnvelope(payload)
-				await executor(ctx, cleanPayload)
+				try {
+					await executor(ctx, cleanPayload)
+				} catch (error) {
+					if (!(error instanceof JobContinuedSignal)) throw error
+					continued = true
+				}
 
 				const durationMs = Date.now() - startTime
 				span.setAttributes({ 'graphile.duration_ms': durationMs })
@@ -254,7 +282,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 					operation,
 					attempt: helpers.job.attempts,
 					maxAttempts: helpers.job.max_attempts,
-					errorType
+					errorType,
+					...(continued ? { continued } : {})
 				})
 				const level = status === 'success' ? 'info' : 'error'
 				ctx.logger[level]('job.completed', {
@@ -266,6 +295,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					max_attempts: helpers.job.max_attempts,
 					duration_ms: durationMs,
 					status,
+					...(continued ? { continued } : {}),
 					...(errorType ? { error_type: errorType } : {})
 				})
 			}

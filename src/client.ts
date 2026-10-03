@@ -7,13 +7,18 @@ import {
 	type WorkerUtils
 } from 'graphile-worker'
 import type { Pool } from 'pg'
+import { addJobSql, addJobsSql } from './enqueue-sql.js'
 import { assertValidSchemaName, quoteSchemaName } from './schema-name.js'
 
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
 /** The producer's public-SQL adapter deliberately performs no migrations. */
 export type EnqueueAdapter = {
 	addJob(identifier: string, payload: unknown, spec?: TaskSpec): Promise<Job>
-	addJobs(specs: readonly AddJobsJobSpec[]): Promise<readonly Job[]>
+	/** Return jobs in spec order and honor Graphile's batch preserve_run_at flag. */
+	addJobs(
+		specs: readonly AddJobsJobSpec[],
+		jobKeyPreserveRunAt?: boolean
+	): Promise<readonly Job[]>
 }
 export type WorkerClient = {
 	readonly enqueue: EnqueueAdapter
@@ -66,46 +71,22 @@ export function createWorkerClient(options: {
 	}
 	const enqueue: EnqueueAdapter = {
 		async addJob(identifier, payload, spec = {}) {
-			const result = await options.pgPool.query<DbJob>(
-				`SELECT * FROM ${sqlSchema}.add_job(
-				identifier := $1::text, payload := $2::json, queue_name := $3::text,
-				run_at := $4::timestamptz, max_attempts := $5::int, job_key := $6::text,
-				priority := $7::int, flags := $8::text[], job_key_mode := $9::text
-			)`,
-				[
-					identifier,
-					JSON.stringify(payload),
-					spec.queueName ?? null,
-					spec.runAt ?? null,
-					spec.maxAttempts ?? null,
-					spec.jobKey ?? null,
-					spec.priority ?? null,
-					spec.flags ?? null,
-					spec.jobKeyMode ?? 'replace'
-				]
-			)
-			const job = result.rows[0]
-			if (!job) throw new Error('Graphile add_job returned no job')
+			const { text, values } = addJobSql(schema, identifier, payload, spec, '*')
+			const job = (await options.pgPool.query<DbJob>(text, values)).rows[0]
+			if (!job?.id) throw new Error('Graphile add_job returned no job')
 			return { ...job, task_identifier: identifier }
 		},
-		async addJobs(specs) {
+		async addJobs(specs, jobKeyPreserveRunAt = false) {
 			if (!specs.length) return []
-			const dbSpecs = specs.map((spec) => ({
-				identifier: spec.identifier,
-				payload: spec.payload,
-				queue_name: spec.queueName,
-				run_at: spec.runAt,
-				max_attempts: spec.maxAttempts,
-				job_key: spec.jobKey,
-				priority: spec.priority,
-				flags: spec.flags
-			}))
-			const result = await options.pgPool.query<DbJob>(
-				`SELECT * FROM ${sqlSchema}.add_jobs(
-				ARRAY(SELECT json_populate_recordset(NULL::${sqlSchema}.job_spec, $1::json)), false
-			)`,
-				[JSON.stringify(dbSpecs)]
+			const { text, values } = addJobsSql(
+				schema,
+				specs,
+				jobKeyPreserveRunAt,
+				'jobs.*'
 			)
+			const result = await options.pgPool.query<DbJob>(text, values)
+			if (result.rows.length !== specs.length)
+				throw new Error('Graphile add_jobs returned fewer jobs than requested')
 			return result.rows.map((job, index) => ({
 				...job,
 				task_identifier: specs[index]!.identifier
