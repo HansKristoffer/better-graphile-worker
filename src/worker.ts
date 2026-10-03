@@ -480,6 +480,23 @@ export type GraphileRunnerOverrides = Omit<
 	| 'pollInterval'
 >
 
+/**
+ * graphile-worker's default (-1) completes/fails jobs fire-and-forget, so stop()
+ * and runOnce() can resolve before the job row is updated. Batching (even with
+ * no delay) is flushed during shutdown. Caller presets still take precedence.
+ */
+function withDurableCompletion(graphile: GraphileRunnerOverrides | undefined) {
+	return {
+		...graphile,
+		preset: {
+			extends: [
+				{ worker: { completeJobBatchDelay: 0, failJobBatchDelay: 0 } },
+				...(graphile?.preset ? [graphile.preset] : [])
+			]
+		}
+	}
+}
+
 export async function startRunner(options: {
 	pgPool: Pool
 	schema: string
@@ -495,7 +512,7 @@ export async function startRunner(options: {
 
 	return run(
 		compact({
-			...options.graphile,
+			...withDurableCompletion(options.graphile),
 			pgPool: options.pgPool,
 			schema: options.schema,
 			taskList: options.taskList,
@@ -515,7 +532,7 @@ export async function runOnceTasks(options: {
 	graphile?: GraphileRunnerOverrides | undefined
 }): Promise<void> {
 	await runOnce({
-		...options.graphile,
+		...withDurableCompletion(options.graphile),
 		pgPool: options.pgPool,
 		schema: options.schema,
 		taskList: options.taskList,
