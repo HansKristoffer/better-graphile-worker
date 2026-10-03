@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.1](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.1.0...v2.1.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **worker:** persist job completion before shutdown resolves ([#7](https://github.com/HansKristoffer/better-graphile-worker/issues/7)) ([39b116a](https://github.com/HansKristoffer/better-graphile-worker/commit/39b116a2126c67c5211a253a82a2f43847dbe114))
+
 ## [2.1.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.0.0...v2.1.0) (2026-10-03)
 
 
