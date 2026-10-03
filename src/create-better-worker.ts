@@ -40,13 +40,15 @@ import {
 } from './worker.js'
 import { jobLogger } from './observers.js'
 import { createLifecycle } from './lifecycle.js'
-import { normalizeWorkerQueues } from './registry.js'
+import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
+	PrepareJobFn,
+	PrepareJobsFn,
 	CronQueueName,
 	JobsApi,
 	QueueName
@@ -70,6 +72,11 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	otel?: { api: OtelApi | null }
 	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
 	permanentFailure?: 'discard' | 'retain' | undefined
+	/**
+	 * Run only these queues (and their cron schedules); defaults to all. Enqueueing still
+	 * covers every queue, so separate instances can give workloads their own concurrency.
+	 */
+	process?: readonly NoInfer<QueueName<TQueues>>[]
 }
 
 export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
@@ -86,6 +93,9 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
 	readonly createJobs: CreateJobsFn<TQueues>
+	/** Build enqueue SQL to execute inside your own transaction. */
+	readonly prepareJob: PrepareJobFn<TQueues>
+	readonly prepareJobs: PrepareJobsFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
 	readonly promise: Promise<void>
 	migrate(): Promise<void>
@@ -125,11 +135,32 @@ function resolveCompletedJobsStore(option: CompletedJobsOption | undefined) {
 	return createCompletedJobsStore(option.maxPerQueue)
 }
 
+function selectProcessed(
+	queues: NormalizedQueue[],
+	names: readonly string[] | undefined
+): NormalizedQueue[] {
+	if (names === undefined) return queues
+	const known = new Set(queues.map((queue) => queue.name))
+	if (!names.length) throw new TypeError('process must list at least one queue')
+	const selected = new Set<string>()
+	for (const name of names) {
+		if (!known.has(name))
+			throw new TypeError(`process lists unknown queue "${name}"`)
+		if (selected.has(name))
+			throw new TypeError(`process lists queue "${name}" twice`)
+		selected.add(name)
+	}
+	return queues.filter((queue) => selected.has(queue.name))
+}
+
 export function createBetterWorker<
 	const TQueues extends readonly QueueContract[]
 >(options: BetterWorkerOptions<TQueues>): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
-	const queues = normalizeWorkerQueues(options.queues, options.handlers)
+	const queues = selectProcessed(
+		normalizeWorkerQueues(options.queues, options.handlers),
+		options.process
+	)
 	const otel = options.otel ? options.otel.api : getOtel()
 	assertInteger(options.concurrency ?? DEFAULT_CONCURRENCY, 'concurrency', 1)
 	assertInteger(
@@ -150,13 +181,14 @@ export function createBetterWorker<
 		enqueue: client.enqueue,
 		otel,
 		queues: options.queues,
+		schema,
 		...compact({
 			hooks,
 			validateOnEnqueue: options.validateOnEnqueue,
 			defaultMaxAttempts: options.defaultMaxAttempts
 		})
 	})
-	const { createJob, createJobs } = producer
+	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
 	const runtime = {
@@ -196,6 +228,8 @@ export function createBetterWorker<
 		queues: options.queues,
 		createJob,
 		createJobs,
+		prepareJob,
+		prepareJobs,
 		jobs,
 		get promise() {
 			return lifecycle.promise

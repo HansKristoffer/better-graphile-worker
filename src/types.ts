@@ -82,6 +82,33 @@ export type CreateJobsFn<TQueues extends readonly QueueContract[]> =
 			) => Promise<string[]>
 		: (...args: BatchArgs<TQueues[number]>) => Promise<string[]>
 
+/** Enqueue SQL to run in the caller's own transaction; it has no effect until executed. */
+export type PreparedJob = {
+	readonly queue: string
+	/** Returns one `id` row per created job. */
+	readonly text: string
+	readonly values: (string | number | boolean | null)[]
+	/** True when `shouldSkipEnqueue` applied; the statement then inserts nothing. */
+	readonly skipped: boolean
+}
+
+export type PrepareJobFn<TQueues extends readonly QueueContract[]> =
+	string extends QueueName<TQueues>
+		? (
+				queueName: string,
+				data?: unknown,
+				options?: JobOptions
+			) => Promise<PreparedJob>
+		: (...args: EnqueueArgs<TQueues[number]>) => Promise<PreparedJob>
+export type PrepareJobsFn<TQueues extends readonly QueueContract[]> =
+	string extends QueueName<TQueues>
+		? (
+				queueName: string,
+				data: readonly unknown[],
+				options?: BatchJobOptions
+			) => Promise<PreparedJob>
+		: (...args: BatchArgs<TQueues[number]>) => Promise<PreparedJob>
+
 /** A union reference must accept the input regardless of which queue it selects. */
 type ReferenceInput<Q> = (
 	Q extends QueueContract

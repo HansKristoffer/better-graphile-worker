@@ -619,3 +619,74 @@ if (hasInputSchema(erasedContract)) {
 	// @ts-expect-error Guard narrowing preserves readonly schema fields.
 	erasedContract.inputSchema = z.string()
 }
+
+// Derived job options receive pre-transform input; cron queues have no input.
+const derived = defineQueue({
+	name: 'derived',
+	inputSchema: z.object({
+		shop: z.string(),
+		size: z.string().transform(Number)
+	}),
+	deriveJobOptions: (input) => {
+		const size: string = input.size
+		// @ts-expect-error Derive input is typed, not any
+		void input.missing
+		return { queueName: `shop:${input.shop}`, jobKey: size }
+	},
+	processFn: async (payload, ctx) => {
+		const size: number = payload.size
+		if (size > 1) return ctx.continue({ runAt: new Date() })
+		const never: never = await ctx.continue()
+		return never
+	}
+})
+// @ts-expect-error Plain cron queues have no input to derive from
+defineQueue({
+	name: 'derivedCron',
+	cron: '* * * * *',
+	deriveJobOptions: () => ({})
+})
+const processWorker = createBetterWorker({
+	pgPool: pool,
+	queues: [derived],
+	process: ['derived']
+})
+createBetterWorker({
+	pgPool: pool,
+	queues: [derived],
+	// @ts-expect-error Only registered queues can be processed
+	process: ['missing']
+})
+async function prepared() {
+	const job = await processWorker.prepareJob('derived', {
+		shop: 's',
+		size: '1'
+	})
+	const text: string = job.text
+	const values: (string | number | boolean | null)[] = job.values
+	await client.prepareJobs('email', [{ to: 'person' }])
+	// @ts-expect-error Prepared jobs keep payload correlation
+	await client.prepareJob('email', 'hello')
+	return [text, values]
+}
+void prepared
+
+// Existing one-argument advanced adapters remain assignable.
+declare const oldAdapter: {
+	addJob: advanced.EnqueueAdapter['addJob']
+	addJobs(
+		specs: Parameters<advanced.EnqueueAdapter['addJobs']>[0]
+	): ReturnType<advanced.EnqueueAdapter['addJobs']>
+}
+const compatibleAdapter: advanced.EnqueueAdapter = oldAdapter
+void compatibleAdapter
+defineQueue({
+	name: 'asyncDerived',
+	inputSchema: z.string(),
+	// @ts-expect-error Derived options must be synchronous.
+	deriveJobOptions: async () => ({})
+})
+// @ts-expect-error Prepared calls require correlated names and inputs.
+client.prepareJob(name, payload)
+// @ts-expect-error Plain cron queues cannot be prepared as batches.
+client.prepareJobs('tick', [undefined])

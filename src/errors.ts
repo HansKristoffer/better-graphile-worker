@@ -89,3 +89,11 @@ export class StepSerializationError extends NonRetriableError {
 		this.name = 'StepSerializationError'
 	}
 }
+
+/** Internal: thrown by `ctx.continue()` so nothing after it runs; treated as success. */
+export class JobContinuedSignal extends Error {
+	constructor() {
+		super('Job continued; code after ctx.continue() must not run')
+		this.name = 'JobContinuedSignal'
+	}
+}

@@ -27,9 +27,33 @@ export type QueueCronOptions = Pick<
 	identifier?: string
 }
 
+/** Per-job options derived from the wire input; explicit call options take precedence. */
+export type DerivedJobOptions = {
+	queueName?: string
+	jobKey?: string
+	jobKeyMode?: 'replace' | 'preserve_run_at' | 'unsafe_dedupe'
+	priority?: number
+	flags?: readonly string[]
+}
+
 export type JobCronMeta = {
 	ts: Date
 	backfilled?: boolean
+}
+
+export type ContinueOptions = {
+	/** When the continuation may start; defaults to now. */
+	runAt?: Date | string
+}
+
+export function parseContinueRunAt(
+	options: ContinueOptions | undefined
+): Date | undefined {
+	if (options?.runAt === undefined) return undefined
+	const runAt = new Date(options.runAt)
+	if (!Number.isFinite(runAt.getTime()))
+		throw new RangeError('runAt must be a valid timestamp')
+	return runAt
 }
 
 /** Context object passed to process and init functions */
@@ -49,6 +73,11 @@ export type JobContext<
 	createJobs: CreateJobsFn<TQueues>
 	cron?: JobCronMeta | undefined
 	step: JobStep
+	/**
+	 * End this run successfully and enqueue the same job again (same input, lane, key,
+	 * priority, flags and steps, fresh attempts). Code after it never runs.
+	 */
+	continue(options?: ContinueOptions): Promise<never>
 }
 
 export type QueueContract<
@@ -64,6 +93,10 @@ export type QueueContract<
 	readonly serial?: boolean | string
 	readonly cron?: CronSchedule
 	readonly cronOptions?: Readonly<QueueCronOptions>
+	/** Synchronous, pure: derive a lane, key, priority or flags from each job's wire input. */
+	deriveJobOptions?(
+		input: TSchema extends z.ZodType ? z.input<NoInfer<TSchema>> : never
+	): DerivedJobOptions
 }
 
 /** Shared contracts cannot carry competing inline handler implementations. */
@@ -81,7 +114,11 @@ export type RegularQueueContract<
 export type CronQueueContract<N extends string = string> = QueueContract<
 	N,
 	undefined
-> & { readonly cron: CronSchedule; readonly inputSchema?: never }
+> & {
+	readonly cron: CronSchedule
+	readonly inputSchema?: never
+	readonly deriveJobOptions?: never
+}
 export type CronInitQueueContract<
 	S extends z.ZodType,
 	N extends string = string

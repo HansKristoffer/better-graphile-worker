@@ -7,7 +7,13 @@ import { bindCreateJob, createJobsApi } from './create-job.js'
 import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import { getOtel, type OtelApi } from './otel.js'
-import type { CreateJobFn, CreateJobsFn, JobsApi } from './types.js'
+import type {
+	CreateJobFn,
+	CreateJobsFn,
+	JobsApi,
+	PrepareJobFn,
+	PrepareJobsFn
+} from './types.js'
 
 export type JobClientOptions<TQueues extends readonly QueueContract[]> = {
 	pgPool: Pool
@@ -24,6 +30,9 @@ export type JobClient<TQueues extends readonly QueueContract[]> = {
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
 	readonly createJobs: CreateJobsFn<TQueues>
+	/** Build enqueue SQL to execute inside your own transaction. */
+	readonly prepareJob: PrepareJobFn<TQueues>
+	readonly prepareJobs: PrepareJobsFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
 	migrate(): Promise<void>
 	release(): Promise<void>
@@ -40,22 +49,26 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		pgPool: options.pgPool,
 		schema
 	})
-	const { createJob, createJobs } = bindCreateJob<TQueues>({
-		enqueue: client.enqueue,
-		otel: options.otel ? options.otel.api : getOtel(),
-		queues: options.queues,
-		...compact({
-			hooks: options.hooks,
-			validateOnEnqueue: options.validateOnEnqueue,
-			defaultMaxAttempts: options.defaultMaxAttempts
+	const { createJob, createJobs, prepareJob, prepareJobs } =
+		bindCreateJob<TQueues>({
+			enqueue: client.enqueue,
+			otel: options.otel ? options.otel.api : getOtel(),
+			queues: options.queues,
+			schema,
+			...compact({
+				hooks: options.hooks,
+				validateOnEnqueue: options.validateOnEnqueue,
+				defaultMaxAttempts: options.defaultMaxAttempts
+			})
 		})
-	})
 
 	return {
 		schema,
 		queues: options.queues,
 		createJob,
 		createJobs,
+		prepareJob,
+		prepareJobs,
 		jobs: createJobsApi(createJob, options.queues),
 		migrate() {
 			return client.migrate()

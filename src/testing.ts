@@ -6,7 +6,8 @@ import {
 	type InlineQueues,
 	type RunnableQueue,
 	type QueueHandlers,
-	CRON_INIT_SUFFIX
+	CRON_INIT_SUFFIX,
+	parseContinueRunAt
 } from './queue.js'
 import type { JobLogger, LogAttributes } from './hooks.js'
 import { createNoopSpan } from './otel.js'
@@ -25,6 +26,7 @@ import { extractProducerLink } from './payload.js'
 import { bindCreateJob, parseQueuePayload } from './create-job.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import type { JobOptions } from './job-options.js'
+import { JobContinuedSignal } from './errors.js'
 
 export type CapturedLog = {
 	level: keyof JobLogger
@@ -45,6 +47,12 @@ export type CapturedEnqueue<
 		: never
 	: never
 
+export type CapturedContinue = {
+	queue: string
+	jobId: string
+	runAt: Date | undefined
+}
+
 type ProcessArgs<T extends readonly QueueContract[]> = T[number] extends infer Q
 	? Q extends QueueContract
 		? [
@@ -58,6 +66,8 @@ type ProcessArgs<T extends readonly QueueContract[]> = T[number] extends infer Q
 export type TestHarness<T extends readonly QueueContract[]> = {
 	logs: CapturedLog[]
 	enqueued: CapturedEnqueue<T>[]
+	/** Runs that ended with `ctx.continue()`; `process()` resolves normally for them. */
+	continued: CapturedContinue[]
 	clearLogs(): void
 	process<const Args extends ProcessArgs<T>>(
 		...args: Args
@@ -159,6 +169,7 @@ export function createTestHarness<
 	const stepCaches = new Map<string, StepStore>()
 	let invocation = 0
 	const enqueued: CapturedEnqueue[] = []
+	const continued: CapturedContinue[] = []
 	const producer = bindCreateJob({
 		queues: contracts,
 		otel: null,
@@ -197,6 +208,7 @@ export function createTestHarness<
 			new AbortController().signal
 		const helpers =
 			extras?.helpers ?? fakeHelpers(queueName, { ...extras, jobId, signal })
+		let called = false
 		return {
 			jobId,
 			queue: extras?.queue ?? queueName,
@@ -209,6 +221,18 @@ export function createTestHarness<
 			createJob: extras?.createJob ?? producer.enqueueOne,
 			createJobs: extras?.createJobs ?? producer.enqueueMany,
 			cron: extras?.cron,
+			continue:
+				extras?.continue ??
+				(async (options) => {
+					if (called) throw new Error('ctx.continue() was already called')
+					called = true
+					continued.push({
+						queue: queueName,
+						jobId,
+						runAt: parseContinueRunAt(options)
+					})
+					throw new JobContinuedSignal()
+				}),
 			step:
 				extras?.step ??
 				createStepRunner({
@@ -229,6 +253,7 @@ export function createTestHarness<
 	const harness = {
 		logs,
 		enqueued,
+		continued,
 		clearLogs() {
 			logs.length = 0
 		},
@@ -240,7 +265,11 @@ export function createTestHarness<
 			const queue = getQueue(String(queueName))
 			const ctx = context(String(queueName), extras)
 			const parsed = await parseQueuePayload(queue, payload)
-			await queue.processFn(parsed, ctx)
+			try {
+				await queue.processFn(parsed, ctx)
+			} catch (error) {
+				if (!(error instanceof JobContinuedSignal)) throw error
+			}
 			return { ctx, logs: [...logs] }
 		},
 		async init(queueName: string, extras?: Partial<JobContext>) {
@@ -248,9 +277,14 @@ export function createTestHarness<
 			if (!queue.initFn) {
 				throw new Error(`Queue "${String(queueName)}" is not a cron-init queue`)
 			}
-			return queue.initFn(
-				context(`${String(queueName)}${CRON_INIT_SUFFIX}`, extras)
-			)
+			try {
+				return await queue.initFn(
+					context(`${String(queueName)}${CRON_INIT_SUFFIX}`, extras)
+				)
+			} catch (error) {
+				if (!(error instanceof JobContinuedSignal)) throw error
+				return []
+			}
 		},
 		context
 	}
