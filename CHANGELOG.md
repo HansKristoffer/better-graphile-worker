@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.1.1...v2.2.0) (2026-10-10)
+
+
+### Features
+
+* **worker:** report failure messages and payloads to logs and hooks ([#10](https://github.com/HansKristoffer/better-graphile-worker/issues/10)) ([566f558](https://github.com/HansKristoffer/better-graphile-worker/commit/566f558314b3aaf8dce4d8f93df9eb3272826a82))
+
 ## [2.1.1](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.1.0...v2.1.1) (2026-10-03)
 
 
