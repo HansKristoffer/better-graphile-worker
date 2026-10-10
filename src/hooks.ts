@@ -41,6 +41,8 @@ export type JobFinishedEvent = {
 	attempt: number
 	maxAttempts: number
 	errorType?: string | undefined
+	/** The failed attempt's error message, untrimmed. */
+	errorMessage?: string | undefined
 	/** The run ended with `ctx.continue()`; a continuation job was enqueued. */
 	continued?: boolean
 }
@@ -52,6 +54,11 @@ export type PermanentFailureEvent = {
 	operation: 'process' | 'init'
 	attempts: number
 	maxAttempts: number
+	/**
+	 * The job's payload as the producer enqueued it (wire input, without the
+	 * envelope). It may contain personal data: the hook decides what to forward.
+	 */
+	payload: unknown
 }
 
 export type EnqueueFailEvent = {
