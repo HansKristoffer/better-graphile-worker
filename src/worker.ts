@@ -119,6 +119,9 @@ function createContinue(
 	}
 }
 
+// Keeps one huge error from flooding the log; hooks get the full message.
+const LOGGED_ERROR_MESSAGE_LIMIT = 500
+
 type TaskExecutorFn = (ctx: JobContext, cleanPayload: unknown) => Promise<void>
 
 type ExecuteTaskOptions = {
@@ -190,6 +193,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
+			let errorMessage: string | undefined
 			let permanent = false
 			let continued = false
 
@@ -221,8 +225,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 			} catch (error) {
 				status = 'failed'
 				const durationMs = Date.now() - startTime
-				const errorMessage =
-					error instanceof Error ? error.message : String(error)
+				errorMessage = error instanceof Error ? error.message : String(error)
 				errorType = error instanceof Error ? error.name : 'Unknown'
 
 				span.setStatus({ code: statusCodes.ERROR, message: errorMessage })
@@ -245,7 +248,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 						jobId,
 						operation,
 						attempts: helpers.job.attempts,
-						maxAttempts: helpers.job.max_attempts
+						maxAttempts: helpers.job.max_attempts,
+						payload: cleanPayload
 					})
 					runtime.completedJobs.add({
 						id: jobId,
@@ -283,6 +287,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					attempt: helpers.job.attempts,
 					maxAttempts: helpers.job.max_attempts,
 					errorType,
+					errorMessage,
 					...(continued ? { continued } : {})
 				})
 				const level = status === 'success' ? 'info' : 'error'
@@ -296,7 +301,12 @@ async function executeTask(options: ExecuteTaskOptions) {
 					duration_ms: durationMs,
 					status,
 					...(continued ? { continued } : {}),
-					...(errorType ? { error_type: errorType } : {})
+					...(errorType ? { error_type: errorType } : {}),
+					...(errorMessage === undefined
+						? {}
+						: {
+								error_message: errorMessage.slice(0, LOGGED_ERROR_MESSAGE_LIMIT)
+							})
 				})
 			}
 		},

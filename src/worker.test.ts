@@ -17,7 +17,11 @@ import {
 	DEFAULT_GRAPHILE_WORKER_SCHEMA
 } from './create-better-worker.js'
 import { createCompletedJobsStore } from './completed-jobs-store.js'
-import type { JobLogger } from './hooks.js'
+import type {
+	JobFinishedEvent,
+	JobLogger,
+	PermanentFailureEvent
+} from './hooks.js'
 import { NonRetriableError } from './errors.js'
 
 const silentLogger: JobLogger = {
@@ -366,6 +370,70 @@ describe('non-retriable failures', () => {
 				fakeJobHelpers()
 			)
 		).rejects.toBeInstanceOf(NonRetriableError)
+	})
+})
+
+describe('failure diagnostics', () => {
+	test('a retried failure reports its error message, trimmed in the log', async () => {
+		const longMessage = `boom ${'x'.repeat(1000)}`
+		const queues = [
+			defineQueue({ name: 'flaky', inputSchema: z.object({ id: z.string() }) })
+		] as const
+		const logged: Record<string, unknown>[] = []
+		const finished: JobFinishedEvent[] = []
+		let permanent = 0
+		const runtime = testRuntime()
+		runtime.hooks.createLogger = () => ({
+			...silentLogger,
+			error: (_message, meta) => {
+				logged.push(meta ?? {})
+			}
+		})
+		runtime.hooks.onJobFinished = (event) => {
+			finished.push(event)
+		}
+		runtime.hooks.onPermanentFailure = () => {
+			permanent++
+		}
+		const tasks = buildTaskList(
+			normalizeWorkerQueues(queues, {
+				flaky: () => {
+					throw new TypeError(longMessage)
+				}
+			}),
+			runtime
+		)
+		await expect(
+			tasks.flaky!(injectTraceContext({ id: '1' }, null), fakeJobHelpers())
+		).rejects.toThrow(TypeError)
+
+		expect(permanent).toBe(0)
+		expect(finished[0]).toMatchObject({
+			status: 'failed',
+			errorType: 'TypeError',
+			errorMessage: longMessage
+		})
+		const completed = logged.find((meta) => meta.event === 'job.completed')
+		expect(completed).toMatchObject({
+			error_type: 'TypeError',
+			error_message: longMessage.slice(0, 500)
+		})
+	})
+
+	test('onPermanentFailure receives the payload without the envelope', async () => {
+		const events: PermanentFailureEvent[] = []
+		const runtime = testRuntime()
+		runtime.hooks.onPermanentFailure = (event) => {
+			events.push(event)
+		}
+		const tasks = buildTaskList(normalized, runtime)
+		await expect(
+			tasks.testRegular!(
+				injectTraceContext({ not: 'valid' }, null),
+				fakeJobHelpers()
+			)
+		).rejects.toBeInstanceOf(NonRetriableError)
+		expect(events[0]?.payload).toEqual({ not: 'valid' })
 	})
 })
 
