@@ -192,7 +192,7 @@ Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
 
-Continuation, retention, checkpointing and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+Continuation, retention, checkpointing, job outcomes and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
 
 ## Context and durable steps
 
@@ -243,16 +243,54 @@ await worker.failJobs(['123'], 'gave up')
 worker.getQueueDefinitions()
 ```
 
-`pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. Database failures cannot be hidden by local history.
+`pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. For a durable record per job, use [job outcomes](#looking-up-a-job-after-it-finishes). Database failures cannot be hidden by local history.
 
 Metadata uses Graphile's public `jobs` view. `includePayload` defaults to false and returns null payloads. Set it to true to add the private-table debugging join and inspect business payloads. Listing validates integer limits (0–1000), offsets and states. Use the returned `cursor` to retain PostgreSQL timestamp precision; the display `createdAt` loses sub-millisecond precision. Cursor and offset cannot be combined. Counts scan current jobs; avoid unnecessary high-frequency polling on large queues. Schema identifiers, including uppercase names, are quoted consistently.
+
+### Looking up a job after it finishes
+
+Graphile deletes a job once it succeeds. Set `jobOutcomes` on your workers to keep each job's final state in PostgreSQL, then look a job up by id from a worker or a job client:
+
+```ts
+const worker = createBetterWorker({
+  pgPool,
+  queues,
+  jobOutcomes: { retention: 14 * 24 * 60 * 60 * 1000 } // milliseconds; defaults to 7 days
+})
+await worker.migrate() // also creates graphile_worker.bgw_job_outcomes
+
+const job = await producer.getJob(jobId)
+switch (job.state) {
+  case 'pending': // waiting for job.runAt
+  case 'running':
+  case 'retrying': // an attempt failed (job.lastError); the next one runs at job.runAt
+    break
+  case 'completed':
+    break
+  case 'continued': // ctx.continue() ended this run; job.continuedTo is the next run's id
+    break
+  case 'failed': // permanently: attempts exhausted, NonRetriableError or failJobs
+    break
+  case 'not_found': // never existed, deleted outside the worker, or its outcome expired
+}
+```
+
+A job still in Graphile's table is reported from there, so a failed job that you retry reads `pending` again. Every state except `not_found` carries `queue` (the Graphile task identifier), `attempts`, `maxAttempts`, `createdAt` and `lastError`; finished states add `finishedAt`. Payloads are not stored.
+
+With the option on, a worker completes a successful job itself: it deletes the job and writes its outcome in one transaction while holding the job's lock. A continuation's enqueue, its outcome and the old run's removal also commit together. So within the retention period, a completed or continued job always has an outcome. If that write fails, the attempt fails and is retried, as with a failed step checkpoint. A failure outcome that cannot be written is logged, not raised. A permanently failed job also stays in Graphile's table unless you chose `permanentFailure: 'discard'`.
+
+Enable the option on every worker instance that processes jobs in the schema; an instance without it lets Graphile complete jobs and records nothing. Producers need no option: `getJob` reads live jobs either way, and outcomes when the table exists. Workers create the table on `migrate()`, `start()` and `runOnce()`, and delete expired outcomes at most once a minute while finishing jobs. Worker roles need `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the table; roles that call `getJob` need `SELECT` on it and on Graphile's `jobs` view.
+
+### CLI
 
 ```ts
 import { createCli } from 'better-graphile-worker/cli'
 await createCli(worker)(process.argv.slice(2))
 ```
 
-Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `retry <id>`, `fail <id>`, `run-once`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
+Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `get-job <id>`, `retry <id>`, `fail <id>`, `run-once`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
+
+### Testing
 
 ```ts
 import { createTestHarness } from 'better-graphile-worker/testing'
