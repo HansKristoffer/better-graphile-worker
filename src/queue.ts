@@ -68,6 +68,10 @@ export type JobContext<
 	logger: JobLogger
 	span: JobSpan
 	helpers: JobHelpers
+	/**
+	 * Aborts on graceful shutdown, or with a `JobTimeoutError` reason when the attempt
+	 * exceeds its queue's `timeout`.
+	 */
 	signal: AbortSignal
 	createJob: CreateJobFn<TQueues>
 	createJobs: CreateJobsFn<TQueues>
@@ -89,6 +93,11 @@ export type QueueContract<
 	readonly maxAttempts?: number
 	readonly priority?: number
 	readonly flags?: readonly string[]
+	/**
+	 * Fail an attempt that runs longer than this many milliseconds (applies to each run,
+	 * including continuations and cron-init). Overrides the worker's `defaultTimeout`.
+	 */
+	readonly timeout?: number
 	/** Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`. */
 	readonly serial?: boolean | string
 	readonly cron?: CronSchedule

@@ -22,7 +22,11 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 Continuations, permanent-failure retention, step checkpoints and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
-Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
+Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state. Graphile 0.17 sets `locked_by` to the worker pool's id, which every concurrent worker in the process shares, so a retry picked up by the same process has the same owner. Checkpoints and continuations therefore also match `locked_at`, which identifies the attempt.
+
+## Timeouts fail the attempt, not the handler
+
+A handler cannot be stopped from outside, so a timeout races the handler: the task function rejects with `JobTimeoutError`, which records the failure and releases the lock and lane, while the handler may keep running. The attempt's context then refuses steps, continuations and child enqueues, and the `locked_at` fence above rejects checkpoints already queued. A continuation that is committing when the timer fires decides the outcome instead, because reporting a failure next to a committed continuation would leave an exhausted row that looks failed.
 
 ## Atomic bookkeeping
 

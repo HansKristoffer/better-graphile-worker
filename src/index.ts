@@ -94,6 +94,7 @@ export {
 	InvalidSchemaNameError,
 	StepPersistenceError,
 	ShutdownTimeoutError,
+	JobTimeoutError,
 	StepSerializationError
 } from './errors.js'
 export type { OtelApi } from './otel.js'

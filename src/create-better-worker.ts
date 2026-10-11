@@ -67,6 +67,8 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	hooks?: BetterWorkerHooks
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
+	/** Fail attempts that run longer than this many milliseconds; queues override it with `timeout`. */
+	defaultTimeout?: number
 	completedJobs?: CompletedJobsOption
 	graphile?: GraphileRunnerOverrides | undefined
 	otel?: { api: OtelApi | null }
@@ -169,6 +171,8 @@ export function createBetterWorker<
 		1,
 		2147483647
 	)
+	if (options.defaultTimeout !== undefined)
+		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const hooks = options.hooks ?? {}
@@ -199,7 +203,8 @@ export function createBetterWorker<
 		logger,
 		schema,
 		otel,
-		permanentFailure: options.permanentFailure
+		permanentFailure: options.permanentFailure,
+		defaultTimeout: options.defaultTimeout
 	}
 
 	const lifecycle = createLifecycle({
@@ -286,7 +291,11 @@ export function createBetterWorker<
 			return jobs.map((job) => String(job.id))
 		},
 		getQueueDefinitions() {
-			return getQueueDefinitions(options.queues, options.defaultMaxAttempts)
+			return getQueueDefinitions(
+				options.queues,
+				options.defaultMaxAttempts,
+				options.defaultTimeout
+			)
 		}
 	}
 }

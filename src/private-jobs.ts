@@ -31,14 +31,20 @@ export async function writeCheckpoint(
 		client.query(
 			`WITH owned AS (
 		SELECT id, payload::jsonb AS data FROM ${quoted}._private_jobs
-		WHERE id = $1::bigint AND locked_by = $4::text AND locked_at IS NOT NULL FOR UPDATE
+		WHERE id = $1::bigint AND locked_by = $4::text AND date_trunc('milliseconds', locked_at) = $5::timestamptz FOR UPDATE
 	) UPDATE ${quoted}._private_jobs jobs SET
 		payload = jsonb_set(
 			owned.data,
 			'{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($2::text, $3::jsonb), true
 		), updated_at = now()
 		FROM owned WHERE jobs.id = owned.id AND owned.data->>'__bgw' = '2' AND owned.data ? 'payload'`,
-			[jobId, id, JSON.stringify(checkpoint), helpers.job.locked_by]
+			[
+				jobId,
+				id,
+				JSON.stringify(checkpoint),
+				helpers.job.locked_by,
+				helpers.job.locked_at
+			]
 		)
 	)
 

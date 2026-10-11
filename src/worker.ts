@@ -29,7 +29,11 @@ import {
 	parseQueuePayload,
 	resolveEnqueueSpec
 } from './create-job.js'
-import { JobContinuedSignal, NonRetriableError } from './errors.js'
+import {
+	JobContinuedSignal,
+	JobTimeoutError,
+	NonRetriableError
+} from './errors.js'
 import {
 	extractCronMeta,
 	extractProducerLink,
@@ -53,9 +57,65 @@ export type TaskListRuntime<
 	schema: string
 	otel?: OtelApi | null
 	permanentFailure?: 'discard' | 'retain' | undefined
+	/** Applies to queues without their own `timeout`, in milliseconds. */
+	defaultTimeout?: number | undefined
 }
 
 export { extractProducerLink } from './payload.js'
+
+/**
+ * One run's signal and deadline. JavaScript cannot stop a handler that ignores its
+ * signal, so on timeout the run is failed without it: the handler keeps running
+ * detached, and everything it starts afterwards through the context is refused.
+ */
+function createAttempt(parent: AbortSignal, timeout: number | undefined) {
+	const controller = new AbortController()
+	const forward = () => controller.abort(parent.reason)
+	if (parent.aborted) forward()
+	else parent.addEventListener('abort', forward, { once: true })
+	let expired: JobTimeoutError | undefined
+	let continuing: Promise<boolean> | undefined
+	let timer: ReturnType<typeof setTimeout> | undefined
+	return {
+		signal: controller.signal,
+		assertActive() {
+			if (expired) throw expired
+		},
+		/** A continuation committing when the timeout fires decides the run's outcome. */
+		continuing<T>(work: Promise<T>): Promise<T> {
+			continuing = work.then(
+				() => true,
+				() => false
+			)
+			return work
+		},
+		/** Settles with `work`, or with a `JobTimeoutError` once the timeout passes. */
+		run(work: Promise<void>, onAbandoned: (error?: unknown) => void) {
+			if (timeout === undefined) return work
+			return new Promise<void>((resolve, reject) => {
+				work.then(resolve, reject)
+				timer = setTimeout(() => {
+					const error = new JobTimeoutError(timeout)
+					expired = error
+					controller.abort(error)
+					void (continuing ?? Promise.resolve(false)).then((continued) =>
+						reject(continued ? new JobContinuedSignal() : error)
+					)
+					work.then(
+						() => onAbandoned(),
+						(cause) => onAbandoned(cause)
+					)
+				}, timeout)
+			})
+		},
+		dispose() {
+			clearTimeout(timer)
+			parent.removeEventListener('abort', forward)
+		}
+	}
+}
+
+type Attempt = ReturnType<typeof createAttempt>
 
 function createJobContext(
 	jobId: string,
@@ -65,7 +125,8 @@ function createJobContext(
 	hooks: BetterWorkerHooks,
 	runtime: TaskListRuntime,
 	cron: JobContext['cron'],
-	rawPayload: unknown
+	rawPayload: unknown,
+	attempt: Attempt
 ): JobContext {
 	return {
 		jobId,
@@ -74,11 +135,17 @@ function createJobContext(
 		maxAttempts: helpers.job.max_attempts,
 		span,
 		helpers,
-		signal: helpers.abortSignal,
-		createJob: runtime.createJob,
-		createJobs: runtime.createJobs,
+		signal: attempt.signal,
+		createJob: async (...args) => {
+			attempt.assertActive()
+			return runtime.createJob(...args)
+		},
+		createJobs: async (...args) => {
+			attempt.assertActive()
+			return runtime.createJobs(...args)
+		},
 		cron,
-		continue: createContinue(helpers, runtime, span),
+		continue: createContinue(helpers, runtime, span, attempt),
 		logger: jobLogger(hooks, {
 			queue: queueName,
 			jobId,
@@ -94,7 +161,8 @@ function createJobContext(
 					? rawPayload
 					: injectTraceContext(undefined, null)
 			}),
-			span
+			span,
+			assertActive: attempt.assertActive
 		})
 	}
 }
@@ -102,15 +170,19 @@ function createJobContext(
 function createContinue(
 	helpers: JobHelpers,
 	runtime: TaskListRuntime,
-	span: JobSpan
+	span: JobSpan,
+	attempt: Attempt
 ): JobContext['continue'] {
 	let called = false
 	return async (options) => {
+		attempt.assertActive()
 		if (called) throw new Error('ctx.continue() was already called')
 		called = true
 		const runAt = parseContinueRunAt(options)
 		const { traceparent } = injectTraceContext(undefined, runtime.otel)
-		const id = await continueJob(helpers, runtime.schema, runAt, traceparent)
+		const id = await attempt.continuing(
+			continueJob(helpers, runtime.schema, runAt, traceparent)
+		)
 		span.setAttributes({
 			'graphile.continued': true,
 			'graphile.continuation_job_id': id
@@ -132,6 +204,7 @@ type ExecuteTaskOptions = {
 	executor: TaskExecutorFn
 	extraAttributes?: Record<string, string | number>
 	runtime: TaskListRuntime
+	timeout: number | undefined
 }
 
 function isNonRetriable(error: unknown): boolean {
@@ -146,7 +219,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 		operation,
 		executor,
 		extraAttributes,
-		runtime
+		runtime,
+		timeout
 	} = options
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
@@ -181,6 +255,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 				span.setAttribute('messaging.producer.span_id', link.context.spanId)
 			}
 
+			const attempt = createAttempt(helpers.abortSignal, timeout)
 			const ctx = createJobContext(
 				jobId,
 				queueName,
@@ -189,7 +264,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 				runtime.hooks,
 				runtime,
 				cron,
-				payload
+				payload,
+				attempt
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
@@ -200,7 +276,22 @@ async function executeTask(options: ExecuteTaskOptions) {
 			try {
 				assertPayloadEnvelope(payload)
 				try {
-					await executor(ctx, cleanPayload)
+					await attempt.run(executor(ctx, cleanPayload), (error) =>
+						ctx.logger.warn('job.timed_out_handler_settled', {
+							event: 'job.timed_out_handler_settled',
+							queue: queueName,
+							job_id: jobId,
+							attempt: helpers.job.attempts,
+							duration_ms: Date.now() - startTime,
+							...(error === undefined
+								? {}
+								: {
+										error_message: String(
+											error instanceof Error ? error.message : error
+										).slice(0, LOGGED_ERROR_MESSAGE_LIMIT)
+									})
+						})
+					)
 				} catch (error) {
 					if (!(error instanceof JobContinuedSignal)) throw error
 					continued = true
@@ -275,6 +366,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 				throw error
 			} finally {
+				attempt.dispose()
 				const durationMs = Date.now() - startTime
 				const permanentlyFailed = status === 'failed' && permanent
 				await observe(runtime.hooks.onJobFinished, {
@@ -323,6 +415,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 
 	for (const queue of queues) {
 		const q = queue
+		const timeout = q.timeout ?? runtime.defaultTimeout
 		if (q.initFn) {
 			const initFn = q.initFn
 			const processingTaskName = q.name
@@ -336,6 +429,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					operation: 'init',
 					extraAttributes: { 'graphile.target_queue': processingTaskName },
 					runtime: erasedRuntime,
+					timeout,
 					executor: async (ctx, _cleanPayload) => {
 						const items = await initFn(ctx)
 
@@ -345,11 +439,9 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 						ctx.span.setAttribute('graphile.init_items_count', items.length)
 
 						if (items.length > 0) {
-							const jobIds = await erasedRuntime.createJobs(
-								processingTaskName,
-								items,
-								{ validateOnEnqueue: true }
-							)
+							const jobIds = await ctx.createJobs(processingTaskName, items, {
+								validateOnEnqueue: true
+							})
 							ctx.logger.info('Enqueued items for processing', {
 								jobCount: jobIds.length
 							})
@@ -364,6 +456,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					timeout,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = await parseQueuePayload(q, cleanPayload)
 						await q.processFn(validatedPayload, ctx)
@@ -377,6 +470,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					timeout,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = q.inputSchema
 							? await parseQueuePayload(q, cleanPayload)
