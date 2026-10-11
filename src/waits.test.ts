@@ -176,6 +176,13 @@ describe('waiting on child jobs in the test harness', () => {
 			processFn: () => ({ at: '2026-01-01' })
 		})
 		void defineQueue({
+			name: 'dated',
+			inputSchema: z.string(),
+			outputSchema: z.date(),
+			// @ts-expect-error Outputs are stored as JSON; a Date is not
+			processFn: () => new Date()
+		})
+		void defineQueue({
 			name: 'wrong',
 			inputSchema: z.string(),
 			outputSchema: z.number(),
@@ -208,6 +215,32 @@ describe('waiting on child jobs in the test harness', () => {
 				await ctx.step.batchTriggerAndWait('many', fetchAccount, [], {
 					timeout: 60_000
 				})
+				// A tuple of inputs returns a tuple of results.
+				const [a, b] = await ctx.step.batchTriggerAndWait(
+					'pair',
+					fetchAccount,
+					[{ accountId: 'a' }, { accountId: 'b' }]
+				)
+				const pair: [boolean, boolean] = [a.ok, b.ok]
+				void pair
+				// @ts-expect-error The pair has no third result
+				const [, , third] = await ctx.step.batchTriggerAndWait(
+					'pair',
+					fetchAccount,
+					[{ accountId: 'a' }, { accountId: 'b' }]
+				)
+				void third
+				const dynamic = await ctx.step.batchTriggerAndWait(
+					'dynamic',
+					fetchAccount,
+					['a'].map((accountId) => ({ accountId }))
+				)
+				const maybe: WaitResult<{ upserted: number }> | undefined = dynamic[0]
+				void maybe
+				await ctx.step.batchTriggerAndWait('typo', fetchAccount, [
+					// @ts-expect-error Batch items keep excess-property checks
+					{ accountId: 'a', acountId: 'typo' }
+				])
 			}
 		})
 	})

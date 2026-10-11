@@ -788,6 +788,15 @@ createBetterWorker({
 			if (!single.ok) throw single.error
 			// @ts-expect-error Waited inputs use the child's producer input
 			await ctx.step.triggerAndWait('bad', waitContracts[0], { accountId: 1 })
+			const [one, two] = await ctx.step.batchTriggerAndWait(
+				'pair-v1',
+				waitContracts[0],
+				[{ accountId: 'a' }, { accountId: 'b' }]
+			)
+			const pair: [boolean, boolean] = [one.ok, two.ok]
+			void pair
+			// @ts-expect-error A handlers registry waits only on its own queues
+			await ctx.step.triggerAndWait('other', inlineCount, 'text')
 		}
 	}
 })

@@ -30,7 +30,11 @@ export type StepCodec<T> = {
 type WaitArgs<Input> = undefined extends Input
 	? [input?: Input, options?: WaitOptions]
 	: [input: Input, options?: WaitOptions]
-export type JobStep = {
+/**
+ * `TQueue` is the queues a context may wait on: any reference for inline handlers, the
+ * registry's queues for a handlers registry.
+ */
+export type JobStep<TQueue extends QueueContract = QueueContract> = {
 	run<T>(
 		id: string,
 		fn: () => Promise<T> | T,
@@ -44,20 +48,25 @@ export type JobStep = {
 	 * run ends and the job waits without spending an attempt; it then runs again from
 	 * the top and this call returns the checkpointed result. Code before it repeats.
 	 */
-	triggerAndWait<const Q extends QueueContract>(
+	triggerAndWait<const Q extends TQueue>(
 		id: string,
 		queue: Q,
 		...args: WaitArgs<NoInfer<ReferenceInput<Q>>>
 	): Promise<WaitResult<InferOutput<Q>>>
-	/** Like `triggerAndWait` for a batch, enqueued atomically; results keep input order. */
+	/**
+	 * Like `triggerAndWait` for a batch, enqueued atomically. Results keep input order,
+	 * and a tuple of inputs returns a tuple of results.
+	 */
 	batchTriggerAndWait<
-		const Q extends QueueContract & { inputSchema: z.ZodType }
+		const Q extends TQueue & { inputSchema: z.ZodType },
+		// Only the shape is inferred; each element is checked against the child's input.
+		const I extends readonly unknown[]
 	>(
 		id: string,
 		queue: Q,
-		inputs: readonly NoInfer<ReferenceInput<Q>>[],
+		inputs: { readonly [K in keyof I]: NoInfer<ReferenceInput<Q>> },
 		options?: WaitOptions
-	): Promise<WaitResult<InferOutput<Q>>[]>
+	): Promise<{ -readonly [K in keyof I]: WaitResult<InferOutput<Q>> }>
 }
 /**
  * Enqueues a wait's children once per id and ends the run while they are unfinished.
@@ -191,7 +200,7 @@ export function createStepRunner(options: {
 			return result as WaitResult<never>
 		},
 		batchTriggerAndWait: (id, queue, inputs, waitOptions) =>
-			wait(id, queue, inputs, true, waitOptions) as Promise<WaitResult<never>[]>
+			wait(id, queue, inputs, true, waitOptions) as Promise<never>
 	}
 }
 function entry(output: unknown): StepCacheEntry {

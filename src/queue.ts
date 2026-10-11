@@ -3,6 +3,7 @@ import type z from 'zod'
 import type { JobLogger, JobSpan } from './hooks.js'
 import type { ProgressOf } from './progress.js'
 import type { JobStep } from './steps.js'
+import type { JsonCompatible } from './validation.js'
 import type { Duration } from './job-options.js'
 import type {
 	CreateJobFn,
@@ -80,7 +81,7 @@ export type JobContext<
 	createJob: CreateJobFn<TQueues>
 	createJobs: CreateJobsFn<TQueues>
 	cron?: JobCronMeta | undefined
-	step: JobStep
+	step: JobStep<TQueues[number]>
 	/** Progress readable from outside the worker; typed by the queue's `progressSchema`. */
 	progress: ProgressOf<
 		ProgressSchemaOf<Extract<TQueues[number], { name: TName }>>
@@ -141,8 +142,14 @@ export type OutputSchemaOf<Q> = Q extends {
 
 /** What a handler returns: its `outputSchema` input, or nothing without one. */
 export type ProcessResult<O> = [O] extends [z.ZodType]
-	? z.input<O> | Promise<z.input<O>>
+	? JsonOutput<z.input<O>> | Promise<JsonOutput<z.input<O>>>
 	: Promise<void> | void
+/** Outputs are stored as JSON; encode dates as strings and transform them back. */
+type JsonOutput<T> = [Exclude<T, undefined>] extends [
+	JsonCompatible<Exclude<T, undefined>>
+]
+	? T
+	: never
 
 /** Shared contracts cannot carry competing inline handler implementations. */
 export type HandlerFreeQueueContract<Q extends QueueContract = QueueContract> =
