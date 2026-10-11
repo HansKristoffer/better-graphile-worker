@@ -6,7 +6,7 @@ import {
 } from './errors.js'
 import { isPlainObject } from './payload.js'
 import { quoteSchemaName } from './schema-name.js'
-import { assertInteger, assertJsonValue, type JsonValue } from './validation.js'
+import { assertJsonValue, type JsonValue } from './validation.js'
 
 export type WaitOptions = {
 	/**
@@ -37,7 +37,7 @@ export const WAITS_TABLE = 'bgw_waits'
 /**
  * A group is one wait of one parent run; `remaining` counts its unreported children.
  * Both the parent's suspend and every child's report lock the group row, so a wakeup
- * cannot fall between them. Rows outlive the wait until the parent job is gone.
+ * cannot fall between them. The wait deletes its group once it checkpoints the results.
  */
 export function waitTablesSql(schema: string): string {
 	const quoted = quoteSchemaName(schema)
@@ -63,9 +63,12 @@ CREATE TABLE IF NOT EXISTS ${quoted}.${WAITS_TABLE} (
 CREATE INDEX IF NOT EXISTS ${WAITS_TABLE}_pending ON ${quoted}.${WAITS_TABLE} (child_job_id) WHERE result IS NULL;`
 }
 
-export function assertWaitOptions(options: WaitOptions | undefined): void {
-	if (options?.timeout !== undefined)
-		assertInteger(options.timeout, 'Wait timeout', 1)
+/** Validated on both sides, like inputs: by the child's worker and by the parent. */
+async function parseOutput(queue: QueueContract, value: unknown) {
+	const parsed = await queue.outputSchema?.safeParseAsync(value)
+	if (parsed && !parsed.success)
+		throw new JobValidationError(queue.name, parsed.error.issues, 'output')
+	return parsed?.data
 }
 
 /** Validate a handler's return value against `outputSchema` and keep its JSON input. */
@@ -74,13 +77,7 @@ export async function encodeQueueOutput(
 	value: unknown
 ): Promise<JsonValue | undefined> {
 	if (!queue.outputSchema) return undefined
-	const parsed = await queue.outputSchema.safeParseAsync(value)
-	if (!parsed.success)
-		throw new JobValidationError(
-			queue.name,
-			parsed.error.issues.map(({ path, message }) => ({ path, message })),
-			'output'
-		)
+	await parseOutput(queue, value)
 	assertJsonValue(value, true)
 	return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
 }
@@ -103,14 +100,8 @@ export async function decodeWaitCheckpoint(
 					id: report.id,
 					error: new ChildJobFailedError(report.id, queue.name, report.error)
 				}
-			const parsed = await queue.outputSchema?.safeParseAsync(report.output)
-			if (parsed && !parsed.success)
-				throw new JobValidationError(
-					queue.name,
-					parsed.error.issues.map(({ path, message }) => ({ path, message })),
-					'output'
-				)
-			return { ok: true as const, id: report.id, output: parsed?.data }
+			const output = await parseOutput(queue, report.output)
+			return { ok: true as const, id: report.id, output }
 		})
 	)
 }

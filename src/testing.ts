@@ -214,46 +214,42 @@ export function createTestHarness<
 					queue.name,
 					contracts.map((item) => item.name)
 				)
-			const ids = batch
+			const enqueued = batch
 				? await producer.enqueueMany(queue.name, inputs)
 				: [await producer.enqueueOne(queue.name, inputs[0])]
+			// The harness has no shouldSkipEnqueue hook, so every child has an id.
+			const ids = enqueued.filter((id) => id !== null)
+
 			const child = getQueue(queue.name)
 			const reports: (ChildReport & { id: string })[] = []
 			for (const [index, id] of ids.entries()) {
-				if (id === null)
-					throw new Error(
-						`shouldSkipEnqueue skipped a child of "${queue.name}"`
-					)
-				const input = inputs[index]
-				const wire =
-					input === undefined ? undefined : JSON.parse(JSON.stringify(input))
-				let run: Awaited<ReturnType<typeof invoke<unknown>>>
-				try {
-					run = await invoke(queue.name, { jobId: id }, async (ctx) =>
-						encodeQueueOutput(
-							child,
-							await child.processFn(await parseQueuePayload(child, wire), ctx)
-						)
-					)
-				} catch (error) {
-					const failure =
-						error instanceof Error ? error : new Error(String(error))
-					reports.push({
-						id,
-						ok: false,
-						error: { name: failure.name, message: failure.message }
-					})
-					continue
-				}
-				if (run.continued)
-					throw new Error(
-						`Child ${id} of "${queue.name}" called ctx.continue(); the test harness runs waited children once`
-					)
-				reports.push(
-					run.result === undefined
-						? { id, ok: true }
-						: { id, ok: true, output: run.result as never }
+				const report: ChildReport = await invoke(
+					queue.name,
+					{ jobId: id },
+					async (ctx) => {
+						const payload = await parseQueuePayload(child, inputs[index])
+						return encodeQueueOutput(child, await child.processFn(payload, ctx))
+					}
+				).then(
+					(run) => {
+						if (run.continued)
+							throw new Error(
+								`Child ${id} of "${queue.name}" called ctx.continue(); the test harness runs waited children once`
+							)
+						return run.result === undefined
+							? { ok: true }
+							: { ok: true, output: run.result }
+					},
+					(error: unknown) => {
+						const failure =
+							error instanceof Error ? error : new Error(String(error))
+						return {
+							ok: false,
+							error: { name: failure.name, message: failure.message }
+						}
+					}
 				)
+				reports.push({ id, ...report })
 			}
 			return { checkpoint: reports, persisted: false }
 		}

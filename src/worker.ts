@@ -70,6 +70,7 @@ import {
 	type WaitBackend
 } from './steps.js'
 import { encodeQueueOutput, type ChildReport } from './waits.js'
+import type { JsonValue } from './validation.js'
 import { createProgressRunner, type ProgressRunner } from './progress.js'
 
 export type TaskListRuntime<
@@ -317,7 +318,7 @@ const LOGGED_ERROR_MESSAGE_LIMIT = 500
 type TaskExecutorFn = (
 	ctx: JobContext,
 	cleanPayload: unknown
-) => Promise<unknown>
+) => Promise<JsonValue | undefined>
 
 type ExecuteTaskOptions = {
 	queueName: string
@@ -424,7 +425,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 			try {
 				assertPayloadEnvelope(payload)
-				let output: unknown
+				let output: JsonValue | undefined
 				try {
 					output = await attempt.run(executor(ctx, cleanPayload), (error) => {
 						const attributes: LogAttributes = {
@@ -466,7 +467,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					!continued &&
 					!(await report(true, {
 						ok: true,
-						...(output === undefined ? {} : { output: output as never })
+						...(output === undefined ? {} : { output })
 					}))
 				)
 					throw new StepPersistenceError(jobId)
@@ -666,6 +667,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 								jobCount: jobIds.length
 							})
 						}
+						// Initializers are never waited on, so they have no output.
+						return undefined
 					}
 				})
 

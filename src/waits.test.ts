@@ -637,7 +637,7 @@ suite('waiting on child jobs in PostgreSQL', () => {
 	})
 
 	test('a child continuation reports for its run, and a parent continuation keeps its waits', async () => {
-		const id = (await worker.createJob('carry', 'hello'))!
+		await worker.createJob('carry', 'hello')
 		await parents.runOnce()
 		await children.runOnce() // continues once, then the continuation reports
 		await parents.runOnce() // resumes and continues
@@ -651,7 +651,6 @@ suite('waiting on child jobs in PostgreSQL', () => {
 			'continued',
 			'completed'
 		])
-		void id
 	})
 
 	test('a started worker drives many parents to completion', async () => {

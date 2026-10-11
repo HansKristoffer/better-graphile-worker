@@ -4,7 +4,6 @@ import type { JobSpan } from './hooks.js'
 import type { QueueContract } from './queue.js'
 import type { InferOutput, ReferenceInput } from './types.js'
 import {
-	assertWaitOptions,
 	decodeWaitCheckpoint,
 	type WaitCheckpoint,
 	type WaitOptions,
@@ -19,6 +18,7 @@ import {
 import { writeCheckpoint } from './private-jobs.js'
 import {
 	assertJsonValue,
+	assertInteger,
 	type JsonCompatible,
 	type JsonValue
 } from './validation.js'
@@ -103,6 +103,11 @@ export function createStepRunner(options: {
 	waits?: WaitBackend | undefined
 }): JobStep {
 	const pending = new Map<string, Promise<unknown>>()
+	function begin(id: string) {
+		options.assertActive?.()
+		if (typeof id !== 'string' || !id.length)
+			throw new NonRetriableError('Step id must be a non-empty string')
+	}
 	function event(name: string, id: string) {
 		try {
 			options.span.addEvent(name, { 'step.id': id })
@@ -115,9 +120,7 @@ export function createStepRunner(options: {
 		fn: () => Promise<T> | T,
 		codec?: StepCodec<T>
 	): Promise<T> {
-		options.assertActive?.()
-		if (typeof id !== 'string' || !id.length)
-			throw new NonRetriableError('Step id must be a non-empty string')
+		begin(id)
 		const decode = (output: unknown): T => {
 			if (codec) return codec.decode(serializeStepOutput(id, output))
 			return serializeStepOutput(id, output) as T
@@ -157,10 +160,9 @@ export function createStepRunner(options: {
 		batch: boolean,
 		waitOptions: WaitOptions | undefined
 	): Promise<WaitResult<unknown>[]> {
-		options.assertActive?.()
-		if (typeof id !== 'string' || !id.length)
-			throw new NonRetriableError('Step id must be a non-empty string')
-		assertWaitOptions(waitOptions)
+		begin(id)
+		if (waitOptions?.timeout !== undefined)
+			assertInteger(waitOptions.timeout, 'Wait timeout', 1)
 		const cached = options.store.get(id)
 		if (cached) {
 			event('step.cache_hit', id)
