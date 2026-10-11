@@ -92,6 +92,7 @@ export type { GraphileRunnerOverrides } from './worker.js'
 export type { CrashRecoveryOptions } from './crash-recovery.js'
 export {
 	NonRetriableError,
+	RetryAtError,
 	UnknownQueueError,
 	JobValidationError,
 	DuplicateQueueError,

@@ -191,7 +191,7 @@ await prisma.$transaction(async (tx) => {
 
 Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
-`ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt and uses Graphile's exponential backoff. Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.
+`ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt (see `RetryAtError` for choosing its time). Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.
 
 Re-adding a key held by a running job clears that job's key and exhausts its attempts, so it will not be retried if it later fails. Only the job's own continuation should reuse its key. If another producer has already replaced a running job's key, its continuation remains unkeyed and does not overwrite the replacement.
 
@@ -257,10 +257,29 @@ All new jobs, including scheduled cron, use a version-2 envelope with payload, t
 
 Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown by your handler, such as validating a downstream response, follows normal retry behavior.
 
+To choose when the next attempt runs, throw `RetryAtError` with the time and the original error:
+
+```ts
+import { RetryAtError } from 'better-graphile-worker'
+
+processFn: async ({ connectionId }, ctx) => {
+  try {
+    await syncBank(connectionId)
+  } catch (error) {
+    if (!(error instanceof RateLimitError)) throw error
+    const delays = [60_000, 3_600_000, 86_400_000, 7 * 86_400_000]
+    const delay = delays[Math.min(ctx.attempt, delays.length) - 1]!
+    throw new RetryAtError(new Date(Date.now() + delay), { cause: error })
+  }
+}
+```
+
+It spends the attempt like any other failure: on the last attempt the job fails permanently, `onPermanentFailure` runs and the time is ignored. Logs, `onJobFinished` and Graphile's `last_error` record the cause's name and message, and the scheduled time appears as `retryAt` in `onJobFinished` and `retry_at` in the `job.completed` log. Completed steps and progress carry over. The job keeps its id. The time is a lower bound: if it is sooner than Graphile's own backoff for that attempt (`exp(min(attempt, 10))` seconds, about 3 s after the first attempt, 55 s after the fourth and at most about 6 h), the job waits for the backoff instead. A waiting job does not hold its serial lane, so later jobs in the lane run before it. Re-adding its `jobKey` while it waits replaces it as usual: new input, no steps, attempts reset and the wait cancelled. To wait without spending an attempt, use `ctx.continue({ runAt })`; to stop retrying, throw `NonRetriableError`.
+
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
 
-Continuation, retention, checkpointing, job outcomes, progress, crash recovery and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+Continuation, retention, retry scheduling, checkpointing, job outcomes, progress, crash recovery and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
 
 ## Context and durable steps
 
