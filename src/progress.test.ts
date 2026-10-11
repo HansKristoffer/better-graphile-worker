@@ -207,6 +207,8 @@ suite('progress in PostgreSQL', () => {
 		schema,
 		queues: contracts,
 		hooks: { createLogger: () => quiet },
+		// Outcomes complete jobs in our own transaction; progress must not interfere.
+		jobOutcomes: {},
 		handlers: {
 			sync: async ({ mode }, ctx) => {
 				attempts.push(ctx.progress.get())
@@ -276,10 +278,12 @@ suite('progress in PostgreSQL', () => {
 
 	test('a continuation carries the latest progress', async () => {
 		attempts.length = 0
-		await worker.createJob('sync', { mode: 'continue' })
-		await worker.runOnce()
+		const id = (await worker.createJob('sync', { mode: 'continue' }))!
 		await worker.runOnce()
 		expect(attempts).toEqual([undefined, { phase: 'continue', done: 1 }])
+		const job = await worker.getJob(id)
+		if (job.state !== 'continued') throw new Error(`job is ${job.state}`)
+		expect((await worker.getJob(job.continuedTo)).state).toBe('completed')
 	})
 
 	test('writes require the current lock', async () => {

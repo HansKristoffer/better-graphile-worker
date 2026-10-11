@@ -7,8 +7,10 @@ export {
 export {
 	createWorkerClient,
 	type WorkerClient,
-	type EnqueueAdapter
+	type EnqueueAdapter,
+	type EnqueuedJob
 } from './client.js'
+export type { IdempotentJobSpec } from './enqueue-sql.js'
 export {
 	buildTaskList,
 	buildCronItems,

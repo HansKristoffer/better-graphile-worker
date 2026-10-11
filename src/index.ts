@@ -48,7 +48,7 @@ export type {
 	QueueProgress,
 	GetJobProgressFn
 } from './types.js'
-export type { StopOptions } from './job-options.js'
+export type { Duration, StopOptions } from './job-options.js'
 export {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA,
@@ -87,6 +87,7 @@ export type {
 	ListJobsOptions,
 	JobListState
 } from './admin.js'
+export type { JobOutcomesOption, JobState } from './job-outcomes.js'
 export type { GraphileRunnerOverrides } from './worker.js'
 export {
 	NonRetriableError,

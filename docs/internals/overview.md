@@ -20,7 +20,7 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 ## Private table access is isolated and pinned
 
-Continuations, permanent-failure retention, step checkpoints, progress and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
+Continuations, permanent-failure retention, step checkpoints, job outcomes, progress and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
 Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
 
@@ -30,6 +30,9 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 - Step checkpoints are patched atomically into the envelope and serialized per job. A failed checkpoint write is never treated as completed.
 - Progress lives in the envelope beside the checkpoints, so it uses the same lock check and survives retries. Its writes are throttled, so the latest value can be in memory only: a failing attempt writes it before Graphile records the failure, and a continuation receives it inside its transaction.
 - Retention exhausts the job's attempt budget and then rethrows the original error, so Graphile records the error and releases the lock itself.
+- With `jobOutcomes`, the worker completes successful jobs itself, replicating Graphile 0.17's `complete_jobs` (delete the row, release its lane) in the same statement as the outcome insert. Graphile's completion then deletes nothing. Recording after Graphile's completion could not be atomic, and recording before it would report a job as completed while a crash left it to run again. Failure outcomes are best effort, because a failed job keeps its row unless the queue discards it, and `getJob` prefers the live row over the outcome.
+
+Idempotency keys go through `bgw_add_jobs`, a PL/pgSQL wrapper around `add_job` that `migrate()` creates ([`src/enqueue-sql.ts`](../../src/enqueue-sql.ts)). It cannot be one prepared statement. A losing producer must read the winner's job id, but a statement's snapshot predates the winner's commit; only `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` sees it. The winner must write the job id after `add_job` returns, and one statement cannot insert and then update the same row. The function runs each step as its own statement and keeps the prepared-SQL contract: one statement, atomic in the caller's transaction. Keys are scoped per task identifier, unlike Graphile's global `jobKey`, so two queues cannot swallow each other's jobs.
 
 None of this makes external effects exactly-once: a process can crash after an effect but before its checkpoint. That limit belongs in user documentation, not in more machinery.
 

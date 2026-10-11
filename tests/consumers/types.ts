@@ -56,6 +56,12 @@ client.createJobs('email', [{ to: 'person' }], { jobKey: 'shared' })
 client.createJobs('count', ['hello'], { jobKeyMode: 'replace' })
 // @ts-expect-error Cron has no batch inputs
 client.createJobs('tick', [undefined])
+client.jobs.count('hello', { idempotencyKey: 'once', idempotencyTtl: '2h' })
+client.createJobs('count', ['hello'], { idempotencyTtl: 60_000 })
+// @ts-expect-error Durations need a unit
+client.createJob('count', 'hello', { idempotencyTtl: '2 hours' })
+// @ts-expect-error Batch items derive their own idempotency keys
+client.createJobs('count', ['hello'], { idempotencyKey: 'shared' })
 declare const name: 'email' | 'count'
 declare const payload: { to: string } | string
 // @ts-expect-error Uncorrelated unions are unsafe

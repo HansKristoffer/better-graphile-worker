@@ -8,6 +8,7 @@ import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import { getOtel, type OtelApi } from './otel.js'
 import { queryJobProgress } from './admin.js'
+import { queryJob, type JobState } from './job-outcomes.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -41,6 +42,8 @@ export type JobClient<TQueues extends readonly QueueContract[]> = {
 	migrate(): Promise<void>
 	release(): Promise<void>
 	getWorkerUtils(): Promise<WorkerUtils>
+	/** Live state, or the recorded outcome if a worker has `jobOutcomes` enabled. */
+	getJob(id: string): Promise<JobState>
 }
 
 export function createJobClient<const TQueues extends readonly QueueContract[]>(
@@ -90,6 +93,9 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		},
 		getWorkerUtils() {
 			return client.getUtils()
+		},
+		getJob(id) {
+			return queryJob(client, schema, id)
 		}
 	}
 }
