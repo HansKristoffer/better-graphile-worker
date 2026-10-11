@@ -122,7 +122,3 @@ export function extractStepCache(payload: unknown): StepCache {
 	}
 	return cache
 }
-export function extractProgress(payload: unknown): unknown {
-	assertPayloadEnvelope(payload)
-	return payload.progress
-}

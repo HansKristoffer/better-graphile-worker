@@ -1,6 +1,4 @@
-import type { JobHelpers } from 'graphile-worker'
 import type z from 'zod'
-import { writeProgress } from './private-jobs.js'
 import { assertJsonValue, type JsonValue } from './validation.js'
 
 /** Progress of the running job, persisted in its PostgreSQL row. */
@@ -13,25 +11,25 @@ export type JobProgress<TValue = JsonValue, TInput = TValue> = {
 	flush(): Promise<void>
 }
 
-type ProgressTypes<P> = [P] extends [never]
+type ProgressTypes<P, S = Exclude<P, undefined>> = [S] extends [never]
 	? [JsonValue, JsonValue]
-	: z.ZodType extends P
+	: z.ZodType extends S
 		? [JsonValue, JsonValue]
-		: P extends z.ZodType
-			? [z.output<P>, z.input<P>]
+		: S extends z.ZodType
+			? [z.output<S>, z.input<S>]
 			: [JsonValue, JsonValue]
 /** Progress for a queue's optional `progressSchema`; untyped queues use JSON values. */
 export type ProgressOf<P> = JobProgress<
-	ProgressTypes<Exclude<P, undefined>>[0],
-	ProgressTypes<Exclude<P, undefined>>[1]
+	ProgressTypes<P>[0],
+	ProgressTypes<P>[1]
 >
-export type ProgressValueOf<P> = ProgressTypes<Exclude<P, undefined>>[0]
+export type ProgressValueOf<P> = ProgressTypes<P>[0]
 
 /** `getJobProgress` result; progress is undefined until the job sets it. */
 export type JobProgressSnapshot<T = unknown> = { progress: T | undefined }
 
 /** The interval between persisted writes; `flush()` writes immediately. */
-export const PROGRESS_WRITE_INTERVAL_MS = 1000
+const PROGRESS_WRITE_INTERVAL_MS = 1000
 
 export type ProgressRunner = JobProgress<unknown, unknown> & {
 	/** Stop accepting values, optionally persist the latest one, and await writes. */
@@ -119,19 +117,4 @@ export function createProgressRunner(options: {
 			rethrow()
 		}
 	}
-}
-
-export function createPgProgressRunner(options: {
-	helpers: JobHelpers
-	schema: string
-	jobId: string
-	initial: unknown
-	progressSchema?: z.ZodType | undefined
-}): ProgressRunner {
-	return createProgressRunner({
-		initial: options.initial,
-		schema: options.progressSchema,
-		write: (value) =>
-			writeProgress(options.helpers, options.schema, options.jobId, value)
-	})
 }

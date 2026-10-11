@@ -20,7 +20,6 @@ export {
 	type CronSchedule,
 	type JobContext,
 	type JobCronMeta,
-	type ProgressSchemaOf,
 	type JobLogger,
 	type JobSpan
 } from './queue.js'

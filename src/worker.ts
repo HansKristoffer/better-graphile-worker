@@ -40,9 +40,13 @@ import {
 } from './payload.js'
 import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
-import { continueJob, retainPermanentFailure } from './private-jobs.js'
+import {
+	continueJob,
+	retainPermanentFailure,
+	writeProgress
+} from './private-jobs.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
-import { createPgProgressRunner, type ProgressRunner } from './progress.js'
+import { createProgressRunner, type ProgressRunner } from './progress.js'
 
 export type TaskListRuntime<
 	TQueues extends readonly QueueContract[] = readonly QueueContract[]
@@ -196,12 +200,10 @@ async function executeTask(options: ExecuteTaskOptions) {
 				span.setAttribute('messaging.producer.span_id', link.context.spanId)
 			}
 
-			const progress = createPgProgressRunner({
-				helpers,
-				schema: runtime.schema,
-				jobId,
+			const progress = createProgressRunner({
 				initial: isPayloadEnvelope(payload) ? payload.progress : undefined,
-				progressSchema
+				schema: progressSchema,
+				write: (value) => writeProgress(helpers, runtime.schema, jobId, value)
 			})
 			const ctx = createJobContext(
 				jobId,
