@@ -282,14 +282,14 @@ describe.skipIf(!enabled)('idempotency keys in PostgreSQL', () => {
 		await worker.runOnce()
 	})
 
-	test('enqueue prunes expired keys', async () => {
+	test('worker maintenance prunes expired keys', async () => {
 		await worker.createJob('other', 'p', { idempotencyKey: 'stale' })
 		await expire('stale')
 		await worker.createJob('other', 'p', { idempotencyKey: 'fresh' })
+		await worker.runOnce()
 		const { rows } = await pool.query(
 			`SELECT key FROM "${schema}".bgw_idempotency_keys WHERE key IN ('stale', 'fresh')`
 		)
 		expect(rows).toEqual([{ key: 'fresh' }])
-		await worker.runOnce()
 	})
 })

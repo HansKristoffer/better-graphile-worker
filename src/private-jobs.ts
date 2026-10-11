@@ -13,19 +13,24 @@ import {
 	type ChildReport,
 	type WaitCheckpoint
 } from './waits.js'
-export async function retainPermanentFailure(
-	helpers: JobHelpers,
-	schema: string
-): Promise<void> {
-	const result = await helpers.withPgClient((client) =>
-		client.query(
-			`UPDATE ${quoteSchemaName(schema)}._private_jobs SET max_attempts = attempts WHERE id = $1::bigint AND locked_by = $2::text AND locked_at IS NOT NULL`,
-			[helpers.job.id, helpers.job.locked_by]
-		)
-	)
-	if (result.rowCount !== 1)
-		throw new StepPersistenceError(String(helpers.job.id))
-	// Throwing the original error lets Graphile persist last_error and release its lock.
+/**
+ * The locked job as this attempt owns it: `$1` id, `$2` lock owner, `$3` lock time.
+ * Graphile 0.17 sets `locked_by` to the worker pool's id, which every worker in the
+ * process shares, so only the lock time tells this attempt apart from a later one.
+ */
+function owned(alias?: string): string {
+	const column = (name: string) => (alias ? `${alias}.${name}` : name)
+	return `${column('id')} = $1::bigint AND ${column('locked_by')} = $2::text AND date_trunc('milliseconds', ${column('locked_at')}) = $3::timestamptz`
+}
+
+/** Values for `owned()`; pg decodes locked_at to a Date, which keeps milliseconds only. */
+function ownerValues(helpers: JobHelpers): unknown[] {
+	return [helpers.job.id, helpers.job.locked_by, helpers.job.locked_at]
+}
+
+/** The delay Graphile 0.17's failure update adds to run_at, for a number of attempts. */
+function graphileBackoff(attempts: string): string {
+	return `exp(least(${attempts}, 10)) * interval '1 second'`
 }
 
 /**
@@ -38,11 +43,11 @@ export async function scheduleRetry(
 	schema: string,
 	runAt: Date
 ): Promise<Date> {
-	const backoff = `exp(least(attempts, 10)) * interval '1 second'`
+	const backoff = graphileBackoff('attempts')
 	const result = await helpers.withPgClient((client) =>
 		client.query<{ retry_at: Date }>(
-			`UPDATE ${quoteSchemaName(schema)}._private_jobs SET run_at = $3::timestamptz - ${backoff} WHERE id = $1::bigint AND locked_by = $2::text AND locked_at IS NOT NULL RETURNING greatest(now(), run_at) + ${backoff} AS retry_at`,
-			[helpers.job.id, helpers.job.locked_by, runAt]
+			`UPDATE ${quoteSchemaName(schema)}._private_jobs SET run_at = $4::timestamptz - ${backoff} WHERE ${owned()} RETURNING greatest(now(), run_at) + ${backoff} AS retry_at`,
+			[...ownerValues(helpers), runAt]
 		)
 	)
 	const row = result.rows[0]
@@ -53,9 +58,12 @@ export async function scheduleRetry(
 
 /**
  * Settle the locked job in one statement: upsert its outcome, report its final state to
- * waiting parents (waking a parent whose last child this was), and with `finish`
- * complete it the way Graphile's complete_jobs does (delete it, release its lane), so
- * Graphile's own completion finds nothing to delete. Returns false without a lock.
+ * waiting parents (waking a parent whose last child this was), and handle its `row`:
+ * - `delete` completes it the way Graphile's complete_jobs does (delete it, release its
+ *   lane), so Graphile's own completion finds nothing to delete;
+ * - `exhaust` spends its attempts, so the error Graphile then records is permanent;
+ * - `keep` leaves it for Graphile's failure update.
+ * Returns false without the attempt's lock.
  */
 async function settleJob(
 	client: Pick<PoolClient, 'query'>,
@@ -70,22 +78,22 @@ async function settleJob(
 			  }
 			| undefined
 		report?: ChildReport | undefined
-		finish: boolean
+		row: 'delete' | 'exhaust' | 'keep'
 	}
 ): Promise<boolean> {
 	const quoted = quoteSchemaName(schema)
-	const values: unknown[] = [helpers.job.id, helpers.job.locked_by]
+	const values = ownerValues(helpers)
 	const param = (value: unknown) => `$${values.push(value)}`
 	const ctes = [
 		`owned AS (
 	SELECT jobs.id, tasks.identifier, jobs.attempts, jobs.max_attempts, jobs.created_at
 	FROM ${quoted}._private_jobs jobs
 	JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id
-	WHERE jobs.id = $1::bigint AND jobs.locked_by = $2::text AND jobs.locked_at IS NOT NULL
+	WHERE ${owned('jobs')}
 	FOR UPDATE OF jobs
 )`
 	]
-	const { outcome, report, finish } = settle
+	const { outcome, report, row } = settle
 	if (outcome)
 		ctes.push(`recorded AS (
 	INSERT INTO ${quoted}.${JOB_OUTCOMES_TABLE}
@@ -105,7 +113,11 @@ async function settleJob(
 )`,
 			...wakeParents(quoted)
 		)
-	if (finish)
+	if (row === 'exhaust')
+		ctes.push(`exhausted AS (
+	UPDATE ${quoted}._private_jobs jobs SET max_attempts = jobs.attempts FROM owned WHERE jobs.id = owned.id
+)`)
+	if (row === 'delete')
 		ctes.push(`deleted AS (
 	DELETE FROM ${quoted}._private_jobs jobs USING owned WHERE jobs.id = owned.id RETURNING jobs.job_queue_id
 ), unlocked AS (
@@ -151,10 +163,7 @@ export function settleLockedJob(
 	)
 }
 
-/**
- * Patch the locked job's envelope; `$1` is the job id, `$2` the lock owner and `$3` the
- * lock time, which tells this attempt apart from a later one by the same worker pool.
- */
+/** Patch the locked job's envelope while this attempt owns it. */
 async function patchEnvelope(
 	helpers: JobHelpers,
 	schema: string,
@@ -168,7 +177,7 @@ async function patchEnvelope(
 		client.query(
 			`WITH owned AS (
 		SELECT id, payload::jsonb AS data FROM ${quoted}._private_jobs
-		WHERE id = $1::bigint AND locked_by = $2::text AND date_trunc('milliseconds', locked_at) = $3::timestamptz FOR UPDATE
+		WHERE ${owned()} FOR UPDATE
 	) UPDATE ${quoted}._private_jobs jobs SET payload = ${patched}, updated_at = now()
 		FROM owned WHERE jobs.id = owned.id AND owned.data->>'__bgw' = '2' AND owned.data ? 'payload'`,
 			[jobId, helpers.job.locked_by, helpers.job.locked_at, ...values]
@@ -256,8 +265,7 @@ export async function continueJob(
 	progress?: unknown
 ): Promise<string> {
 	const quoted = quoteSchemaName(schema)
-	// pg decodes locked_at to Date, which only retains milliseconds.
-	const params = [helpers.job.id, helpers.job.locked_by, helpers.job.locked_at]
+	const params = ownerValues(helpers)
 	return helpers.withPgClient(async (client) => {
 		await client.query('BEGIN')
 		try {
@@ -275,8 +283,7 @@ export async function continueJob(
 FROM ${quoted}._private_jobs jobs
 JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id
 LEFT JOIN ${quoted}._private_job_queues queues ON queues.id = jobs.job_queue_id
-WHERE jobs.id = $1::bigint AND jobs.locked_by = $2::text AND jobs.locked_at IS NOT NULL
-AND date_trunc('milliseconds', jobs.locked_at) = $3::timestamptz
+WHERE ${owned('jobs')}
 FOR UPDATE OF jobs`,
 				params
 			)
@@ -304,8 +311,8 @@ FOR UPDATE OF jobs`,
 			if (!id) throw new Error('Graphile add_job returned no continuation')
 			// Keyed jobs are already exhausted by add_job; this covers unkeyed ones.
 			await client.query(
-				`UPDATE ${quoted}._private_jobs SET max_attempts = attempts WHERE id = $1::bigint AND locked_by = $2::text`,
-				params.slice(0, 2)
+				`UPDATE ${quoted}._private_jobs SET max_attempts = attempts WHERE ${owned()}`,
+				params
 			)
 			// Waiting parents follow the job to its continuation.
 			if (job.payload.waited === true)
@@ -317,7 +324,7 @@ FOR UPDATE OF jobs`,
 				recordOutcome &&
 				!(await settleJob(client, helpers, schema, {
 					outcome: { state: 'continued', continuedTo: id },
-					finish: true
+					row: 'delete'
 				}))
 			)
 				throw new StepPersistenceError(String(helpers.job.id))
@@ -345,7 +352,7 @@ export async function releaseJobsLockedBy(
 		`WITH jobs AS (
 	UPDATE ${quoted}._private_jobs SET
 		last_error = 'Worker ' || locked_by || ' stopped sending heartbeats (crashed or blocked); released by crash recovery',
-		run_at = greatest(now(), run_at) + exp(least(attempts, 10)) * interval '1 second',
+		run_at = greatest(now(), run_at) + ${graphileBackoff('attempts')},
 		locked_by = NULL, locked_at = NULL
 	WHERE locked_by = ANY($1::text[])
 	RETURNING id
@@ -391,12 +398,11 @@ export async function enterWait(
 	return helpers.withPgClient(async (client) => {
 		await client.query('BEGIN')
 		try {
-			const owned = await client.query(
-				`SELECT 1 FROM ${quoted}._private_jobs WHERE id = $1::bigint AND locked_by = $2::text
-	AND date_trunc('milliseconds', locked_at) = $3::timestamptz FOR UPDATE`,
-				[helpers.job.id, helpers.job.locked_by, helpers.job.locked_at]
+			const own = await client.query(
+				`SELECT 1 FROM ${quoted}._private_jobs WHERE ${owned()} FOR UPDATE`,
+				ownerValues(helpers)
 			)
-			if (owned.rowCount !== 1)
+			if (own.rowCount !== 1)
 				throw new StepPersistenceError(String(helpers.job.id))
 
 			const existing = await client.query<{
@@ -460,7 +466,7 @@ export async function enterWait(
 	attempts = jobs.attempts - $3::int,
 	run_at = least(
 		CASE WHEN $3::int = 1 THEN 'infinity'::timestamptz ELSE jobs.run_at END,
-		coalesce(groups.deadline, ${NO_DEADLINE}) - exp(least(jobs.attempts - $3::int, 10)) * interval '1 second'
+		coalesce(groups.deadline, ${NO_DEADLINE}) - ${graphileBackoff('jobs.attempts - $3::int')}
 	)
 FROM ${groups} groups
 WHERE jobs.id = $1::bigint AND groups.parent_job_id = $1::bigint AND groups.wait_id = $2::text`,
@@ -534,12 +540,6 @@ export async function sweepWaits(
 ): Promise<string[]> {
 	const quoted = quoteSchemaName(schema)
 	const waits = `${quoted}.${WAITS_TABLE}`
-	// Waits were never migrated in this schema.
-	const exists = await client.query<{ exists: boolean }>(
-		'SELECT to_regclass($1) IS NOT NULL AS exists',
-		[waits]
-	)
-	if (!exists.rows[0]?.exists) return []
 	const lost = await client.query<{ child_job_id: string }>(
 		`WITH lost AS (
 	SELECT waits.parent_job_id, waits.wait_id, waits.idx, jsonb_build_object('ok', false, 'error', jsonb_build_object(

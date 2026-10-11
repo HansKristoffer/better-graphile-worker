@@ -41,8 +41,7 @@ export const WAITS_TABLE = 'bgw_waits'
  */
 export function waitTablesSql(schema: string): string {
 	const quoted = quoteSchemaName(schema)
-	return `SELECT pg_advisory_xact_lock(hashtext('better-graphile-worker:migrate'));
-CREATE TABLE IF NOT EXISTS ${quoted}.${WAIT_GROUPS_TABLE} (
+	return `CREATE TABLE IF NOT EXISTS ${quoted}.${WAIT_GROUPS_TABLE} (
 	parent_job_id bigint NOT NULL,
 	wait_id text NOT NULL,
 	remaining integer NOT NULL CHECK (remaining >= 0),

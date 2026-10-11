@@ -41,9 +41,8 @@ import {
 } from './worker.js'
 import { jobLogger } from './observers.js'
 import {
-	migrateJobOutcomes,
 	queryJob,
-	resolveJobOutcomes,
+	resolveOutcomeRetention,
 	type JobOutcomesOption,
 	type JobState
 } from './job-outcomes.js'
@@ -53,11 +52,11 @@ import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import {
-	ensureHeartbeatTable,
+	maintainOnce,
 	resolveCrashRecovery,
-	startHeartbeat,
+	startMaintenance,
 	type CrashRecoveryOptions
-} from './crash-recovery.js'
+} from './maintenance.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -223,16 +222,8 @@ export function createBetterWorker<
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
-	const jobOutcomes = resolveJobOutcomes(options.jobOutcomes, schema, (error) =>
-		logger.error('job.outcome.prune_failed', { error: String(error) })
-	)
-	// Workers create the table on start too, so enabling the option cannot fail every job.
-	const ensureOutcomes = async () => {
-		if (!jobOutcomes) return
-		await client.migrate()
-		await migrateJobOutcomes(options.pgPool, schema)
-	}
-	let heartbeat: ReturnType<typeof startHeartbeat> | undefined
+	const outcomeRetention = resolveOutcomeRetention(options.jobOutcomes)
+	let maintenance: ReturnType<typeof startMaintenance> | undefined
 	const runtime = {
 		hooks,
 		completedJobs,
@@ -243,36 +234,48 @@ export function createBetterWorker<
 		otel,
 		permanentFailure: options.permanentFailure,
 		defaultTimeout: options.defaultTimeout,
-		jobOutcomes,
-		heartbeatReady: () => heartbeat?.ready,
+		jobOutcomes: outcomeRetention !== undefined,
+		heartbeatReady: () => maintenance?.ready,
 		queues: options.queues,
 		prepareJob: producer.prepareOne,
 		prepareJobs: producer.prepareMany
 	}
 
-	async function prepareCrashRecovery() {
-		if (!crashRecovery) return undefined
+	/**
+	 * Create this library's tables if they are missing, so enabling an option cannot fail
+	 * every job. False when the role cannot and nothing asked for them explicitly: the
+	 * default must not break a locked-down role that upgraded without migrate().
+	 */
+	async function prepareTables() {
+		if (await client.hasTables()) return true
 		try {
-			await ensureHeartbeatTable(options.pgPool, schema)
-			return crashRecovery
+			await client.migrate()
+			return true
 		} catch (error) {
-			// The default must not break a locked-down role that upgraded without migrate().
 			const cannotCreate = (error as { code?: string }).code === '42501'
-			if (options.crashRecovery !== undefined || !cannotCreate) throw error
-			logger.warn('worker.crash_recovery.disabled', {
+			const required =
+				options.crashRecovery !== undefined || outcomeRetention !== undefined
+			if (required || !cannotCreate) throw error
+			logger.warn('worker.maintenance.disabled', {
 				reason:
-					'The heartbeat table is missing and this role cannot create it; run migrate()'
+					"This library's tables are missing and this role cannot create them; run migrate()"
 			})
-			return undefined
+			return false
 		}
+	}
+	const maintenanceOptions = {
+		pgPool: options.pgPool,
+		schema,
+		logger,
+		recovery: crashRecovery,
+		outcomeRetention
 	}
 
 	const lifecycle = createLifecycle({
 		start: async () => {
 			logger.info('Starting graphile-worker')
 			logRegisteredQueues(queues, logger)
-			await ensureOutcomes()
-			const recovery = await prepareCrashRecovery()
+			const maintained = await prepareTables()
 			const runner = await startRunner({
 				pgPool: options.pgPool,
 				schema,
@@ -282,27 +285,24 @@ export function createBetterWorker<
 				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
 				noHandleSignals: true,
 				graphile: options.graphile,
-				onPoolCreate:
-					recovery &&
-					((workerId) => {
-						heartbeat = startHeartbeat({
-							pgPool: options.pgPool,
-							schema,
-							workerId,
-							config: recovery,
-							logger
-						})
-					})
+				onPoolCreate: maintained
+					? (workerId) => {
+							maintenance = startMaintenance({
+								...maintenanceOptions,
+								workerId
+							})
+						}
+					: undefined
 			}).catch(async (error) => {
-				await heartbeat?.stop()
+				await maintenance?.stop()
 				throw error
 			})
-			const beating = heartbeat
-			if (!beating) return runner
+			const running = maintenance
+			if (!running) return runner
 			// Keep beating until every job has settled, including a graceful drain.
 			return {
-				promise: runner.promise.finally(() => beating.stop()),
-				stop: () => runner.stop().finally(() => beating.stop())
+				promise: runner.promise.finally(() => running.stop()),
+				stop: () => runner.stop().finally(() => running.stop())
 			}
 		},
 		release: () => client.release(),
@@ -322,16 +322,13 @@ export function createBetterWorker<
 		get promise() {
 			return lifecycle.promise
 		},
-		migrate: async () => {
-			await client.migrate()
-			await ensureOutcomes()
-		},
+		migrate: () => client.migrate(),
 		start: () => lifecycle.start(),
 		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
 			lifecycle.runOnce(async () => {
-				await ensureOutcomes()
+				const maintained = await prepareTables()
 				await runOnceTasks({
 					pgPool: options.pgPool,
 					schema,
@@ -339,6 +336,7 @@ export function createBetterWorker<
 					noHandleSignals: true,
 					graphile: options.graphile
 				})
+				if (maintained) await maintainOnce(maintenanceOptions)
 			}),
 		triggerCron: (name, opts) => producer.triggerCron(name, opts),
 

@@ -11,7 +11,7 @@ import { z } from 'zod'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
 import { createBetterWorker } from './create-better-worker.js'
-import { resolveCrashRecovery, sweepDeadWorkers } from './crash-recovery.js'
+import { resolveCrashRecovery, sweepDeadWorkers } from './maintenance.js'
 
 const enabled = Boolean(process.env.DATABASE_URL)
 const suite = describe.skipIf(!enabled)
@@ -90,7 +90,7 @@ suite('crash recovery in PostgreSQL', () => {
 	}
 	const beatAs = (workerId: string, age: string) =>
 		pool.query(
-			`INSERT INTO ${q}._bgw_worker_heartbeats VALUES ($1, now() - $2::interval)`,
+			`INSERT INTO ${q}.bgw_worker_heartbeats VALUES ($1, now() - $2::interval)`,
 			[workerId, age]
 		)
 	const job = async (id: string) =>
@@ -113,7 +113,7 @@ suite('crash recovery in PostgreSQL', () => {
 		await pool.query(
 			`UPDATE ${q}._private_job_queues SET locked_by = NULL, locked_at = NULL`
 		)
-		await pool.query(`DELETE FROM ${q}._bgw_worker_heartbeats`)
+		await pool.query(`DELETE FROM ${q}.bgw_worker_heartbeats`)
 	})
 	afterAll(async () => {
 		await worker.stop()
@@ -145,7 +145,7 @@ suite('crash recovery in PostgreSQL', () => {
 			queue_locked_by: 'pool-alive'
 		})
 		const rows = await pool.query(
-			`SELECT worker_id FROM ${q}._bgw_worker_heartbeats`
+			`SELECT worker_id FROM ${q}.bgw_worker_heartbeats`
 		)
 		expect(rows.rows).toEqual([{ worker_id: 'pool-alive' }])
 	})
@@ -171,7 +171,7 @@ suite('crash recovery in PostgreSQL', () => {
 		const url = new URL(process.env.DATABASE_URL!)
 		url.username = role
 		url.password = role
-		await pool.query(`DROP TABLE ${q}._bgw_worker_heartbeats`)
+		await pool.query(`DROP TABLE ${q}.bgw_worker_heartbeats`)
 		await pool.query(`CREATE ROLE ${role} LOGIN BYPASSRLS PASSWORD '${role}'`)
 		await pool.query(`GRANT USAGE ON SCHEMA ${q} TO ${role}`)
 		await pool.query(`GRANT ALL ON ALL TABLES IN SCHEMA ${q} TO ${role}`)
@@ -194,7 +194,7 @@ suite('crash recovery in PostgreSQL', () => {
 			const byDefault = workerAs()
 			await byDefault.start()
 			await byDefault.stop()
-			expect(warnings).toContain('worker.crash_recovery.disabled')
+			expect(warnings).toContain('worker.maintenance.disabled')
 
 			await expect(workerAs(true).start()).rejects.toMatchObject({
 				code: '42501',
@@ -237,7 +237,7 @@ suite('crash recovery in PostgreSQL', () => {
 				sync: async (_payload, ctx) => {
 					const claimed = ctx.helpers.job
 					const own = await pool.query(
-						`SELECT 1 FROM ${q}._bgw_worker_heartbeats WHERE worker_id = $1`,
+						`SELECT 1 FROM ${q}.bgw_worker_heartbeats WHERE worker_id = $1`,
 						[claimed.locked_by]
 					)
 					retried.resolve({

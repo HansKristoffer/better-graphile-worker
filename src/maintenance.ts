@@ -1,5 +1,7 @@
 import type { Pool, PoolClient } from 'pg'
+import { pruneIdempotencyKeys } from './enqueue-sql.js'
 import type { JobLogger } from './hooks.js'
+import { pruneJobOutcomes } from './job-outcomes.js'
 import { releaseJobsLockedBy, sweepWaits } from './private-jobs.js'
 import { quoteSchemaName } from './schema-name.js'
 import { assertInteger } from './validation.js'
@@ -15,7 +17,9 @@ export type CrashRecoveryOptions = {
 	staleAfter?: number
 }
 
-const HEARTBEATS = '_bgw_worker_heartbeats'
+export const HEARTBEATS_TABLE = 'bgw_worker_heartbeats'
+/** How often maintenance runs without crash recovery, which sets its own interval. */
+const MAINTENANCE_INTERVAL = 30_000
 const MAX_TIMER = 2147483647
 
 /** On unless explicitly disabled. */
@@ -35,26 +39,8 @@ export function resolveCrashRecovery(
 	return { heartbeatInterval, staleAfter }
 }
 
-/** Library-owned, so it lives beside Graphile's tables but outside its migrations. */
-export async function ensureHeartbeatTable(
-	pgPool: Pool,
-	schema: string
-): Promise<void> {
-	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
-	// Check first so a worker role without CREATE can start against a migrated schema.
-	const existing = await pgPool.query<{ exists: boolean }>(
-		'SELECT to_regclass($1) IS NOT NULL AS exists',
-		[table]
-	)
-	if (existing.rows[0]?.exists) return
-	await pgPool
-		.query(
-			`CREATE TABLE IF NOT EXISTS ${table} (worker_id text PRIMARY KEY, last_seen_at timestamptz NOT NULL)`
-		)
-		.catch((error: { code?: string }) => {
-			// Concurrent creators race on the catalog; the loser's table already exists.
-			if (error.code !== '23505' && error.code !== '42P07') throw error
-		})
+export function heartbeatTableSql(schema: string): string {
+	return `CREATE TABLE IF NOT EXISTS ${quoteSchemaName(schema)}.${HEARTBEATS_TABLE} (worker_id text PRIMARY KEY, last_seen_at timestamptz NOT NULL);`
 }
 
 /**
@@ -66,7 +52,7 @@ export async function sweepDeadWorkers(
 	schema: string,
 	staleAfter: number
 ) {
-	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
+	const table = `${quoteSchemaName(schema)}.${HEARTBEATS_TABLE}`
 	try {
 		await client.query('BEGIN')
 		const dead = await client.query<{ worker_id: string }>(
@@ -89,22 +75,103 @@ export async function sweepDeadWorkers(
 	}
 }
 
-/**
- * Heartbeat for one Graphile worker pool (its id is the jobs' locked_by), sweeping dead
- * workers after each beat. It runs on the worker's own event loop, beside its jobs, but
- * holds its own pool connection so jobs holding every other one cannot starve it.
- * `ready` settles after the first beat; jobs wait for it so none can do work (and crash
- * the process) before its worker is registered.
- */
-export function startHeartbeat(options: {
+type MaintenanceOptions = {
 	pgPool: Pool
 	schema: string
-	workerId: string
-	config: Required<CrashRecoveryOptions>
 	logger: JobLogger
-}) {
-	const { pgPool, schema, workerId, config, logger } = options
-	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
+	/** Crash recovery's heartbeat and dead-worker sweep; off when undefined. */
+	recovery?: Required<CrashRecoveryOptions> | undefined
+	/** Delete job outcomes older than this many milliseconds; off when undefined. */
+	outcomeRetention?: number | undefined
+}
+
+/**
+ * One maintenance pass: release jobs of dead workers, fail waits on children that ended
+ * without reporting (such as those just released), and delete expired outcomes and
+ * idempotency keys. Every step uses SKIP LOCKED, so any number of workers can run it at
+ * once, and a failing step does not stop the others.
+ */
+async function sweep(
+	options: MaintenanceOptions,
+	withConnection: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>
+) {
+	const { schema, logger, recovery, outcomeRetention } = options
+	const steps: [string, (client: PoolClient) => Promise<unknown>][] = [
+		[
+			'worker.crash_recovery.sweep_failed',
+			async (client) => {
+				if (!recovery) return
+				const swept = await sweepDeadWorkers(
+					client,
+					schema,
+					recovery.staleAfter
+				)
+				// Stopped workers leave their row behind; only released jobs are news.
+				if (swept.jobIds.length)
+					logger.warn('worker.crash_recovery.released', {
+						dead_worker_ids: swept.workerIds.join(','),
+						job_ids: swept.jobIds.join(','),
+						job_count: swept.jobIds.length
+					})
+			}
+		],
+		[
+			'worker.waits.sweep_failed',
+			async (client) => {
+				const lost = await sweepWaits(client, schema)
+				if (lost.length)
+					logger.warn('worker.waits.lost_children', {
+						job_ids: lost.join(','),
+						job_count: lost.length
+					})
+			}
+		],
+		[
+			'job.outcome.prune_failed',
+			async (client) => {
+				if (outcomeRetention !== undefined)
+					await pruneJobOutcomes(client, schema, outcomeRetention)
+			}
+		],
+		[
+			'worker.idempotency.prune_failed',
+			(client) => pruneIdempotencyKeys(client, schema)
+		]
+	]
+	for (const [event, step] of steps) {
+		try {
+			await withConnection(step)
+		} catch (error) {
+			logger.warn(event, { error: String(error) })
+		}
+	}
+}
+
+/** The single maintenance pass of `runOnce()`, on an ordinary pool connection. */
+export async function maintainOnce(options: MaintenanceOptions) {
+	await sweep(options, async (work) => {
+		const client = await options.pgPool.connect()
+		try {
+			return await work(client)
+		} finally {
+			client.release()
+		}
+	})
+}
+
+/**
+ * Maintenance for one started Graphile worker pool, every heartbeat interval. With crash
+ * recovery it first heartbeats the pool (its id is the jobs' locked_by). It runs on the
+ * worker's own event loop, beside its jobs, but holds its own pool connection so jobs
+ * holding every other one cannot starve it. `ready` settles after the first beat; jobs
+ * wait for it so none can do work (and crash the process) before its worker is
+ * registered.
+ */
+export function startMaintenance(
+	options: MaintenanceOptions & { workerId: string }
+) {
+	const { pgPool, schema, workerId, recovery, logger } = options
+	const table = `${quoteSchemaName(schema)}.${HEARTBEATS_TABLE}`
 	let registered = false
 	let stopped = false
 	let timer: ReturnType<typeof setTimeout> | undefined
@@ -122,7 +189,7 @@ export function startHeartbeat(options: {
 		held = undefined
 		client.release(error)
 	}
-	// Reconnect on the next beat after any failure rather than reusing a suspect client.
+	// Reconnect on the next pass after any failure rather than reusing a suspect client.
 	async function withConnection<T>(work: (client: PoolClient) => Promise<T>) {
 		const client = await connection()
 		try {
@@ -150,6 +217,7 @@ RETURNING xmax = 0 AS inserted`,
 		registered = true
 	}
 	async function beatSafely() {
+		if (!recovery) return
 		try {
 			await beat()
 		} catch (error) {
@@ -159,42 +227,14 @@ RETURNING xmax = 0 AS inserted`,
 			})
 		}
 	}
-	async function sweep() {
-		try {
-			const { workerIds, jobIds } = await withConnection((client) =>
-				sweepDeadWorkers(client, schema, config.staleAfter)
-			)
-			// Stopped workers leave their row behind; only released jobs are news.
-			if (jobIds.length)
-				logger.warn('worker.crash_recovery.released', {
-					dead_worker_ids: workerIds.join(','),
-					job_ids: jobIds.join(','),
-					job_count: jobIds.length
-				})
-		} catch (error) {
-			logger.warn('worker.crash_recovery.sweep_failed', {
-				error: String(error)
-			})
-		}
-		try {
-			// Fail waits on children that ended without reporting, such as those just released.
-			const lost = await withConnection((client) => sweepWaits(client, schema))
-			if (lost.length)
-				logger.warn('worker.waits.lost_children', {
-					job_ids: lost.join(','),
-					job_count: lost.length
-				})
-		} catch (error) {
-			logger.warn('worker.waits.sweep_failed', { error: String(error) })
-		}
-	}
+	const pass = () => sweep(options, withConnection)
 	const ready = beatSafely()
-	let pending = ready.then(sweep)
+	let pending = ready.then(pass)
 	function schedule() {
 		if (stopped) return
 		timer = setTimeout(() => {
-			pending = beatSafely().then(sweep).then(schedule)
-		}, config.heartbeatInterval)
+			pending = beatSafely().then(pass).then(schedule)
+		}, recovery?.heartbeatInterval ?? MAINTENANCE_INTERVAL)
 		timer.unref()
 	}
 	void pending.then(schedule)

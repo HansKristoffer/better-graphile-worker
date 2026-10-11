@@ -110,7 +110,7 @@ export type IdempotentJobSpec = Omit<AddJobsJobSpec, 'jobKeyMode'> &
 		idempotencyTtl?: number
 	}
 
-const IDEMPOTENCY_KEYS_TABLE = 'bgw_idempotency_keys'
+export const IDEMPOTENCY_KEYS_TABLE = 'bgw_idempotency_keys'
 const ADD_JOBS_FUNCTION = 'bgw_add_jobs'
 
 /**
@@ -143,18 +143,17 @@ export function addIdempotentJobsSql(
 	}
 }
 
-// ponytail: each call prunes at most 100 expired keys; add a periodic sweep if keys outpace keyed enqueues.
 /**
- * Creates the idempotency table and its enqueue function. Must run after Graphile's own
+ * Creates the idempotency table and its enqueue function. Expired keys are reclaimed on
+ * conflict here and deleted by worker maintenance. Must run after Graphile's own
  * migration. A key row is claimed with INSERT ... ON CONFLICT, which waits for a concurrent
  * claimer to commit, so concurrent producers create one job. The job id is written in a
  * later statement, which is why this is a function and not one prepared statement.
  */
-export function idempotencyMigrationSql(schema: string): string {
+export function idempotencyTablesSql(schema: string): string {
 	const quoted = quoteSchemaName(schema)
 	const table = `${quoted}.${IDEMPOTENCY_KEYS_TABLE}`
-	return `SELECT pg_advisory_xact_lock(hashtext('better-graphile-worker:migrate'));
-CREATE TABLE IF NOT EXISTS ${table} (
+	return `CREATE TABLE IF NOT EXISTS ${table} (
 	queue text NOT NULL,
 	key text NOT NULL,
 	job_id bigint,
@@ -169,12 +168,6 @@ DECLARE
 	item record;
 	job_id_ bigint;
 BEGIN
-	-- Bounded pruning; SKIP LOCKED keeps concurrent producers from waiting on each other.
-	DELETE FROM ${table} AS k USING (
-		SELECT queue, key FROM ${table} WHERE expires_at <= now()
-		ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
-	) AS expired
-	WHERE k.queue = expired.queue AND k.key = expired.key;
 	FOR item IN
 		SELECT t.value AS spec, t.n FROM json_array_elements(specs) WITH ORDINALITY AS t(value, n) ORDER BY t.n
 	LOOP
@@ -238,4 +231,17 @@ function assertDistinguishable(specs: readonly AddJobsJobSpec[]): void {
 			)
 		seen.set(content, target)
 	}
+}
+
+export async function pruneIdempotencyKeys(
+	client: { query(text: string): Promise<unknown> },
+	schema: string
+): Promise<void> {
+	const table = `${quoteSchemaName(schema)}.${IDEMPOTENCY_KEYS_TABLE}`
+	// SKIP LOCKED keeps the sweep from waiting on producers claiming a key.
+	await client.query(
+		`DELETE FROM ${table} WHERE (queue, key) IN (
+	SELECT queue, key FROM ${table} WHERE expires_at <= now() FOR UPDATE SKIP LOCKED
+)`
+	)
 }
