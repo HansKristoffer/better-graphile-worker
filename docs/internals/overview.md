@@ -10,7 +10,7 @@ Ordinary enqueue goes through Graphile's public SQL functions. That keeps produc
 
 ## One wire format, no legacy readers
 
-Every job carries a version-2 envelope ([`src/payload.ts`](../../src/payload.ts)): the producer's wire input, W3C trace context, and step checkpoints in separate fields. Workers reject anything else as a permanent failure. Readers for older formats were removed in 2.0. The cost is that an envelope change is a major release that requires draining old jobs first. Do not add a compatibility reader without that discussion.
+Every job carries a version-2 envelope ([`src/payload.ts`](../../src/payload.ts)): the producer's wire input, W3C trace context, and step checkpoints in separate fields. Workers reject anything else as a permanent failure. Readers for older formats were removed in 2.0. The cost is that an envelope change is a major release that requires draining old jobs first. Do not add a compatibility reader without that discussion. The exception is a new optional field such as `progress`: workers ignore fields they do not know and continuations copy them, so adding one is not a format change.
 
 Wire inputs are restricted to plain JSON values ([`src/validation.ts`](../../src/validation.ts)). JSON serialization would otherwise turn a Date into a string, drop a nested `undefined` or throw on a bigint at enqueue. The handler would receive a different value than the producer sent, or the enqueue would fail late.
 
@@ -20,7 +20,7 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 ## Private table access is isolated and pinned
 
-Continuations, permanent-failure retention, step checkpoints, crash recovery and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
+Continuations, permanent-failure retention, step checkpoints, job outcomes, progress, crash recovery and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
 Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
 
@@ -28,7 +28,7 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 
 Graphile 0.17 only reclaims a locked job after 4 hours, and its lock carries no liveness. With `crashRecovery`, each worker pool upserts a row in `_bgw_worker_heartbeats` keyed by its pool id, the value Graphile writes to `locked_by` for jobs and lanes. The id is only exposed through the `pool:create` event, so [`src/worker.ts`](../../src/worker.ts) listens on the runner's emitter. Handlers wait for the first heartbeat. Otherwise a job could kill the process before its worker is registered and stay locked for 4 hours.
 
-Releasing a live worker's job is the dangerous failure. Graphile's `completeJobs` deletes by job id without checking `locked_by`, so the falsely-dead worker finishing later deletes the job while its second run is still going. Our own private-table writes do check `locked_by` and refuse. The heartbeat runs on a timer in the worker's own process, so a blocked event loop looks like death. That is why the defaults are conservative and `staleAfter` must cover several missed beats. It holds one pool connection for its lifetime, like Graphile's LISTEN client, so jobs holding every other connection cannot starve it. A heartbeat thread would survive a blocked loop, but it would also keep a hung process looking alive and would need connection details we do not own.
+Releasing a live worker's job is the dangerous failure. Graphile's `completeJobs` deletes by job id without checking `locked_by`, so the falsely-dead worker finishing later deletes the job while its second run is still going. Our own private-table writes, including completion with `jobOutcomes`, check `locked_by` and refuse. The heartbeat runs on a timer in the worker's own process, so a blocked event loop looks like death. That is why the defaults are conservative and `staleAfter` must cover several missed beats. It holds one pool connection for its lifetime, like Graphile's LISTEN client, so jobs holding every other connection cannot starve it. A heartbeat thread would survive a blocked loop, but it would also keep a hung process looking alive and would need connection details we do not own.
 
 It is on by default because a stuck lane is the failure users meet without knowing the 4-hour scan exists, and a 5-minute synchronous block already breaks Graphile's LISTEN connection and anything else on the loop. Only an explicit opt-in may fail `start()`: the default degrades to a warning when the role cannot create the table, so an upgrade that skips `migrate()` keeps working.
 
@@ -38,7 +38,11 @@ The sweep claims stale heartbeat rows with `FOR UPDATE SKIP LOCKED` and releases
 
 - A continuation enqueues the next run and marks the current run as never-retry in one transaction. Otherwise a crash between the two could produce a retry next to the continuation.
 - Step checkpoints are patched atomically into the envelope and serialized per job. A failed checkpoint write is never treated as completed.
+- Progress lives in the envelope beside the checkpoints, so it uses the same lock check and survives retries. Its writes are throttled, so the latest value can be in memory only: a failing attempt writes it before Graphile records the failure, and a continuation receives it inside its transaction.
 - Retention exhausts the job's attempt budget and then rethrows the original error, so Graphile records the error and releases the lock itself.
+- With `jobOutcomes`, the worker completes successful jobs itself, replicating Graphile 0.17's `complete_jobs` (delete the row, release its lane) in the same statement as the outcome insert. Graphile's completion then deletes nothing. Recording after Graphile's completion could not be atomic, and recording before it would report a job as completed while a crash left it to run again. Failure outcomes are best effort, because a failed job keeps its row unless the queue discards it, and `getJob` prefers the live row over the outcome.
+
+Idempotency keys go through `bgw_add_jobs`, a PL/pgSQL wrapper around `add_job` that `migrate()` creates ([`src/enqueue-sql.ts`](../../src/enqueue-sql.ts)). It cannot be one prepared statement. A losing producer must read the winner's job id, but a statement's snapshot predates the winner's commit; only `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` sees it. The winner must write the job id after `add_job` returns, and one statement cannot insert and then update the same row. The function runs each step as its own statement and keeps the prepared-SQL contract: one statement, atomic in the caller's transaction. Keys are scoped per task identifier, unlike Graphile's global `jobKey`, so two queues cannot swallow each other's jobs.
 
 None of this makes external effects exactly-once: a process can crash after an effect but before its checkpoint. That limit belongs in user documentation, not in more machinery.
 

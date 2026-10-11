@@ -15,6 +15,7 @@ export type StepCache = Record<string, StepCacheEntry>
 type EnvelopeMetadata = {
 	[BGW_ENVELOPE_KEY]: typeof BGW_ENVELOPE_VERSION
 	steps?: StepCache
+	progress?: unknown
 	_cron?: unknown
 	[TRACEPARENT_KEY]?: string
 }

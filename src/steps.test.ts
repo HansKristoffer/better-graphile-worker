@@ -165,9 +165,9 @@ describe('createPgStepStore', () => {
 		await store.set('fetch-user', { id: 'u1' })
 		expect(params).toEqual([
 			'1',
+			'worker-1',
 			'fetch-user',
-			JSON.stringify({ output: { id: 'u1' } }),
-			'worker-1'
+			JSON.stringify({ output: { id: 'u1' } })
 		])
 		expect(store.get('fetch-user')).toEqual({ output: { id: 'u1' } })
 	})

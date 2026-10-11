@@ -1,5 +1,6 @@
 import type z from 'zod'
-import type { QueueContract } from './queue.js'
+import type { ProgressSchemaOf, QueueContract } from './queue.js'
+import type { JobProgressSnapshot, ProgressValueOf } from './progress.js'
 import type { BatchJobOptions, JobOptions } from './job-options.js'
 import type { PayloadEnvelope } from './payload.js'
 
@@ -37,6 +38,18 @@ export type QueuePayload<
 	T extends string,
 	TQueues extends readonly QueueContract[]
 > = InferPayload<ExtractQueue<T, TQueues>>
+/** The value a queue's `ctx.progress` stores, from its `progressSchema` output. */
+export type QueueProgress<
+	T extends string,
+	TQueues extends readonly QueueContract[]
+> = ProgressValueOf<ProgressSchemaOf<ExtractQueue<T, TQueues>>>
+/** Read a job's progress by queue name and id; null when the job no longer exists. */
+export type GetJobProgressFn<TQueues extends readonly QueueContract[]> = <
+	T extends QueueName<TQueues>
+>(
+	queue: T,
+	jobId: string
+) => Promise<JobProgressSnapshot<QueueProgress<T, TQueues>> | null>
 export type InputsOf<TQueues extends readonly QueueContract[]> = {
 	[Q in TQueues[number] as Q['name']]: InferInput<Q>
 }
