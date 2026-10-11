@@ -203,7 +203,7 @@ const apiWorker = createBetterWorker({ pgPool, queues, process: ['advanceRun'], 
 await Promise.all([exportsWorker.start(), apiWorker.start()])
 ```
 
-Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold.
+Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold; a `timeout` below 4 hours enforces this.
 
 ### Crash recovery
 
@@ -225,6 +225,28 @@ The risk is a worker that is alive but cannot heartbeat for `staleAfter`. It loo
 - Handlers wait for the worker's first heartbeat before they run.
 - The heartbeat table, `_bgw_worker_heartbeats` in the Graphile schema, is created by `migrate()`. A worker also creates it on start if it is missing. If the worker's role cannot, the worker logs `worker.crash_recovery.disabled` and runs without crash recovery; with `crashRecovery` set explicitly, `start()` fails instead. Stopped workers leave their row; a later sweep removes it.
 
+### Timeouts
+
+Graphile has no execution time limit: a hung handler holds its lock and its lane until it returns. Set `timeout` (milliseconds) on a queue, or `defaultTimeout` on a worker for every queue without its own.
+
+```ts
+const exportRun = defineQueue({
+  name: 'exportRun',
+  inputSchema: z.object({ runId: z.string() }),
+  timeout: 60 * 60_000,
+  processFn: async ({ runId }, ctx) => {
+    await fetch(`https://exports.example.com/${runId}`, { method: 'POST', signal: ctx.signal })
+  }
+})
+const worker = createBetterWorker({ pgPool, queues, defaultTimeout: 20 * 60_000 })
+```
+
+The clock covers one attempt: each retry and each continuation starts a fresh one, and a cron-init queue's timeout also applies to its `initFn`. There is no per-job override; give jobs with different limits their own queues. When the time is up, `ctx.signal` aborts with a `JobTimeoutError` as its `reason`, and the attempt fails with `JobTimeoutError` whether or not the handler stops. Graphile releases the lock and lane at once. Normal retry rules apply, so the timeout spends an attempt and backs off, and on the last attempt it is a permanent failure. `onJobFinished` and the `job.completed` log report `errorType: 'JobTimeoutError'`, and Graphile stores the message as `last_error`. `getQueueDefinitions()` shows each queue's effective timeout.
+
+JavaScript cannot kill a function. A handler that ignores its signal keeps running, detached, in your process; a retry can run next to it. Everything it starts through the context after the timeout is refused with `JobTimeoutError`: `ctx.step.run`, `ctx.progress.set` and `flush`, `ctx.continue()`, `ctx.createJob` and `ctx.createJobs`. A checkpoint or progress write already in flight lands only if it commits before the failure is recorded; it can never be written into a later attempt. Raw `ctx.helpers` and your own side effects are not guarded, so pass `ctx.signal` to HTTP and database clients and check it in loops. When the detached handler finally settles, a `job.timed_out_handler_settled` warning is logged. Synchronous code that never yields blocks the event loop, so no timeout can fire.
+
+`ctx.continue()` after the timeout is refused, so keep time slices well inside it. A continuation that is already committing when the timeout fires wins, and the run counts as continued. During graceful shutdown, Graphile aborts `ctx.signal` with its own reason after `gracefulShutdownAbortTimeout`; `ctx.continue()` still works then. A hung handler cannot hold up `stop()` past its timeout: the attempt fails and shutdown proceeds without waiting for the detached handler.
+
 ## Payloads and failure policy
 
 Producer inputs use `z.input`; consumers receive `z.output`. Both use async parsing, including async refinements and transforms. Validation runs before enqueue by default and again on the consumer because other producers can write jobs. Cron-init validates each returned input once during enqueue; it never enqueues transformed outputs.
@@ -242,7 +264,7 @@ Continuation, retention, checkpointing, job outcomes, progress, crash recovery a
 
 ## Context and durable steps
 
-Contexts include `jobId`, the task `queue`, `attempt`, `maxAttempts`, `logger`, `span`, `signal`, raw Graphile `helpers`, typed `createJob`/`createJobs`, `continue`, `step`, `progress`, and `cron` metadata (`ts: Date`, optional `backfilled`). Cron-init contexts use the suffixed task name.
+Contexts include `jobId`, the task `queue`, `attempt`, `maxAttempts`, `logger`, `span`, `signal` (aborted on shutdown or [timeout](#timeouts)), raw Graphile `helpers`, typed `createJob`/`createJobs`, `continue`, `step`, `progress`, and `cron` metadata (`ts: Date`, optional `backfilled`). Cron-init contexts use the suffixed task name.
 
 ```ts
 const user = await ctx.step.run('fetch-user-v1', async () => {

@@ -88,7 +88,10 @@ export function recordJobOutcome(
 	)
 }
 
-/** Patch the locked job's envelope; `$1` is the job id, `$2` the lock owner. */
+/**
+ * Patch the locked job's envelope; `$1` is the job id, `$2` the lock owner and `$3` the
+ * lock time, which tells this attempt apart from a later one by the same worker pool.
+ */
 async function patchEnvelope(
 	helpers: JobHelpers,
 	schema: string,
@@ -101,10 +104,10 @@ async function patchEnvelope(
 		client.query(
 			`WITH owned AS (
 		SELECT id, payload::jsonb AS data FROM ${quoted}._private_jobs
-		WHERE id = $1::bigint AND locked_by = $2::text AND locked_at IS NOT NULL FOR UPDATE
+		WHERE id = $1::bigint AND locked_by = $2::text AND date_trunc('milliseconds', locked_at) = $3::timestamptz FOR UPDATE
 	) UPDATE ${quoted}._private_jobs jobs SET payload = ${patched}, updated_at = now()
 		FROM owned WHERE jobs.id = owned.id AND owned.data->>'__bgw' = '2' AND owned.data ? 'payload'`,
-			[jobId, helpers.job.locked_by, ...values]
+			[jobId, helpers.job.locked_by, helpers.job.locked_at, ...values]
 		)
 	)
 	if (result.rowCount !== 1) throw new StepPersistenceError(jobId)
@@ -121,7 +124,7 @@ export function writeCheckpoint(
 		helpers,
 		schema,
 		jobId,
-		`jsonb_set(owned.data, '{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($3::text, $4::jsonb), true)`,
+		`jsonb_set(owned.data, '{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($4::text, $5::jsonb), true)`,
 		[id, JSON.stringify(checkpoint)]
 	)
 }
@@ -136,7 +139,7 @@ export function writeProgress(
 		helpers,
 		schema,
 		jobId,
-		`jsonb_set(owned.data, '{progress}', $3::jsonb, true)`,
+		`jsonb_set(owned.data, '{progress}', $4::jsonb, true)`,
 		[JSON.stringify(value)]
 	)
 }

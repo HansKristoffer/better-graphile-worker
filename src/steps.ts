@@ -42,6 +42,8 @@ export function serializeStepOutput(stepId: string, value: unknown): unknown {
 export function createStepRunner(options: {
 	store: StepStore
 	span: JobSpan
+	/** Throws when the attempt may no longer start steps, e.g. after its timeout. */
+	assertActive?: () => void
 }): JobStep {
 	const pending = new Map<string, Promise<unknown>>()
 	function event(name: string, id: string) {
@@ -56,6 +58,7 @@ export function createStepRunner(options: {
 		fn: () => Promise<T> | T,
 		codec?: StepCodec<T>
 	): Promise<T> {
+		options.assertActive?.()
 		if (typeof id !== 'string' || !id.length)
 			throw new NonRetriableError('Step id must be a non-empty string')
 		const decode = (output: unknown): T => {

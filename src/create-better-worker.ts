@@ -82,6 +82,8 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	hooks?: BetterWorkerHooks
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
+	/** Fail attempts that run longer than this many milliseconds; queues override it with `timeout`. */
+	defaultTimeout?: number
 	completedJobs?: CompletedJobsOption
 	/** Record final job states in PostgreSQL so `getJob` can read them after completion. */
 	jobOutcomes?: JobOutcomesOption
@@ -195,6 +197,8 @@ export function createBetterWorker<
 		1,
 		2147483647
 	)
+	if (options.defaultTimeout !== undefined)
+		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
 
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 
@@ -238,6 +242,7 @@ export function createBetterWorker<
 		schema,
 		otel,
 		permanentFailure: options.permanentFailure,
+		defaultTimeout: options.defaultTimeout,
 		jobOutcomes,
 		heartbeatReady: () => heartbeat?.ready
 	}
@@ -379,7 +384,11 @@ export function createBetterWorker<
 			return jobs.map((job) => String(job.id))
 		},
 		getQueueDefinitions() {
-			return getQueueDefinitions(options.queues, options.defaultMaxAttempts)
+			return getQueueDefinitions(
+				options.queues,
+				options.defaultMaxAttempts,
+				options.defaultTimeout
+			)
 		}
 	}
 }

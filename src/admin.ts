@@ -17,6 +17,8 @@ export type QueueDefinition = {
 	cron: string | null
 	serial: boolean | string | null
 	maxAttempts: number
+	/** Attempt timeout in milliseconds, including the worker default; null when unlimited. */
+	timeout: number | null
 	priority: number | null
 	hasInputSchema: boolean
 	inputSchema: z.ZodType | null
@@ -86,7 +88,8 @@ const MAX_LIST_LIMIT = 1000
 
 export function getQueueDefinitions(
 	queues: readonly QueueContract[],
-	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
+	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+	defaultTimeout?: number
 ): QueueDefinition[] {
 	return queues.map((queue) => ({
 		name: queue.name,
@@ -94,6 +97,7 @@ export function getQueueDefinitions(
 		cron: formatCronSchedule(queue.cron),
 		serial: queue.serial ?? null,
 		maxAttempts: queue.maxAttempts ?? defaultMaxAttempts,
+		timeout: queue.timeout ?? defaultTimeout ?? null,
 		priority: queue.priority ?? null,
 		hasInputSchema: hasInputSchema(queue),
 		inputSchema: hasInputSchema(queue) ? queue.inputSchema : null
