@@ -47,7 +47,8 @@ export class UnknownQueueError extends Error {
 export class JobValidationError extends NonRetriableError {
 	constructor(
 		readonly queueName: string,
-		readonly issues: readonly { path: PropertyKey[]; message: string }[]
+		readonly issues: readonly { path: PropertyKey[]; message: string }[],
+		subject: 'payload' | 'output' = 'payload'
 	) {
 		const details = issues
 			.map((issue) => {
@@ -56,7 +57,7 @@ export class JobValidationError extends NonRetriableError {
 				return `${path}: ${issue.message}`
 			})
 			.join('; ')
-		super(`Invalid payload for queue "${queueName}": ${details}`)
+		super(`Invalid ${subject} for queue "${queueName}": ${details}`)
 		this.name = 'JobValidationError'
 	}
 }
@@ -131,5 +132,55 @@ export class JobContinuedSignal extends Error {
 	constructor() {
 		super('Job continued; code after ctx.continue() must not run')
 		this.name = 'JobContinuedSignal'
+	}
+}
+
+/**
+ * A child job of `ctx.step.triggerAndWait` failed permanently. The result is
+ * checkpointed like a step, so retrying the parent cannot change it: rethrowing it
+ * fails the parent without further attempts. `cause` carries the child's error.
+ */
+export class ChildJobFailedError extends NonRetriableError {
+	constructor(
+		readonly jobId: string,
+		readonly queueName: string,
+		error: { name: string; message: string }
+	) {
+		const cause = new Error(error.message)
+		cause.name = error.name
+		super(`Child job ${jobId} of "${queueName}" failed: ${error.message}`, {
+			cause
+		})
+		this.name = 'ChildJobFailedError'
+	}
+}
+
+/**
+ * A wait's `timeout` passed before all of its children finished. The children keep
+ * running. Checkpointed like a step, so a retry of the parent throws it again.
+ */
+export class WaitTimeoutError extends NonRetriableError {
+	constructor(
+		readonly waitId: string,
+		/** Child job ids that had not finished. */
+		readonly pending: readonly string[]
+	) {
+		super(
+			`Wait "${waitId}" timed out with ${pending.length} unfinished child job(s): ${pending.join(', ')}`
+		)
+		this.name = 'WaitTimeoutError'
+	}
+}
+
+/**
+ * Internal: thrown by a wait that ended the run until its children finish. The task
+ * rethrows it so Graphile unlocks the job and its lane without deleting it.
+ */
+export class JobSuspendedSignal extends Error {
+	constructor(readonly waitId: string) {
+		super(`Waiting for the child jobs of "${waitId}"; not a failure`)
+		this.name = 'JobSuspendedSignal'
+		// Graphile logs every suspension as a failed task; a stack would only add noise.
+		this.stack = ''
 	}
 }

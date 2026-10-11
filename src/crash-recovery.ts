@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg'
 import type { JobLogger } from './hooks.js'
-import { releaseJobsLockedBy } from './private-jobs.js'
+import { releaseJobsLockedBy, sweepWaits } from './private-jobs.js'
 import { quoteSchemaName } from './schema-name.js'
 import { assertInteger } from './validation.js'
 
@@ -175,6 +175,17 @@ RETURNING xmax = 0 AS inserted`,
 			logger.warn('worker.crash_recovery.sweep_failed', {
 				error: String(error)
 			})
+		}
+		try {
+			// Fail waits on children that ended without reporting, such as those just released.
+			const lost = await withConnection((client) => sweepWaits(client, schema))
+			if (lost.length)
+				logger.warn('worker.waits.lost_children', {
+					job_ids: lost.join(','),
+					job_count: lost.length
+				})
+		} catch (error) {
+			logger.warn('worker.waits.sweep_failed', { error: String(error) })
 		}
 	}
 	const ready = beatSafely()

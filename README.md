@@ -1,6 +1,6 @@
 # better-graphile-worker
 
-Typed Graphile Worker queues with Zod schemas, cron and cron-init, durable step checkpoints, job progress, and optional OpenTelemetry. You own the PostgreSQL pool.
+Typed Graphile Worker queues with Zod schemas, cron and cron-init, durable step checkpoints, waiting on child jobs, job progress, and optional OpenTelemetry. You own the PostgreSQL pool.
 
 ## Install
 
@@ -279,7 +279,7 @@ It spends the attempt like any other failure: on the last attempt the job fails 
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
 
-Continuation, retention, retry scheduling, checkpointing, job outcomes, progress, crash recovery and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+Continuation, retention, retry scheduling, checkpointing, waits, job outcomes, progress, crash recovery and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
 
 ## Context and durable steps
 
@@ -306,7 +306,75 @@ const when = await ctx.step.run('timestamp-v1', () => new Date(), {
 }) // Date on both fresh execution and replay
 ```
 
-Use the same result type and codec for every use of an ID. Version IDs when the stored format changes. Checkpoints cannot guarantee exactly-once external effects: a process can crash after an effect but before its checkpoint. External effects must be idempotent. Steps memoize results; they do not implement suspended workflows or durable sleeps.
+Use the same result type and codec for every use of an ID. Version IDs when the stored format changes. Checkpoints cannot guarantee exactly-once external effects: a process can crash after an effect but before its checkpoint. External effects must be idempotent. Steps memoize results; to wait for other jobs, see [Waiting on child jobs](#waiting-on-child-jobs). For a durable sleep, use `ctx.continue({ runAt })`.
+
+## Waiting on child jobs
+
+A handler can enqueue child jobs and wait for their results. While the children run, the parent holds no worker slot, no lane and no attempt, for minutes or days.
+
+```ts
+const fetchAccount = defineQueue({
+  name: 'fetchAccount',
+  inputSchema: z.object({ accountId: z.string() }),
+  outputSchema: z.object({ upserted: z.number() }), // types and validates the result
+  maxAttempts: 10,
+  processFn: async ({ accountId }) => ({ upserted: await sync(accountId) })
+})
+
+const syncBank = defineQueue({
+  name: 'syncBank',
+  inputSchema: z.object({ userId: z.string() }),
+  processFn: async ({ userId }, ctx) => {
+    const accounts = await ctx.step.run('list-accounts-v1', () => listAccounts(userId))
+    const results = await ctx.step.batchTriggerAndWait(
+      'fetch-all-v1',
+      fetchAccount,
+      accounts.map((accountId) => ({ accountId })),
+      { timeout: 7 * 86_400_000 } // optional, milliseconds
+    )
+    for (const result of results) {
+      if (!result.ok) throw result.error // ChildJobFailedError with the child's last error
+      ctx.logger.info('fetched', { jobId: result.id, upserted: result.output.upserted })
+    }
+  }
+})
+```
+
+`ctx.step.triggerAndWait(id, queue, input, options?)` waits on one child; `batchTriggerAndWait(id, queue, inputs, options?)` enqueues a batch atomically and returns results in input order. Each result is `{ ok: true, id, output }` or `{ ok: false, id, error }`, where `id` is the child's job id; a tuple of inputs returns a tuple of results. Pass the queue definition, as with `ctx.createJob`, in both registration styles. A handlers registry accepts only its own queues. The child's `deriveJobOptions` and defaults apply.
+
+**This is replay, not suspension.** JavaScript cannot pause a function across processes. When children are still running, the run ends at the wait. When the last child finishes, the job runs again **from the top** with the same job id; completed steps and waits return their checkpoints, and the wait that ended the run returns its results. Everything before a wait runs again on every resume, so put side effects and slow reads in `ctx.step.run`, and keep the order of waits and steps deterministic. Wait IDs share the step ID namespace; version them like step IDs.
+
+- **Results.** Only a final child state resolves a wait. A child that is retrying keeps the parent asleep; it fails when its attempts are exhausted, it throws `NonRetriableError`, it times out on its last attempt, or `failJobs` fails it. The child's handler returns the `outputSchema` input and the parent receives its output; both sides validate it. Without an `outputSchema`, `output` is `undefined`. Return values must be JSON, like step results, and TypeScript rejects an `outputSchema` whose input is not.
+- **Results are checkpointed.** A wait, including its failures, is a step: retrying the parent does not run its children again, and rethrowing `result.error` fails the parent permanently because `ChildJobFailedError` is a `NonRetriableError`. Retries belong to the child's `maxAttempts`. To start fresh children, use a new wait ID.
+- **Timeout.** `timeout` counts from the first time the wait enqueued its children. The parent wakes at the deadline, and the wait throws `WaitTimeoutError`, also non-retriable, if any child is unfinished. The children keep running; their results are dropped. A caught timeout is checkpointed too, so a replay throws it again.
+- **Attempts, lanes and timeouts.** Ending a run at a wait does not spend an attempt, so a `maxAttempts: 1` parent can wait. A waiting parent does not hold its serial lane, so children in the same lane run, and later jobs in that lane can run before it resumes. A queue `timeout` covers one run; waiting time does not count.
+- **Several waits.** Sequential waits each end the run once. Parallel waits (`Promise.all`) enqueue all their children in the same run; the job resumes after each one finishes and replays the rest. A child can wait on its own children.
+- **Continuations.** A finished wait is a checkpoint, so `ctx.continue()` carries it like a step. A run cannot continue while it waits; `ctx.continue()` after a caught wait rejection is refused. A child that continues reports from its continuation.
+- **Lost children.** Started workers sweep, with their crash-recovery heartbeat, for children that ended without reporting: released by crash recovery on their last attempt, failed by `failJobs`, deleted, or completed by a worker of an older version. Those waits fail and their parents wake. The sweep needs crash recovery, which is on by default. It also deletes the wait rows of parents that no longer exist.
+- **Deduplicated children.** A child returned by its idempotency key is waited on as that existing job. If that job already finished, or is already running, it cannot report a result, and the sweep fails the wait once it ends. A `jobKey` that replaces a pending job is fine, but re-adding the key of a child that is already waited on replaces its payload, with the same effect.
+- **Visibility.** `getJob(parentId)` reports `state: 'waiting'` with the child ids in `waitingOn`; `listJobs` and `getJobStats` count it as pending with a `runAt` at its deadline, or year 9999. `onJobFinished` reports a run that ended at a wait as `status: 'success'` with `waiting: true`.
+- **Graphile logs.** The job keeps its row because the run ends through Graphile's failure path, so Graphile logs `Failed task … with error 'Waiting for the child jobs of "<id>"; not a failure'` and stores that message as the job's `last_error`. A parent resumes as soon as its last child finishes, except when that child finishes in the instant before Graphile releases the parent; then it resumes after Graphile's retry backoff, or at the next sweep, whichever is first.
+- **Setup.** `migrate()` creates `bgw_wait_groups` and `bgw_waits` in the Graphile schema; a wait without them fails with an error asking you to run it. Worker roles need `SELECT`, `INSERT`, `UPDATE` and `DELETE` on both; roles calling `getJob` need `SELECT`. No worker option is needed, but upgrade every worker that runs child queues before using waits: older workers complete children without reporting.
+
+### Porting from Trigger.dev `triggerAndWait`
+
+```ts
+// Trigger.dev
+const result = await fetchAccountTask.triggerAndWait({ accountId })
+if (!result.ok) throw result.error
+const results = await fetchAccountTask.batchTriggerAndWait(ids.map((accountId) => ({ payload: { accountId } })))
+
+// better-graphile-worker, inside processFn
+const result = await ctx.step.triggerAndWait('fetch-v1', fetchAccount, { accountId })
+if (!result.ok) throw result.error
+const results = await ctx.step.batchTriggerAndWait('fetch-all-v1', fetchAccount, ids.map((accountId) => ({ accountId })))
+```
+
+- Give each wait a stable ID, and move side effects before it into `ctx.step.run`: Trigger.dev checkpoints the process, this library replays the handler.
+- Declare `outputSchema` on the child queue to type `output`; Trigger.dev infers it from the return type.
+- Trigger.dev triggers new children when the parent retries. Here a wait's results are final for that wait ID, and `ChildJobFailedError` does not retry. To retry the parent with fresh children, throw a retriable error such as `new Error('fetch failed', { cause: result.error })` and include `ctx.attempt` in the wait ID.
+- Long child retries, such as `RetryAtError` schedules of hours to days, cost the parent nothing while it waits. Use `timeout` to bound the wait.
+- Test handlers that wait with `createTestHarness`, which runs the children inline.
 
 ## Progress
 
@@ -384,6 +452,7 @@ switch (job.state) {
   case 'pending': // waiting for job.runAt
   case 'running':
   case 'retrying': // an attempt failed (job.lastError); the next one runs at job.runAt
+  case 'waiting': // ended at ctx.step.triggerAndWait; job.waitingOn lists the unfinished children
     break
   case 'completed':
     break
@@ -419,7 +488,7 @@ await harness.process('sendEmail', { to: 'person@example.com' })
 console.log(harness.logs, harness.enqueued, harness.continued)
 ```
 
-The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Waits run their children inline, once and in order, through the same validation and checkpoints; a child that throws is a failed result, without retries, and `timeout` is ignored. A waited child that calls `ctx.continue()` is rejected. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
 
 ## Types and major-version migration
 

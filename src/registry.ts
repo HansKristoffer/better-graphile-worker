@@ -10,7 +10,7 @@ import { assertInteger } from './validation.js'
 
 /** Internal handler erasure; public APIs retain their registry-specific signatures. */
 export type NormalizedQueue = QueueContract & {
-	processFn: (payload: unknown, ctx: JobContext) => Promise<void> | void
+	processFn: (payload: unknown, ctx: JobContext) => unknown
 	initFn?: (ctx: JobContext) => Promise<readonly unknown[]> | readonly unknown[]
 }
 
@@ -86,7 +86,7 @@ export function normalizeWorkerQueues<T extends readonly QueueContract[]>(
 		const processFn = value.processFn as (
 			payload: unknown,
 			ctx: JobContext | InlineJobContext
-		) => Promise<void> | void
+		) => unknown
 		const initFn = ('initFn' in value ? value.initFn : undefined) as
 			| ((
 					ctx: JobContext | InlineJobContext

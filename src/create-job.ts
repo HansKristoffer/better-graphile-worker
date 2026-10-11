@@ -514,6 +514,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		prepareJobs: prepareMany as PrepareJobsFn<T>,
 		enqueueOne,
 		enqueueMany,
+		prepareOne,
+		prepareMany,
 		triggerCron: (name: string, opts?: JobOptions) =>
 			enqueueOne(name, undefined, opts, true)
 	}

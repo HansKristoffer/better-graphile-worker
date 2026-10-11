@@ -3,6 +3,7 @@ import type z from 'zod'
 import type { JobLogger, JobSpan } from './hooks.js'
 import type { ProgressOf } from './progress.js'
 import type { JobStep } from './steps.js'
+import type { JsonCompatible } from './validation.js'
 import type { Duration } from './job-options.js'
 import type {
 	CreateJobFn,
@@ -80,7 +81,7 @@ export type JobContext<
 	createJob: CreateJobFn<TQueues>
 	createJobs: CreateJobsFn<TQueues>
 	cron?: JobCronMeta | undefined
-	step: JobStep
+	step: JobStep<TQueues[number]>
 	/** Progress readable from outside the worker; typed by the queue's `progressSchema`. */
 	progress: ProgressOf<
 		ProgressSchemaOf<Extract<TQueues[number], { name: TName }>>
@@ -95,12 +96,18 @@ export type JobContext<
 export type QueueContract<
 	TName extends string = string,
 	TSchema extends z.ZodType | undefined = z.ZodType | undefined,
-	TProgress extends z.ZodType | undefined = z.ZodType | undefined
+	TProgress extends z.ZodType | undefined = z.ZodType | undefined,
+	TOutput extends z.ZodType | undefined = z.ZodType | undefined
 > = {
 	readonly name: TName
 	readonly inputSchema?: TSchema
 	/** Validates `ctx.progress.set()` values; its output must be JSON. */
 	readonly progressSchema?: TProgress
+	/**
+	 * Validates the handler's return value, which `ctx.step.triggerAndWait` hands to a
+	 * waiting parent. The handler returns its input type; the parent receives its output.
+	 */
+	readonly outputSchema?: TOutput
 	readonly maxAttempts?: number
 	readonly priority?: number
 	readonly flags?: readonly string[]
@@ -126,6 +133,24 @@ export type ProgressSchemaOf<Q> = Q extends {
 	? P
 	: undefined
 
+/** A queue's `outputSchema`, or undefined when it has none. */
+export type OutputSchemaOf<Q> = Q extends {
+	readonly outputSchema?: infer O extends z.ZodType | undefined
+}
+	? O
+	: undefined
+
+/** What a handler returns: its `outputSchema` input, or nothing without one. */
+export type ProcessResult<O> = [O] extends [z.ZodType]
+	? JsonOutput<z.input<O>> | Promise<JsonOutput<z.input<O>>>
+	: Promise<void> | void
+/** Outputs are stored as JSON; encode dates as strings and transform them back. */
+type JsonOutput<T> = [Exclude<T, undefined>] extends [
+	JsonCompatible<Exclude<T, undefined>>
+]
+	? T
+	: never
+
 /** Shared contracts cannot carry competing inline handler implementations. */
 export type HandlerFreeQueueContract<Q extends QueueContract = QueueContract> =
 	Q & { readonly processFn?: never; readonly initFn?: never }
@@ -133,8 +158,9 @@ export type HandlerFreeQueueContract<Q extends QueueContract = QueueContract> =
 export type RegularQueueContract<
 	S extends z.ZodType,
 	N extends string = string,
-	P extends z.ZodType | undefined = undefined
-> = QueueContract<N, S, P> & {
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+> = QueueContract<N, S, P, O> & {
 	readonly inputSchema: S
 	readonly cron?: never
 	readonly cronOptions?: never
@@ -142,7 +168,7 @@ export type RegularQueueContract<
 export type CronQueueContract<
 	N extends string = string,
 	P extends z.ZodType | undefined = undefined
-> = QueueContract<N, undefined, P> & {
+> = QueueContract<N, undefined, P, undefined> & {
 	readonly cron: CronSchedule
 	readonly inputSchema?: never
 	readonly deriveJobOptions?: never
@@ -150,8 +176,9 @@ export type CronQueueContract<
 export type CronInitQueueContract<
 	S extends z.ZodType,
 	N extends string = string,
-	P extends z.ZodType | undefined = undefined
-> = QueueContract<N, S, P> & {
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+> = QueueContract<N, S, P, O> & {
 	readonly cron: CronSchedule
 	readonly inputSchema: S
 }
@@ -172,18 +199,25 @@ export type InlineJobContext<
 type InlineProcessHandler<
 	S extends z.ZodType | undefined,
 	N extends string,
-	P extends z.ZodType | undefined
+	P extends z.ZodType | undefined,
+	O extends z.ZodType | undefined = undefined
 > = (
 	payload: S extends z.ZodType ? z.output<S> : undefined,
 	ctx: InlineJobContext<N, ProgressOf<P>>
-) => Promise<void> | void
+) => ProcessResult<O>
 
 export type RegularQueue<
 	S extends z.ZodType,
 	N extends string = string,
-	P extends z.ZodType | undefined = undefined
-> = RegularQueueContract<S, N, P> & {
-	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>, NoInfer<P>>
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+> = RegularQueueContract<S, N, P, O> & {
+	readonly processFn: InlineProcessHandler<
+		NoInfer<S>,
+		NoInfer<N>,
+		NoInfer<P>,
+		NoInfer<O>
+	>
 	readonly initFn?: never
 }
 export type CronQueue<
@@ -196,9 +230,15 @@ export type CronQueue<
 export type CronInitQueue<
 	S extends z.ZodType,
 	N extends string = string,
-	P extends z.ZodType | undefined = undefined
-> = CronInitQueueContract<S, N, P> & {
-	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>, NoInfer<P>>
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+> = CronInitQueueContract<S, N, P, O> & {
+	readonly processFn: InlineProcessHandler<
+		NoInfer<S>,
+		NoInfer<N>,
+		NoInfer<P>,
+		NoInfer<O>
+	>
 	readonly initFn: (
 		ctx: InlineJobContext<`${NoInfer<N>}_cron-init`>
 	) => Promise<readonly z.input<NoInfer<S>>[]> | readonly z.input<NoInfer<S>>[]
@@ -214,9 +254,9 @@ type InlineQueueDefinition<Q extends QueueContract> = Q extends {
 	cron: CronSchedule
 	inputSchema: infer S extends z.ZodType
 }
-	? CronInitQueue<S, Q['name'], ProgressSchemaOf<Q>>
+	? CronInitQueue<S, Q['name'], ProgressSchemaOf<Q>, OutputSchemaOf<Q>>
 	: Q extends { inputSchema: infer S extends z.ZodType }
-		? RegularQueue<S, Q['name'], ProgressSchemaOf<Q>>
+		? RegularQueue<S, Q['name'], ProgressSchemaOf<Q>, OutputSchemaOf<Q>>
 		: Q extends { cron: CronSchedule }
 			? CronQueue<Q['name'], ProgressSchemaOf<Q>>
 			: never
@@ -229,8 +269,9 @@ export type InlineQueues<T extends readonly QueueContract[]> = {
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
->(config: RegularQueue<S, N, P>): RegularQueue<S, N, P>
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+>(config: RegularQueue<S, N, P, O>): RegularQueue<S, N, P, O>
 export function defineQueue<
 	const N extends string,
 	P extends z.ZodType | undefined = undefined
@@ -238,15 +279,17 @@ export function defineQueue<
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
->(config: CronInitQueue<S, N, P>): CronInitQueue<S, N, P>
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
+>(config: CronInitQueue<S, N, P, O>): CronInitQueue<S, N, P, O>
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
 >(
-	config: HandlerFreeQueueContract<RegularQueueContract<S, N, P>>
-): RegularQueueContract<S, N, P>
+	config: HandlerFreeQueueContract<RegularQueueContract<S, N, P, O>>
+): RegularQueueContract<S, N, P, O>
 export function defineQueue<
 	const N extends string,
 	P extends z.ZodType | undefined = undefined
@@ -256,10 +299,11 @@ export function defineQueue<
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
+	P extends z.ZodType | undefined = undefined,
+	O extends z.ZodType | undefined = undefined
 >(
-	config: HandlerFreeQueueContract<CronInitQueueContract<S, N, P>>
-): CronInitQueueContract<S, N, P>
+	config: HandlerFreeQueueContract<CronInitQueueContract<S, N, P, O>>
+): CronInitQueueContract<S, N, P, O>
 export function defineQueue(config: QueueContract): QueueContract {
 	return config
 }
@@ -270,7 +314,7 @@ type ProcessHandler<
 > = (
 	payload: InferPayload<Q>,
 	ctx: JobContext<T, Q['name']>
-) => Promise<void> | void
+) => ProcessResult<OutputSchemaOf<Q>>
 export type QueueHandlers<T extends readonly QueueContract[]> = {
 	[Q in T[number] as Q['name']]: Q extends {
 		cron: CronSchedule

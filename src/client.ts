@@ -15,6 +15,7 @@ import {
 	type IdempotentJobSpec
 } from './enqueue-sql.js'
 import { ensureHeartbeatTable } from './crash-recovery.js'
+import { waitTablesSql } from './waits.js'
 import { assertValidSchemaName, quoteSchemaName } from './schema-name.js'
 
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
@@ -133,6 +134,7 @@ export function createWorkerClient(options: {
 			await getUtils() // makeWorkerUtils initializes/migrates once.
 			// Text without values runs as one implicit transaction.
 			await options.pgPool.query(idempotencyMigrationSql(schema))
+			await options.pgPool.query(waitTablesSql(schema))
 			await ensureHeartbeatTable(options.pgPool, schema)
 		},
 		async retryJobs(ids) {

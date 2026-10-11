@@ -20,13 +20,15 @@ import type {
 import {
 	createStepRunner,
 	createMemoryStepStore,
-	type StepStore
+	type StepStore,
+	type WaitBackend
 } from './steps.js'
+import { encodeQueueOutput, type ChildReport } from './waits.js'
 import { extractProducerLink } from './payload.js'
 import { bindCreateJob, parseQueuePayload } from './create-job.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import type { JobOptions } from './job-options.js'
-import { JobContinuedSignal } from './errors.js'
+import { JobContinuedSignal, UnknownQueueError } from './errors.js'
 import { createProgressRunner, type ProgressRunner } from './progress.js'
 
 export type CapturedLog = {
@@ -204,6 +206,55 @@ export function createTestHarness<
 		}
 	})
 
+	/** Children run inline, once and in order; a thrown error is their final failure. */
+	const waits: WaitBackend = {
+		async wait(_id, queue, inputs, batch) {
+			if (!contracts.includes(queue))
+				throw new UnknownQueueError(
+					queue.name,
+					contracts.map((item) => item.name)
+				)
+			const enqueued = batch
+				? await producer.enqueueMany(queue.name, inputs)
+				: [await producer.enqueueOne(queue.name, inputs[0])]
+			// The harness has no shouldSkipEnqueue hook, so every child has an id.
+			const ids = enqueued.filter((id) => id !== null)
+
+			const child = getQueue(queue.name)
+			const reports: (ChildReport & { id: string })[] = []
+			for (const [index, id] of ids.entries()) {
+				const report: ChildReport = await invoke(
+					queue.name,
+					{ jobId: id },
+					async (ctx) => {
+						const payload = await parseQueuePayload(child, inputs[index])
+						return encodeQueueOutput(child, await child.processFn(payload, ctx))
+					}
+				).then(
+					(run) => {
+						if (run.continued)
+							throw new Error(
+								`Child ${id} of "${queue.name}" called ctx.continue(); the test harness runs waited children once`
+							)
+						return run.result === undefined
+							? { ok: true }
+							: { ok: true, output: run.result }
+					},
+					(error: unknown) => {
+						const failure =
+							error instanceof Error ? error : new Error(String(error))
+						return {
+							ok: false,
+							error: { name: failure.name, message: failure.message }
+						}
+					}
+				)
+				reports.push({ id, ...report })
+			}
+			return { checkpoint: reports, persisted: false }
+		}
+	}
+
 	function createContext(
 		queueName: string,
 		extras?: Partial<JobContext>
@@ -256,7 +307,8 @@ export function createTestHarness<
 				extras?.step ??
 				createStepRunner({
 					store: stepCaches.get(cacheId)!,
-					span
+					span,
+					waits
 				}),
 			progress: extras?.progress ?? (progress as JobContext['progress'])
 		}
@@ -272,13 +324,13 @@ export function createTestHarness<
 		queueName: string,
 		extras: Partial<JobContext> | undefined,
 		fn: (ctx: JobContext) => Promise<T>
-	): Promise<{ ctx: JobContext; result: T | undefined }> {
+	): Promise<{ ctx: JobContext; result: T | undefined; continued: boolean }> {
 		const { ctx, progress } = createContext(queueName, extras)
 		try {
-			return { ctx, result: await fn(ctx) }
+			return { ctx, result: await fn(ctx), continued: false }
 		} catch (error) {
 			if (!(error instanceof JobContinuedSignal)) throw error
-			return { ctx, result: undefined }
+			return { ctx, result: undefined, continued: true }
 		} finally {
 			await progress.close(true)
 		}
@@ -306,7 +358,10 @@ export function createTestHarness<
 		) {
 			const queue = getQueue(String(queueName))
 			const { ctx } = await invoke(String(queueName), extras, async (ctx) => {
-				await queue.processFn(await parseQueuePayload(queue, payload), ctx)
+				await encodeQueueOutput(
+					queue,
+					await queue.processFn(await parseQueuePayload(queue, payload), ctx)
+				)
 			})
 			return { ctx, logs: [...logs] }
 		},

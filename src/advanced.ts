@@ -29,8 +29,10 @@ export {
 	createStepRunner,
 	createMemoryStepStore,
 	createPgStepStore,
-	type StepStore
+	type StepStore,
+	type WaitBackend
 } from './steps.js'
+export type { ChildReport, WaitCheckpoint } from './waits.js'
 export { getOtel, createNoopSpan } from './otel.js'
 export {
 	queryJobCounts,
