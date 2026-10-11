@@ -429,17 +429,15 @@ async function executeTask(options: ExecuteTaskOptions) {
 			let retryAt: Date | undefined
 			const settle = async (
 				settled: ChildReport,
-				row: 'delete' | 'exhaust' | 'keep'
+				row: Parameters<typeof settleLockedJob>[2]['row']
 			) => {
 				// Otherwise Graphile completes or fails the job itself.
 				if (!runtime.jobOutcomes && !waited && row !== 'exhaust') return true
+				const outcome = settled.ok
+					? { state: 'completed' as const }
+					: { state: 'failed' as const, error: settled.error.message }
 				return settleLockedJob(helpers, runtime.schema, {
-					outcome: runtime.jobOutcomes
-						? {
-								state: settled.ok ? 'completed' : 'failed',
-								error: settled.ok ? undefined : settled.error.message
-							}
-						: undefined,
+					outcome: runtime.jobOutcomes ? outcome : undefined,
 					report: waited ? settled : undefined,
 					row
 				})
@@ -471,11 +469,12 @@ async function executeTask(options: ExecuteTaskOptions) {
 					// A committed ending decides the run, even against a timeout or an error
 					// the handler threw after catching its signal.
 					if (!(await endings.settled())) throw error
-					const expected =
+					// The signal itself, or a timeout that raced the ending, is not news.
+					const isEndingOrRace =
 						error instanceof JobContinuedSignal ||
 						error instanceof JobSuspendedSignal ||
 						error instanceof JobTimeoutError
-					if (!expected)
+					if (!isEndingOrRace)
 						ctx.logger.warn('job.error_after_ending', {
 							event: 'job.error_after_ending',
 							job_id: jobId,

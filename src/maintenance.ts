@@ -40,7 +40,10 @@ export function resolveCrashRecovery(
 }
 
 export function heartbeatTableSql(schema: string): string {
-	return `CREATE TABLE IF NOT EXISTS ${quoteSchemaName(schema)}.${HEARTBEATS_TABLE} (worker_id text PRIMARY KEY, last_seen_at timestamptz NOT NULL);`
+	return `CREATE TABLE IF NOT EXISTS ${quoteSchemaName(schema)}.${HEARTBEATS_TABLE} (
+	worker_id text PRIMARY KEY,
+	last_seen_at timestamptz NOT NULL
+);`
 }
 
 /**
@@ -96,55 +99,43 @@ async function sweep(
 	withConnection: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>
 ) {
 	const { schema, logger, recovery, outcomeRetention } = options
-	const steps: [string, (client: PoolClient) => Promise<unknown>][] = [
-		[
-			'worker.crash_recovery.sweep_failed',
-			async (client) => {
-				if (!recovery) return
-				const swept = await sweepDeadWorkers(
-					client,
-					schema,
-					recovery.staleAfter
-				)
-				// Stopped workers leave their row behind; only released jobs are news.
-				if (swept.jobIds.length)
-					logger.warn('worker.crash_recovery.released', {
-						dead_worker_ids: swept.workerIds.join(','),
-						job_ids: swept.jobIds.join(','),
-						job_count: swept.jobIds.length
-					})
-			}
-		],
-		[
-			'worker.waits.sweep_failed',
-			async (client) => {
-				const lost = await sweepWaits(client, schema)
-				if (lost.length)
-					logger.warn('worker.waits.lost_children', {
-						job_ids: lost.join(','),
-						job_count: lost.length
-					})
-			}
-		],
-		[
-			'job.outcome.prune_failed',
-			async (client) => {
-				if (outcomeRetention !== undefined)
-					await pruneJobOutcomes(client, schema, outcomeRetention)
-			}
-		],
-		[
-			'worker.idempotency.prune_failed',
-			(client) => pruneIdempotencyKeys(client, schema)
-		]
-	]
-	for (const [event, step] of steps) {
+	const attempt = async (
+		failedEvent: string,
+		work: (client: PoolClient) => Promise<void>
+	) => {
 		try {
-			await withConnection(step)
+			await withConnection(work)
 		} catch (error) {
-			logger.warn(event, { error: String(error) })
+			logger.warn(failedEvent, { error: String(error) })
 		}
 	}
+
+	if (recovery)
+		await attempt('worker.crash_recovery.sweep_failed', async (client) => {
+			const swept = await sweepDeadWorkers(client, schema, recovery.staleAfter)
+			// Stopped workers leave their row behind; only released jobs are news.
+			if (swept.jobIds.length)
+				logger.warn('worker.crash_recovery.released', {
+					dead_worker_ids: swept.workerIds.join(','),
+					job_ids: swept.jobIds.join(','),
+					job_count: swept.jobIds.length
+				})
+		})
+	await attempt('worker.waits.sweep_failed', async (client) => {
+		const lost = await sweepWaits(client, schema)
+		if (lost.length)
+			logger.warn('worker.waits.lost_children', {
+				job_ids: lost.join(','),
+				job_count: lost.length
+			})
+	})
+	if (outcomeRetention !== undefined)
+		await attempt('job.outcome.prune_failed', (client) =>
+			pruneJobOutcomes(client, schema, outcomeRetention)
+		)
+	await attempt('worker.idempotency.prune_failed', (client) =>
+		pruneIdempotencyKeys(client, schema)
+	)
 }
 
 /** The single maintenance pass of `runOnce()`, on an ordinary pool connection. */

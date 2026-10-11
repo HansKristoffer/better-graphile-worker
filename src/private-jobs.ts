@@ -71,11 +71,9 @@ async function settleJob(
 	schema: string,
 	settle: {
 		outcome?:
-			| {
-					state: 'completed' | 'failed' | 'continued'
-					error?: string | undefined
-					continuedTo?: string
-			  }
+			| { state: 'completed' }
+			| { state: 'failed'; error: string }
+			| { state: 'continued'; continuedTo: string }
 			| undefined
 		report?: ChildReport | undefined
 		row: 'delete' | 'exhaust' | 'keep'
@@ -98,8 +96,9 @@ async function settleJob(
 		ctes.push(`recorded AS (
 	INSERT INTO ${quoted}.${JOB_OUTCOMES_TABLE}
 		(job_id, task_identifier, state, continued_to, attempts, max_attempts, last_error, created_at)
-	SELECT id, identifier, ${param(outcome.state)}::text, ${param(outcome.continuedTo ?? null)}::bigint,
-		attempts, max_attempts, ${param(outcome.error ?? null)}::text, created_at FROM owned
+	SELECT id, identifier, ${param(outcome.state)}::text,
+		${param(outcome.state === 'continued' ? outcome.continuedTo : null)}::bigint, attempts, max_attempts,
+		${param(outcome.state === 'failed' ? outcome.error : null)}::text, created_at FROM owned
 	ON CONFLICT (job_id) DO UPDATE SET state = excluded.state, continued_to = excluded.continued_to,
 		attempts = excluded.attempts, max_attempts = excluded.max_attempts,
 		last_error = excluded.last_error, finished_at = now()

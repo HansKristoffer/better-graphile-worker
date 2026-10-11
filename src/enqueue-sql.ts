@@ -1,4 +1,5 @@
 import type { AddJobsJobSpec, TaskSpec } from 'graphile-worker'
+import type { PoolClient } from 'pg'
 import { quoteSchemaName } from './schema-name.js'
 
 /** Driver-neutral SQL: scalar parameters only, so pg, Prisma and others run it alike. */
@@ -234,7 +235,7 @@ function assertDistinguishable(specs: readonly AddJobsJobSpec[]): void {
 }
 
 export async function pruneIdempotencyKeys(
-	client: { query(text: string): Promise<unknown> },
+	client: Pick<PoolClient, 'query'>,
 	schema: string
 ): Promise<void> {
 	const table = `${quoteSchemaName(schema)}.${IDEMPOTENCY_KEYS_TABLE}`
