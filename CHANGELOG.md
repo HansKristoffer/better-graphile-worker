@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.4.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.3.0...v2.4.0) (2026-10-11)
+
+
+### Features
+
+* let handlers wait for child jobs with ctx.step.triggerAndWait ([#19](https://github.com/HansKristoffer/better-graphile-worker/issues/19)) ([1c5535d](https://github.com/HansKristoffer/better-graphile-worker/commit/1c5535d66e8a0ab7c12e90df763f2d708c431586))
+* **worker:** run one maintenance loop on every worker and share job mechanics ([#20](https://github.com/HansKristoffer/better-graphile-worker/issues/20)) ([a736d27](https://github.com/HansKristoffer/better-graphile-worker/commit/a736d277b064203dc39ae7f7814d25f27ba7a08d))
+
 ## [2.3.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.2.0...v2.3.0) (2026-10-11)
 
 
