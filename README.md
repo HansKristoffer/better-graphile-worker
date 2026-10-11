@@ -179,6 +179,26 @@ await Promise.all([exportsWorker.start(), apiWorker.start()])
 
 After a hard crash (OOM, `SIGKILL`), Graphile keeps a job and its serial lane locked for at least 4 hours, until its periodic stale-lock scan runs. Keep individual executions below 4 hours as well: Graphile can reclaim a live job beyond that threshold. Short slices and graceful shutdown reduce how often that happens; they do not unlock it sooner.
 
+### Crash recovery
+
+`crashRecovery` releases a crashed worker's jobs within minutes instead of hours. It is off by default.
+
+```ts
+const worker = createBetterWorker({
+  pgPool,
+  queues,
+  crashRecovery: { heartbeatInterval: 30_000, staleAfter: 300_000 } // or `true` for these defaults
+})
+```
+
+Each started worker records a heartbeat every `heartbeatInterval` milliseconds and, after each one, looks for workers whose last heartbeat is older than `staleAfter`. Their jobs and lanes are unlocked with the error `Worker … stopped sending heartbeats (crashed or blocked); released by crash recovery` and retried with Graphile's normal backoff. The crashed run keeps its attempt, so a job that keeps running out of memory eventually fails permanently and shows up as failed in `listJobs`. `onPermanentFailure` does not fire for it, because no handler ran; watch for `worker.crash_recovery.released` warnings in your logs. Any number of instances can sweep at once.
+
+The trade-off: a worker that is alive but cannot heartbeat for `staleAfter` looks dead, and its job then runs twice. The heartbeat shares the job's event loop and pool, so it stops when a handler blocks the event loop synchronously (CPU-bound work, synchronous I/O) or when every pool connection is held by jobs. Keep `staleAfter` well above your longest synchronous stretch and give the pool a spare connection per instance. If a presumed-dead worker comes back, it logs `worker.crash_recovery.presumed_dead`, and when it finishes, Graphile deletes the job even if another worker is running it. `staleAfter` must be at least three heartbeat intervals.
+
+- Only workers started with `crashRecovery` heartbeat. Jobs held by other workers, including `runOnce()`, are left to Graphile's 4-hour scan, so enable it on every instance.
+- Handlers wait for the worker's first heartbeat before they run.
+- The heartbeat table, `_bgw_worker_heartbeats` in the Graphile schema, is created by `migrate()`. A worker with `crashRecovery` also creates it on start if it is missing. Stopped workers leave their row; a later sweep removes it.
+
 ## Payloads and failure policy
 
 Producer inputs use `z.input`; consumers receive `z.output`. Both use async parsing, including async refinements and transforms. Validation runs before enqueue by default and again on the consumer because other producers can write jobs. Cron-init validates each returned input once during enqueue; it never enqueues transformed outputs.
@@ -192,7 +212,7 @@ Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
 
-Continuation, retention, checkpointing and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+Continuation, retention, checkpointing, crash recovery and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
 
 ## Context and durable steps
 

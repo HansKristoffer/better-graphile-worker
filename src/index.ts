@@ -85,6 +85,7 @@ export type {
 	JobListState
 } from './admin.js'
 export type { GraphileRunnerOverrides } from './worker.js'
+export type { CrashRecoveryOptions } from './crash-recovery.js'
 export {
 	NonRetriableError,
 	UnknownQueueError,

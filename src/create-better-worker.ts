@@ -44,6 +44,12 @@ import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
 import { assertUniqueQueueNames } from './define-queues.js'
+import {
+	ensureHeartbeatTable,
+	resolveCrashRecovery,
+	startHeartbeat,
+	type CrashRecoveryOptions
+} from './crash-recovery.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -77,6 +83,11 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * covers every queue, so separate instances can give workloads their own concurrency.
 	 */
 	process?: readonly NoInfer<QueueName<TQueues>>[]
+	/**
+	 * Heartbeat this worker and release jobs (and lanes) held by workers that stopped
+	 * heartbeating, instead of waiting for Graphile's 4-hour stale-lock scan. Opt-in.
+	 */
+	crashRecovery?: boolean | CrashRecoveryOptions | undefined
 }
 
 export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
@@ -170,6 +181,8 @@ export function createBetterWorker<
 		2147483647
 	)
 
+	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
+
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const hooks = options.hooks ?? {}
 	const client = createWorkerClient({
@@ -199,14 +212,17 @@ export function createBetterWorker<
 		logger,
 		schema,
 		otel,
-		permanentFailure: options.permanentFailure
+		permanentFailure: options.permanentFailure,
+		heartbeatReady: () => heartbeat?.ready
 	}
+	let heartbeat: ReturnType<typeof startHeartbeat> | undefined
 
 	const lifecycle = createLifecycle({
 		start: async () => {
 			logger.info('Starting graphile-worker')
 			logRegisteredQueues(queues, logger)
-			return startRunner({
+			if (crashRecovery) await ensureHeartbeatTable(options.pgPool, schema)
+			const runner = await startRunner({
 				pgPool: options.pgPool,
 				schema,
 				taskList: buildTaskList(queues, runtime),
@@ -214,8 +230,29 @@ export function createBetterWorker<
 				concurrency: options.concurrency ?? DEFAULT_CONCURRENCY,
 				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
 				noHandleSignals: true,
-				graphile: options.graphile
+				graphile: options.graphile,
+				onPoolCreate:
+					crashRecovery &&
+					((workerId) => {
+						heartbeat = startHeartbeat({
+							pgPool: options.pgPool,
+							schema,
+							workerId,
+							config: crashRecovery,
+							logger
+						})
+					})
+			}).catch(async (error) => {
+				await heartbeat?.stop()
+				throw error
 			})
+			const beating = heartbeat
+			if (!crashRecovery || !beating) return runner
+			// Keep beating until every job has settled, including a graceful drain.
+			return {
+				promise: runner.promise.finally(() => beating.stop()),
+				stop: () => runner.stop().finally(() => beating.stop())
+			}
 		},
 		release: () => client.release(),
 		onError: (error) =>

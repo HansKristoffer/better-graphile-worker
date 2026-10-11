@@ -8,6 +8,7 @@ import {
 } from 'graphile-worker'
 import type { Pool } from 'pg'
 import { addJobSql, addJobsSql } from './enqueue-sql.js'
+import { ensureHeartbeatTable } from './crash-recovery.js'
 import { assertValidSchemaName, quoteSchemaName } from './schema-name.js'
 
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
@@ -106,8 +107,9 @@ export function createWorkerClient(options: {
 		getUtils,
 		release,
 		async migrate() {
-			await getUtils()
-		}, // makeWorkerUtils initializes/migrates once.
+			await getUtils() // makeWorkerUtils initializes/migrates once.
+			await ensureHeartbeatTable(options.pgPool, schema)
+		},
 		async retryJobs(ids) {
 			if (!ids.length) return []
 			const result = await options.pgPool.query<{ id: string }>(

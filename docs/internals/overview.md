@@ -20,9 +20,17 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 ## Private table access is isolated and pinned
 
-Continuations, permanent-failure retention, step checkpoints and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
+Continuations, permanent-failure retention, step checkpoints, crash recovery and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
 Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
+
+## Crash recovery trusts heartbeats, not locks
+
+Graphile 0.17 only reclaims a locked job after 4 hours, and its lock carries no liveness. With `crashRecovery`, each worker pool upserts a row in `_bgw_worker_heartbeats` keyed by its pool id, the value Graphile writes to `locked_by` for jobs and lanes. The id is only exposed through the `pool:create` event, so [`src/worker.ts`](../../src/worker.ts) listens on the runner's emitter. Handlers wait for the first heartbeat, otherwise a job could kill the process before its worker is registered and stay locked for 4 hours.
+
+Releasing a live worker's job is the dangerous failure. Graphile's `completeJobs` deletes by job id without checking `locked_by`, so the falsely-dead worker finishing later deletes the job while its second run is still going. Our own private-table writes do check `locked_by` and refuse. The heartbeat runs on a timer in the worker's own process. A blocked event loop or an exhausted pool therefore looks like death, which is why the defaults are conservative and `staleAfter` must cover several missed beats. A heartbeat thread with its own connection would survive a blocked loop, but it would also keep a hung process looking alive and would need connection details we do not own.
+
+The sweep claims stale heartbeat rows with `FOR UPDATE SKIP LOCKED` and releases their jobs in the same transaction, so concurrent sweepers never release the same worker twice. It touches the jobs table only when it found a dead worker, because `locked_by` is not indexed. Stopped workers keep their row instead of deleting it, so anything still locked by them is swept too.
 
 ## Atomic bookkeeping
 
