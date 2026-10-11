@@ -189,6 +189,15 @@ export function createTestHarness<
 				for (const spec of specs)
 					result.push(await this.addJob(spec.identifier, spec.payload, spec))
 				return result
+			},
+			// The harness has no database, so it records keys but never deduplicates.
+			async addIdempotentJobs(specs) {
+				const result = []
+				for (const spec of specs) {
+					const job = await this.addJob(spec.identifier, spec.payload, spec)
+					result.push({ id: String(job.id), deduplicated: false })
+				}
+				return result
 			}
 		}
 	})

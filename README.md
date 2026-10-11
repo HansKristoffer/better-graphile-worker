@@ -107,7 +107,7 @@ await producer.release()
 
 Separate handlers infer context enqueue methods from the complete registry and use queue names. Use `satisfies QueueHandlers<typeof queues>` for a reusable handler registry. Handler-free contracts require a handler registry on workers and harnesses. Inline definitions cannot also supply a registry.
 
-Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. Concurrent utility requests share one initialization. Release/stop never close your pool.
+Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. Only `migrate()` also creates the idempotency-key table. Concurrent utility requests share one initialization. Release/stop never close your pool.
 
 `isRegularQueue`, `isCronQueue`, `isCronInitQueue` and `hasInputSchema` preserve literal names, concrete schemas and any inline handlers while narrowing variants. Contract guards do not invent handler functions; worker construction checks the required functions.
 
@@ -129,7 +129,7 @@ Defaults follow explicit job options, then `deriveJobOptions` (or cron options f
 
 ## Lanes, transactions and long-running jobs
 
-`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority` and `flags` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to `createJob`, `createJobs`, `jobs.*`, `ctx.createJob` and cron-init fan-out, which maintains one pending job per key. A repeated tick can still create another job if the previous occurrence is running or has completed; enforce business idempotency in your own tables. Plain cron queues have no input and cannot derive options.
+`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority`, `flags`, `idempotencyKey` and `idempotencyTtl` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to `createJob`, `createJobs`, `jobs.*`, `ctx.createJob` and cron-init fan-out. A `jobKey` only holds while its job is pending: a repeated tick creates another job once the previous one is running or has completed. Use an [idempotency key](#idempotency-keys) to hold the key for a period of time instead. Plain cron queues have no input and cannot derive options.
 
 ```ts
 const advanceRun = defineQueue({
@@ -148,6 +148,32 @@ const advanceRun = defineQueue({
   }
 })
 ```
+
+### Idempotency keys
+
+`idempotencyKey` enqueues at most one job per key and queue within `idempotencyTtl`, even after that job ran, completed or failed. A duplicate enqueues nothing and returns the original job's id; that job may no longer exist. The TTL counts from the first enqueue and defaults to 30 days. Pass milliseconds or a whole number with a unit: `'90s'`, `'30m'`, `'2h'`, `'7d'`.
+
+```ts
+const syncBank = defineQueue({
+  name: 'syncBank',
+  inputSchema: z.object({ userId: z.string() }),
+  // At most one bank sync per user every 2 hours.
+  deriveJobOptions: ({ userId }) => ({ idempotencyKey: `bank:${userId}`, idempotencyTtl: '2h' }),
+  processFn: async ({ userId }) => { /* ... */ }
+})
+await worker.jobs.syncBank({ userId }) // enqueues
+await worker.jobs.syncBank({ userId }) // returns the same id, enqueues nothing
+await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}` })
+```
+
+- Keys are scoped to the queue: the same key on two queues creates two jobs. A cron-init `triggerCron` keys the `{name}_cron-init` task.
+- Concurrent producers with the same key create one job; the others wait for it to commit and get its id.
+- The key is checked before `jobKey`. A duplicate does not replace or reschedule a pending job with the same `jobKey`. A new key enqueues through Graphile as usual, and records whichever job `jobKey` produced.
+- Batches take per-item keys from `deriveJobOptions`; `createJobs` options accept `idempotencyTtl` but no shared `idempotencyKey`. A key repeated within a batch returns the first item's id. Cron-init fan-out with a derived key processes each item once per TTL.
+- Enqueue without the key to force a run. A continuation keeps running the same job and does not touch its key.
+- Return types are unchanged; a duplicate looks like a successful enqueue. Prepared statements return a `deduplicated` column when a key applies, and producer spans record `job.deduplicated`.
+- Keys live in the `bgw_idempotency_keys` table in the Graphile schema, created by `migrate()`. Each keyed enqueue deletes up to 100 expired keys. An enqueue-only role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on that table.
+- The test harness records keys in `enqueued[].options` but does not deduplicate.
 
 `prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction; Graphile 0.17.3 can return fewer jobs if a worker claims an existing key during enqueue. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
@@ -307,7 +333,7 @@ The harness invokes handlers directly without Graphile acknowledgement/retry hoo
 
 Low-level builders, SQL adapters and payload helpers are available exclusively from `better-graphile-worker/advanced`. Application code should use instance methods. The package root exports constructors, contract helpers, public types and errors.
 
-Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
+Custom adapters must implement `EnqueueAdapter.addIdempotentJobs(specs)` to accept `idempotencyKey`; without it, keyed enqueues are rejected. Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
 
 This implementation requires a **major release**. There are no deprecated aliases or readers for the previous wire format:
 

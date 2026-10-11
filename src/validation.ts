@@ -67,3 +67,19 @@ export function assertJsonValue(value: unknown, allowUndefined = false): void {
 	}
 	visit(value, true)
 }
+
+const DURATION_UNITS = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+
+/** Milliseconds from a number of milliseconds or a string such as `'2h'`. */
+export function parseDuration(value: unknown, label: string): number {
+	const match =
+		typeof value === 'string' ? /^(\d+)([smhd])$/.exec(value) : undefined
+	const ms = match
+		? Number(match[1]) * DURATION_UNITS[match[2] as keyof typeof DURATION_UNITS]
+		: value
+	if (typeof ms !== 'number' || !Number.isSafeInteger(ms) || ms < 1)
+		throw new RangeError(
+			`${label} must be a positive number of milliseconds or a string such as "30m", "2h" or "7d"`
+		)
+	return ms
+}

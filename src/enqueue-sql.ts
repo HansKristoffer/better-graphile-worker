@@ -103,6 +103,122 @@ ORDER BY wanted.ord`,
 	}
 }
 
+/** A job spec that may carry an idempotency key; `idempotencyTtl` is in milliseconds. */
+export type IdempotentJobSpec = Omit<AddJobsJobSpec, 'jobKeyMode'> &
+	Pick<TaskSpec, 'jobKeyMode'> & {
+		idempotencyKey?: string
+		idempotencyTtl?: number
+	}
+
+const IDEMPOTENCY_KEYS_TABLE = 'bgw_idempotency_keys'
+const ADD_JOBS_FUNCTION = 'bgw_add_jobs'
+
+/**
+ * Enqueue specs in order through `migrate()`'s wrapper around `add_job`. A key claimed
+ * within its TTL returns the job id recorded for it and enqueues nothing.
+ */
+export function addIdempotentJobsSql(
+	schema: string,
+	specs: readonly IdempotentJobSpec[]
+): SqlStatement {
+	return {
+		text: `SELECT jobs.id::text AS id, jobs.deduplicated FROM ${quoteSchemaName(schema)}.${ADD_JOBS_FUNCTION}($1::json) AS jobs ORDER BY jobs.ord`,
+		values: [
+			JSON.stringify(
+				specs.map((spec) => ({
+					identifier: spec.identifier,
+					payload: spec.payload,
+					queue_name: spec.queueName,
+					run_at: timestamp(spec.runAt) ?? undefined,
+					max_attempts: spec.maxAttempts,
+					job_key: spec.jobKey,
+					job_key_mode: spec.jobKeyMode,
+					priority: spec.priority,
+					flags: spec.flags,
+					idempotency_key: spec.idempotencyKey,
+					idempotency_ttl: spec.idempotencyTtl
+				}))
+			)
+		]
+	}
+}
+
+// ponytail: each call prunes at most 100 expired keys; add a periodic sweep if keys outpace keyed enqueues.
+/**
+ * Creates the idempotency table and its enqueue function. Must run after Graphile's own
+ * migration. A key row is claimed with INSERT ... ON CONFLICT, which waits for a concurrent
+ * claimer to commit, so concurrent producers create one job. The job id is written in a
+ * later statement, which is why this is a function and not one prepared statement.
+ */
+export function idempotencyMigrationSql(schema: string): string {
+	const quoted = quoteSchemaName(schema)
+	const table = `${quoted}.${IDEMPOTENCY_KEYS_TABLE}`
+	return `SELECT pg_advisory_xact_lock(hashtext('better-graphile-worker:migrate'));
+CREATE TABLE IF NOT EXISTS ${table} (
+	queue text NOT NULL,
+	key text NOT NULL,
+	job_id bigint,
+	expires_at timestamptz NOT NULL,
+	PRIMARY KEY (queue, key)
+);
+CREATE INDEX IF NOT EXISTS ${IDEMPOTENCY_KEYS_TABLE}_expires_at ON ${table} (expires_at);
+CREATE OR REPLACE FUNCTION ${quoted}.${ADD_JOBS_FUNCTION}(specs json)
+RETURNS TABLE (ord bigint, id bigint, deduplicated boolean)
+LANGUAGE plpgsql VOLATILE AS $fn$
+DECLARE
+	item record;
+	job_id_ bigint;
+BEGIN
+	-- Bounded pruning; SKIP LOCKED keeps concurrent producers from waiting on each other.
+	DELETE FROM ${table} AS k USING (
+		SELECT queue, key FROM ${table} WHERE expires_at <= now()
+		ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED
+	) AS expired
+	WHERE k.queue = expired.queue AND k.key = expired.key;
+	FOR item IN
+		SELECT t.value AS spec, t.n FROM json_array_elements(specs) WITH ORDINALITY AS t(value, n) ORDER BY t.n
+	LOOP
+		ord := item.n;
+		deduplicated := false;
+		job_id_ := NULL;
+		IF item.spec->>'idempotency_key' IS NOT NULL THEN
+			-- An unexpired key keeps its job id; an expired one is reclaimed.
+			INSERT INTO ${table} AS k (queue, key, expires_at)
+			VALUES (
+				item.spec->>'identifier', item.spec->>'idempotency_key',
+				now() + (item.spec->>'idempotency_ttl')::float8 * interval '1 millisecond'
+			)
+			ON CONFLICT (queue, key) DO UPDATE SET
+				job_id = CASE WHEN k.expires_at > now() THEN k.job_id END,
+				expires_at = CASE WHEN k.expires_at > now() THEN k.expires_at ELSE excluded.expires_at END
+			RETURNING k.job_id INTO job_id_;
+		END IF;
+		IF job_id_ IS NOT NULL THEN
+			deduplicated := true;
+		ELSE
+			SELECT jobs.id INTO job_id_ FROM ${quoted}.add_job(
+				identifier := item.spec->>'identifier',
+				payload := item.spec->'payload',
+				queue_name := item.spec->>'queue_name',
+				run_at := (item.spec->>'run_at')::timestamptz,
+				max_attempts := (item.spec->>'max_attempts')::int,
+				job_key := item.spec->>'job_key',
+				priority := (item.spec->>'priority')::int,
+				flags := (SELECT array_agg(flag) FROM json_array_elements_text(item.spec->'flags') AS flag),
+				job_key_mode := coalesce(item.spec->>'job_key_mode', 'replace')
+			) AS jobs;
+			IF item.spec->>'idempotency_key' IS NOT NULL THEN
+				UPDATE ${table} SET job_id = job_id_
+				WHERE queue = item.spec->>'identifier' AND key = item.spec->>'idempotency_key';
+			END IF;
+		END IF;
+		id := job_id_;
+		RETURN NEXT;
+	END LOOP;
+END
+$fn$;`
+}
+
 /** Unkeyed specs that match by content must also agree on task and lane. */
 function assertDistinguishable(specs: readonly AddJobsJobSpec[]): void {
 	const seen = new Map<string, string>()
