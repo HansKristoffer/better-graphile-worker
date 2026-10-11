@@ -94,8 +94,8 @@ export type QueueContract<
 	readonly priority?: number
 	readonly flags?: readonly string[]
 	/**
-	 * Fail an attempt that runs longer than this many milliseconds (applies to each run,
-	 * including continuations and cron-init). Overrides the worker's `defaultTimeout`.
+	 * Fail an attempt that runs longer than this many milliseconds. Each retry and
+	 * continuation starts a fresh clock. Overrides the worker's `defaultTimeout`.
 	 */
 	readonly timeout?: number
 	/** Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`. */

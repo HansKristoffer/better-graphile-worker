@@ -26,7 +26,7 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 
 ## Timeouts fail the attempt, not the handler
 
-A handler cannot be stopped from outside, so a timeout races the handler: the task function rejects with `JobTimeoutError`, which records the failure and releases the lock and lane, while the handler may keep running. The attempt's context then refuses steps, continuations and child enqueues, and the `locked_at` fence above rejects checkpoints already queued. A continuation that is committing when the timer fires decides the outcome instead, because reporting a failure next to a committed continuation would leave an exhausted row that looks failed.
+Nothing can stop a handler from outside, so a timeout races it. The task function rejects with `JobTimeoutError`, and Graphile records the failure and releases the lock and lane while the handler may keep running. The attempt's context then refuses steps, continuations and child enqueues, and the `locked_at` fence above rejects checkpoints already queued. A continuation that is committing when the timer fires decides the outcome instead, because reporting a failure next to a committed continuation would leave an exhausted row that looks failed.
 
 ## Atomic bookkeeping
 

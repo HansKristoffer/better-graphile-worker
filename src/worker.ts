@@ -22,7 +22,12 @@ import {
 } from './queue.js'
 import type { NormalizedQueue } from './registry.js'
 import type { CompletedJobsStore } from './completed-jobs-store.js'
-import type { BetterWorkerHooks, JobLogger, JobSpan } from './hooks.js'
+import type {
+	BetterWorkerHooks,
+	JobLogger,
+	JobSpan,
+	LogAttributes
+} from './hooks.js'
 import type { CreateJobFn, CreateJobsFn } from './types.js'
 import {
 	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
@@ -101,10 +106,7 @@ function createAttempt(parent: AbortSignal, timeout: number | undefined) {
 					void (continuing ?? Promise.resolve(false)).then((continued) =>
 						reject(continued ? new JobContinuedSignal() : error)
 					)
-					work.then(
-						() => onAbandoned(),
-						(cause) => onAbandoned(cause)
-					)
+					work.then(() => onAbandoned(), onAbandoned)
 				}, timeout)
 			})
 		},
@@ -276,22 +278,24 @@ async function executeTask(options: ExecuteTaskOptions) {
 			try {
 				assertPayloadEnvelope(payload)
 				try {
-					await attempt.run(executor(ctx, cleanPayload), (error) =>
-						ctx.logger.warn('job.timed_out_handler_settled', {
+					await attempt.run(executor(ctx, cleanPayload), (error) => {
+						const attributes: LogAttributes = {
 							event: 'job.timed_out_handler_settled',
 							queue: queueName,
 							job_id: jobId,
 							attempt: helpers.job.attempts,
-							duration_ms: Date.now() - startTime,
-							...(error === undefined
-								? {}
-								: {
-										error_message: String(
-											error instanceof Error ? error.message : error
-										).slice(0, LOGGED_ERROR_MESSAGE_LIMIT)
-									})
-						})
-					)
+							duration_ms: Date.now() - startTime
+						}
+						if (error !== undefined) {
+							const message =
+								error instanceof Error ? error.message : String(error)
+							attributes.error_message = message.slice(
+								0,
+								LOGGED_ERROR_MESSAGE_LIMIT
+							)
+						}
+						ctx.logger.warn('job.timed_out_handler_settled', attributes)
+					})
 				} catch (error) {
 					if (!(error instanceof JobContinuedSignal)) throw error
 					continued = true

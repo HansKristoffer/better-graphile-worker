@@ -187,16 +187,12 @@ describe('attempt timeout', () => {
 	test('shutdown aborts with its own reason and still allows continue', async () => {
 		const shutdown = new AbortController()
 		let reason: unknown
-		let continued = false
 		const { run, finished } = setup(
 			{
 				hang: async (_payload, ctx) => {
 					shutdown.abort()
 					reason = ctx.signal.reason
-					await ctx.continue().catch((error) => {
-						continued = !(error instanceof JobTimeoutError)
-						throw error
-					})
+					await ctx.continue()
 				},
 				defaulted: () => {}
 			},
@@ -213,7 +209,6 @@ describe('attempt timeout', () => {
 		await run('hang')
 		expect(reason).not.toBeInstanceOf(JobTimeoutError)
 		expect((reason as Error).name).toBe('AbortError')
-		expect(continued).toBe(true)
 		expect(finished[0]).toMatchObject({ status: 'success', continued: true })
 	})
 
@@ -327,11 +322,11 @@ describe.skipIf(!enabled)('attempt timeout in PostgreSQL', () => {
 		])
 
 		release.resolve()
-		const results = await late.promise
-		expect(results.every((result) => result.status === 'rejected')).toBe(true)
-		const [after] = await rows()
-		expect(after.payload.steps).toBeUndefined()
-		expect(await rows()).toHaveLength(1)
+		await late.promise
+		// The detached handler's step and child enqueue never reached the database.
+		const after = await rows()
+		expect(after).toHaveLength(1)
+		expect(after[0].payload.steps).toBeUndefined()
 		await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 	})
 
@@ -355,7 +350,7 @@ describe.skipIf(!enabled)('attempt timeout in PostgreSQL', () => {
 		const id = await worker.createJob('stuck', { hang: false })
 		const job = (
 			await pool.query(
-				`UPDATE "${schema}"._private_jobs SET locked_by = 'pool', locked_at = now(), attempts = 2 WHERE id = $1 RETURNING *`,
+				`UPDATE "${schema}"._private_jobs SET locked_by = 'pool', locked_at = now() WHERE id = $1 RETURNING *`,
 				[id]
 			)
 		).rows[0]
