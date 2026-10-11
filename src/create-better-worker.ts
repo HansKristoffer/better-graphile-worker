@@ -23,6 +23,7 @@ import {
 	mergeJobStats,
 	queryJobCounts,
 	queryRecentJobs,
+	queryJobProgress,
 	type ListedJob,
 	type ListJobsOptions,
 	type QueueDefinition,
@@ -57,6 +58,7 @@ import type {
 	PrepareJobFn,
 	PrepareJobsFn,
 	CronQueueName,
+	GetJobProgressFn,
 	JobsApi,
 	QueueName
 } from './types.js'
@@ -124,6 +126,8 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	getJobStats(): Promise<WorkerJobStatsRow[]>
 	listJobs(options?: ListJobsOptions): Promise<ListedJob[]>
 	getJob(id: string): Promise<JobState>
+	/** Read a job's `ctx.progress` value; null once the job no longer exists. */
+	readonly getJobProgress: GetJobProgressFn<TQueues>
 	retryJobs(ids: string[]): Promise<string[]>
 	failJobs(ids: string[], reason?: string): Promise<string[]>
 	getQueueDefinitions(): QueueDefinition[]
@@ -305,6 +309,14 @@ export function createBetterWorker<
 			return queryRecentJobs(utils, schema, listOptions)
 		},
 		getJob: (id) => queryJob(client, schema, id),
+		getJobProgress: ((queue: string, jobId: string) =>
+			queryJobProgress(
+				client,
+				schema,
+				options.queues,
+				queue,
+				jobId
+			)) as GetJobProgressFn<TQueues>,
 		retryJobs: (ids) => client.retryJobs(ids),
 		async failJobs(ids, reason) {
 			const utils = await client.getUtils()

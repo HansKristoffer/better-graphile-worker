@@ -696,3 +696,53 @@ defineQueue({
 client.prepareJob(name, payload)
 // @ts-expect-error Plain cron queues cannot be prepared as batches.
 client.prepareJobs('tick', [undefined])
+
+// Progress is typed by an optional progressSchema and readable by producers.
+const progressContracts = defineQueues([
+	defineQueue({
+		name: 'progressed',
+		inputSchema: z.string(),
+		progressSchema: z.object({ phase: z.string(), done: z.number() })
+	}),
+	defineQueue({ name: 'plain', inputSchema: z.string() })
+])
+createBetterWorker({
+	pgPool: pool,
+	queues: progressContracts,
+	handlers: {
+		progressed: async (_input, ctx) => {
+			const done: number | undefined = ctx.progress.get()?.done
+			void done
+			await ctx.progress.set({ phase: 'fetch', done: 1 })
+			// @ts-expect-error Progress follows progressSchema input.
+			await ctx.progress.set({ phase: 'fetch' })
+		},
+		plain: async (_input, ctx) => {
+			await ctx.progress.set({ any: ['json', 1, null] })
+			// @ts-expect-error Untyped progress still accepts only JSON.
+			await ctx.progress.set(new Date())
+		}
+	}
+})
+const progressClient = createJobClient({
+	pgPool: pool,
+	queues: progressContracts
+})
+progressClient.getJobProgress('progressed', '1').then((job) => {
+	const phase: string | undefined = job?.progress?.phase
+	void phase
+})
+// @ts-expect-error Progress readers take a queue name from the registry.
+progressClient.getJobProgress('missing', '1')
+const inlineProgress = defineQueue({
+	name: 'inlineProgress',
+	cron: '* * * * *',
+	progressSchema: z.number(),
+	processFn: async (_payload, ctx) => {
+		const value: number | undefined = ctx.progress.get()
+		void value
+		// @ts-expect-error Inline progress follows progressSchema input.
+		await ctx.progress.set('text')
+	}
+})
+createTestHarness(defineQueues([inlineProgress]))

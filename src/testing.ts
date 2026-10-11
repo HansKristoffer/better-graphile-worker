@@ -27,6 +27,7 @@ import { bindCreateJob, parseQueuePayload } from './create-job.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import type { JobOptions } from './job-options.js'
 import { JobContinuedSignal } from './errors.js'
+import { createProgressRunner, type ProgressRunner } from './progress.js'
 
 export type CapturedLog = {
 	level: keyof JobLogger
@@ -167,6 +168,7 @@ export function createTestHarness<
 	const logs: CapturedLog[] = []
 	const logger = createCapturingLogger(logs)
 	const stepCaches = new Map<string, StepStore>()
+	const progressValues = new Map<string, unknown>()
 	let invocation = 0
 	const enqueued: CapturedEnqueue[] = []
 	const continued: CapturedContinue[] = []
@@ -202,14 +204,22 @@ export function createTestHarness<
 		}
 	})
 
-	function context(
+	function createContext(
 		queueName: string,
 		extras?: Partial<JobContext>
-	): JobContext {
+	): { ctx: JobContext; progress: ProgressRunner } {
 		const jobId = extras?.jobId ?? `test-job-${++invocation}`
 		const cacheId = JSON.stringify([queueName, jobId])
 		if (!stepCaches.has(cacheId))
 			stepCaches.set(cacheId, createMemoryStepStore())
+		// Like the worker, progress persists per job id; init jobs are untyped.
+		const progress = createProgressRunner({
+			initial: progressValues.get(cacheId),
+			schema: queues.find((queue) => queue.name === queueName)?.progressSchema,
+			write: async (value) => {
+				progressValues.set(cacheId, value)
+			}
+		})
 		const span = extras?.span ?? createNoopSpan()
 		const signal =
 			extras?.signal ??
@@ -218,7 +228,7 @@ export function createTestHarness<
 		const helpers =
 			extras?.helpers ?? fakeHelpers(queueName, { ...extras, jobId, signal })
 		let called = false
-		return {
+		const ctx: JobContext = {
 			jobId,
 			queue: extras?.queue ?? queueName,
 			attempt: extras?.attempt ?? 1,
@@ -247,7 +257,30 @@ export function createTestHarness<
 				createStepRunner({
 					store: stepCaches.get(cacheId)!,
 					span
-				})
+				}),
+			progress: extras?.progress ?? (progress as JobContext['progress'])
+		}
+		return { ctx, progress }
+	}
+
+	function context(queueName: string, extras?: Partial<JobContext>) {
+		return createContext(queueName, extras).ctx
+	}
+
+	/** Persist the latest progress like a retried or continued worker run would see it. */
+	async function invoke<T>(
+		queueName: string,
+		extras: Partial<JobContext> | undefined,
+		fn: (ctx: JobContext) => Promise<T>
+	): Promise<{ ctx: JobContext; result: T | undefined }> {
+		const { ctx, progress } = createContext(queueName, extras)
+		try {
+			return { ctx, result: await fn(ctx) }
+		} catch (error) {
+			if (!(error instanceof JobContinuedSignal)) throw error
+			return { ctx, result: undefined }
+		} finally {
+			await progress.close(true)
 		}
 	}
 
@@ -272,13 +305,9 @@ export function createTestHarness<
 			extras?: Partial<JobContext>
 		) {
 			const queue = getQueue(String(queueName))
-			const ctx = context(String(queueName), extras)
-			const parsed = await parseQueuePayload(queue, payload)
-			try {
-				await queue.processFn(parsed, ctx)
-			} catch (error) {
-				if (!(error instanceof JobContinuedSignal)) throw error
-			}
+			const { ctx } = await invoke(String(queueName), extras, async (ctx) => {
+				await queue.processFn(await parseQueuePayload(queue, payload), ctx)
+			})
 			return { ctx, logs: [...logs] }
 		},
 		async init(queueName: string, extras?: Partial<JobContext>) {
@@ -286,14 +315,13 @@ export function createTestHarness<
 			if (!queue.initFn) {
 				throw new Error(`Queue "${String(queueName)}" is not a cron-init queue`)
 			}
-			try {
-				return await queue.initFn(
-					context(`${String(queueName)}${CRON_INIT_SUFFIX}`, extras)
-				)
-			} catch (error) {
-				if (!(error instanceof JobContinuedSignal)) throw error
-				return []
-			}
+			const initFn = queue.initFn
+			const { result } = await invoke(
+				`${String(queueName)}${CRON_INIT_SUFFIX}`,
+				extras,
+				async (ctx) => initFn(ctx)
+			)
+			return result ?? []
 		},
 		context
 	}

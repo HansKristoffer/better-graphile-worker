@@ -32,7 +32,12 @@ export {
 	type StepStore
 } from './steps.js'
 export { getOtel, createNoopSpan } from './otel.js'
-export { queryJobCounts, queryRecentJobs, mergeJobStats } from './admin.js'
+export {
+	queryJobCounts,
+	queryRecentJobs,
+	queryJobProgress,
+	mergeJobStats
+} from './admin.js'
 
 export { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 export { assertUniqueQueueNames } from './define-queues.js'
