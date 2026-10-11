@@ -47,6 +47,11 @@ export type JobFinishedEvent = {
 	retryAt?: Date
 	/** The run ended with `ctx.continue()`; a continuation job was enqueued. */
 	continued?: boolean
+	/**
+	 * The run ended at `ctx.step.triggerAndWait` until its children finish; the job keeps
+	 * its id and attempt, and runs again from the top.
+	 */
+	waiting?: boolean
 }
 
 export type PermanentFailureEvent = {

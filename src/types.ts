@@ -1,5 +1,9 @@
 import type z from 'zod'
-import type { ProgressSchemaOf, QueueContract } from './queue.js'
+import type {
+	OutputSchemaOf,
+	ProgressSchemaOf,
+	QueueContract
+} from './queue.js'
 import type { JobProgressSnapshot, ProgressValueOf } from './progress.js'
 import type { BatchJobOptions, JobOptions } from './job-options.js'
 import type { PayloadEnvelope } from './payload.js'
@@ -29,6 +33,12 @@ export type InferPayload<Q> = Q extends {
 	: Q extends { inputSchema?: infer S }
 		? SchemaValues<S, 'output'> | undefined
 		: undefined
+/** What a waiting parent receives from a child: its `outputSchema` output, or undefined. */
+export type InferOutput<Q> = Q extends unknown
+	? OutputSchemaOf<Q> extends infer O extends z.ZodType
+		? z.output<O>
+		: undefined
+	: never
 
 export type QueueInput<
 	T extends string,
@@ -65,7 +75,7 @@ export type TasksOf<TQueues extends readonly QueueContract[]> = {
 		{ cron: unknown; inputSchema: z.ZodType }
 	> as `${Q['name']}_cron-init`]: PayloadEnvelope<undefined>
 }
-type JobInputArgs<Input> = undefined extends Input
+export type JobInputArgs<Input> = undefined extends Input
 	? [data?: Input, options?: JobOptions]
 	: [data: Input, options?: JobOptions]
 export type EnqueueArgs<Q> = Q extends QueueContract
@@ -123,7 +133,7 @@ export type PrepareJobsFn<TQueues extends readonly QueueContract[]> =
 		: (...args: BatchArgs<TQueues[number]>) => Promise<PreparedJob>
 
 /** A union reference must accept the input regardless of which queue it selects. */
-type ReferenceInput<Q> = (
+export type ReferenceInput<Q> = (
 	Q extends QueueContract
 		? (input: InferInput<Q>) => void
 		: never

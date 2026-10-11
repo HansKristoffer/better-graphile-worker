@@ -746,3 +746,63 @@ const inlineProgress = defineQueue({
 	}
 })
 createTestHarness(defineQueues([inlineProgress]))
+
+// Waits: child outputs are typed from outputSchema in both registration styles.
+const waitContracts = defineQueues([
+	defineQueue({
+		name: 'fetchAccount',
+		inputSchema: z.object({ accountId: z.string() }),
+		outputSchema: z.object({ upserted: z.number() })
+	}),
+	defineQueue({ name: 'syncAll', inputSchema: z.array(z.string()) })
+])
+createBetterWorker({
+	pgPool: pool,
+	queues: waitContracts,
+	handlers: {
+		fetchAccount: async ({ accountId }) => ({ upserted: accountId.length }),
+		syncAll: async (accountIds, ctx) => {
+			const results = await ctx.step.batchTriggerAndWait(
+				'fetch-all-v1',
+				waitContracts[0],
+				accountIds.map((accountId) => ({ accountId })),
+				{ timeout: 60_000 }
+			)
+			for (const result of results) {
+				if (result.ok) {
+					const upserted: number = result.output.upserted
+					void upserted
+				} else {
+					const error: import('better-graphile-worker').ChildJobFailedError =
+						result.error
+					void error
+				}
+			}
+			const single = await ctx.step.triggerAndWait(
+				'fetch-one-v1',
+				waitContracts[0],
+				{
+					accountId: 'a'
+				}
+			)
+			if (!single.ok) throw single.error
+			// @ts-expect-error Waited inputs use the child's producer input
+			await ctx.step.triggerAndWait('bad', waitContracts[0], { accountId: 1 })
+		}
+	}
+})
+createBetterWorker({
+	pgPool: pool,
+	queues: waitContracts,
+	handlers: {
+		// @ts-expect-error Handlers return their outputSchema's input
+		fetchAccount: async () => ({ upserted: 'many' }),
+		syncAll: async () => {}
+	}
+})
+export type WaitedOutput = Assert<
+	Equal<
+		import('better-graphile-worker').InferOutput<(typeof waitContracts)[0]>,
+		{ upserted: number }
+	>
+>

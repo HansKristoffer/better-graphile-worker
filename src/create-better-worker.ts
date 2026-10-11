@@ -244,7 +244,10 @@ export function createBetterWorker<
 		permanentFailure: options.permanentFailure,
 		defaultTimeout: options.defaultTimeout,
 		jobOutcomes,
-		heartbeatReady: () => heartbeat?.ready
+		heartbeatReady: () => heartbeat?.ready,
+		queues: options.queues,
+		prepareJob: producer.prepareOne,
+		prepareJobs: producer.prepareMany
 	}
 
 	async function prepareCrashRecovery() {

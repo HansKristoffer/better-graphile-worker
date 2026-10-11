@@ -6,6 +6,13 @@ import { StepPersistenceError } from './errors.js'
 import { JOB_OUTCOMES_TABLE } from './job-outcomes.js'
 import { compact } from './options.js'
 import { quoteSchemaName } from './schema-name.js'
+import type { PreparedJob } from './types.js'
+import {
+	WAIT_GROUPS_TABLE,
+	WAITS_TABLE,
+	type ChildReport,
+	type WaitCheckpoint
+} from './waits.js'
 export async function retainPermanentFailure(
 	helpers: JobHelpers,
 	schema: string
@@ -45,69 +52,102 @@ export async function scheduleRetry(
 }
 
 /**
- * Upserts the locked job's outcome. With `finish`, also completes the job the way
- * Graphile's complete_jobs does (delete it, release its lane) in the same statement;
- * Graphile's own completion then finds nothing to delete. Returns false without a lock.
+ * Settle the locked job in one statement: upsert its outcome, report its final state to
+ * waiting parents (waking a parent whose last child this was), and with `finish`
+ * complete it the way Graphile's complete_jobs does (delete it, release its lane), so
+ * Graphile's own completion finds nothing to delete. Returns false without a lock.
  */
-async function writeOutcome(
+async function settleJob(
 	client: Pick<PoolClient, 'query'>,
 	helpers: JobHelpers,
 	schema: string,
-	outcome: {
-		state: 'completed' | 'failed' | 'continued'
-		error?: string | undefined
-		continuedTo?: string
+	settle: {
+		outcome?:
+			| {
+					state: 'completed' | 'failed' | 'continued'
+					error?: string | undefined
+					continuedTo?: string
+			  }
+			| undefined
+		report?: ChildReport | undefined
 		finish: boolean
 	}
 ): Promise<boolean> {
 	const quoted = quoteSchemaName(schema)
-	const finishSql = outcome.finish
-		? `, deleted AS (
-	DELETE FROM ${quoted}._private_jobs jobs USING owned WHERE jobs.id = owned.id RETURNING jobs.job_queue_id
-), unlocked AS (
-	UPDATE ${quoted}._private_job_queues queues SET locked_by = NULL, locked_at = NULL
-	FROM deleted WHERE queues.id = deleted.job_queue_id AND queues.locked_by = $2::text
-)`
-		: ''
-	const result = await client.query<{ recorded: number }>(
-		`WITH owned AS (
+	const values: unknown[] = [helpers.job.id, helpers.job.locked_by]
+	const param = (value: unknown) => `$${values.push(value)}`
+	const ctes = [
+		`owned AS (
 	SELECT jobs.id, tasks.identifier, jobs.attempts, jobs.max_attempts, jobs.created_at
 	FROM ${quoted}._private_jobs jobs
 	JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id
 	WHERE jobs.id = $1::bigint AND jobs.locked_by = $2::text AND jobs.locked_at IS NOT NULL
 	FOR UPDATE OF jobs
-), recorded AS (
+)`
+	]
+	const { outcome, report } = settle
+	if (outcome)
+		ctes.push(`recorded AS (
 	INSERT INTO ${quoted}.${JOB_OUTCOMES_TABLE}
 		(job_id, task_identifier, state, continued_to, attempts, max_attempts, last_error, created_at)
-	SELECT id, identifier, $3::text, $5::bigint, attempts, max_attempts, $4::text, created_at FROM owned
+	SELECT id, identifier, ${param(outcome.state)}::text, ${param(outcome.continuedTo ?? null)}::bigint,
+		attempts, max_attempts, ${param(outcome.error ?? null)}::text, created_at FROM owned
 	ON CONFLICT (job_id) DO UPDATE SET state = excluded.state, continued_to = excluded.continued_to,
 		attempts = excluded.attempts, max_attempts = excluded.max_attempts,
 		last_error = excluded.last_error, finished_at = now()
-	RETURNING job_id
-)${finishSql}
-SELECT count(*)::int AS recorded FROM recorded`,
-		[
-			helpers.job.id,
-			helpers.job.locked_by,
-			outcome.state,
-			outcome.error ?? null,
-			outcome.continuedTo ?? null
-		]
+)`)
+	if (report)
+		ctes.push(
+			`reported AS (
+	UPDATE ${quoted}.${WAITS_TABLE} waits SET result = ${param(JSON.stringify(report))}::jsonb, finished_at = now()
+	FROM owned WHERE waits.child_job_id = owned.id AND waits.result IS NULL
+	RETURNING waits.parent_job_id, waits.wait_id
+)`,
+			...wakeParents(quoted)
+		)
+	if (settle.finish)
+		ctes.push(`deleted AS (
+	DELETE FROM ${quoted}._private_jobs jobs USING owned WHERE jobs.id = owned.id RETURNING jobs.job_queue_id
+), unlocked AS (
+	UPDATE ${quoted}._private_job_queues queues SET locked_by = NULL, locked_at = NULL
+	FROM deleted WHERE queues.id = deleted.job_queue_id AND queues.locked_by = $2::text
+)`)
+	const result = await client.query<{ owned: number }>(
+		`WITH ${ctes.join(', ')}
+SELECT count(*)::int AS owned FROM owned`,
+		values
 	)
-	return result.rows[0]?.recorded === 1
+	return result.rows[0]?.owned === 1
 }
 
-export function recordJobOutcome(
+/**
+ * Count `reported` waits against their groups and wake each parent whose group has no
+ * children left. Updating the group row waits for a parent that is suspending on it.
+ */
+function wakeParents(quoted: string): string[] {
+	return [
+		`counted AS (
+	UPDATE ${quoted}.${WAIT_GROUPS_TABLE} groups SET remaining = groups.remaining - reported.n
+	FROM (SELECT parent_job_id, wait_id, count(*)::int AS n FROM reported GROUP BY 1, 2) reported
+	WHERE groups.parent_job_id = reported.parent_job_id AND groups.wait_id = reported.wait_id
+	RETURNING groups.parent_job_id, groups.remaining
+)`,
+		// Match on id only: a filter on run_at would read the parent's row from this
+		// statement's snapshot, from before a suspend that committed while we waited.
+		`woken AS (
+	UPDATE ${quoted}._private_jobs parents SET run_at = least(parents.run_at, now())
+	FROM counted WHERE parents.id = counted.parent_job_id AND counted.remaining = 0
+)`
+	]
+}
+
+export function settleLockedJob(
 	helpers: JobHelpers,
 	schema: string,
-	outcome: {
-		state: 'completed' | 'failed'
-		error?: string | undefined
-		finish: boolean
-	}
+	settle: Parameters<typeof settleJob>[3]
 ): Promise<boolean> {
 	return helpers.withPgClient((client) =>
-		writeOutcome(client, helpers, schema, outcome)
+		settleJob(client, helpers, schema, settle)
 	)
 }
 
@@ -120,10 +160,11 @@ async function patchEnvelope(
 	schema: string,
 	jobId: string,
 	patched: string,
-	values: unknown[]
+	values: unknown[],
+	client?: Pick<PoolClient, 'query'>
 ): Promise<void> {
 	const quoted = quoteSchemaName(schema)
-	const result = await helpers.withPgClient((client) =>
+	const run = (client: Pick<PoolClient, 'query'>) =>
 		client.query(
 			`WITH owned AS (
 		SELECT id, payload::jsonb AS data FROM ${quoted}._private_jobs
@@ -132,7 +173,7 @@ async function patchEnvelope(
 		FROM owned WHERE jobs.id = owned.id AND owned.data->>'__bgw' = '2' AND owned.data ? 'payload'`,
 			[jobId, helpers.job.locked_by, helpers.job.locked_at, ...values]
 		)
-	)
+	const result = await (client ? run(client) : helpers.withPgClient(run))
 	if (result.rowCount !== 1) throw new StepPersistenceError(jobId)
 }
 
@@ -141,14 +182,16 @@ export function writeCheckpoint(
 	schema: string,
 	jobId: string,
 	id: string,
-	checkpoint: unknown
+	checkpoint: unknown,
+	client?: Pick<PoolClient, 'query'>
 ): Promise<void> {
 	return patchEnvelope(
 		helpers,
 		schema,
 		jobId,
 		`jsonb_set(owned.data, '{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($4::text, $5::jsonb), true)`,
-		[id, JSON.stringify(checkpoint)]
+		[id, JSON.stringify(checkpoint)],
+		client
 	)
 }
 
@@ -264,11 +307,16 @@ FOR UPDATE OF jobs`,
 				`UPDATE ${quoted}._private_jobs SET max_attempts = attempts WHERE id = $1::bigint AND locked_by = $2::text`,
 				params.slice(0, 2)
 			)
+			// Waiting parents follow the job to its continuation.
+			if (job.payload.waited === true)
+				await client.query(
+					`UPDATE ${quoted}.${WAITS_TABLE} SET child_job_id = $2::bigint WHERE child_job_id = $1::bigint AND result IS NULL`,
+					[helpers.job.id, id]
+				)
 			if (
 				recordOutcome &&
-				!(await writeOutcome(client, helpers, schema, {
-					state: 'continued',
-					continuedTo: id,
+				!(await settleJob(client, helpers, schema, {
+					outcome: { state: 'continued', continuedTo: id },
 					finish: true
 				}))
 			)
@@ -309,4 +357,203 @@ SELECT id::text FROM jobs`,
 		[workerIds]
 	)
 	return result.rows.map((row) => row.id)
+}
+
+/** Where a suspended job's run_at points when its wait has no timeout. */
+const NO_DEADLINE = `'9999-01-01T00:00:00Z'::timestamptz`
+
+/**
+ * One wait of the locked job, in one transaction. The first call enqueues the children
+ * with their group and wait rows, so a crash cannot leave children without a group; a
+ * replay finds the group and enqueues nothing. Then, under the group row's lock: when
+ * every child reported or the deadline passed, the results are checkpointed in the
+ * envelope and the group is deleted, so a group without children left exists only
+ * while its parent must wake. Otherwise the job suspends: it keeps the lock and sets
+ * the row up for Graphile's failure update, which unlocks the job and its lane without
+ * deleting it. The attempt is given back and `run_at` is moved back by the backoff
+ * Graphile adds (as in `scheduleRetry`), so it lands on the deadline.
+ * `suspended` is set when an earlier wait of this run already suspended it.
+ */
+export async function enterWait(
+	helpers: JobHelpers,
+	schema: string,
+	wait: {
+		waitId: string
+		count: number
+		timeout: number | undefined
+		suspended: boolean
+		prepare: () => Promise<PreparedJob>
+	}
+): Promise<
+	{ state: 'finished'; checkpoint: WaitCheckpoint } | { state: 'suspended' }
+> {
+	const quoted = quoteSchemaName(schema)
+	const groups = `${quoted}.${WAIT_GROUPS_TABLE}`
+	const waits = `${quoted}.${WAITS_TABLE}`
+	const key = [helpers.job.id, wait.waitId]
+	return helpers.withPgClient(async (client) => {
+		await client.query('BEGIN')
+		try {
+			const owned = await client.query(
+				`SELECT 1 FROM ${quoted}._private_jobs WHERE id = $1::bigint AND locked_by = $2::text
+	AND date_trunc('milliseconds', locked_at) = $3::timestamptz FOR UPDATE`,
+				[helpers.job.id, helpers.job.locked_by, helpers.job.locked_at]
+			)
+			if (owned.rowCount !== 1)
+				throw new StepPersistenceError(String(helpers.job.id))
+			const lockGroup = () =>
+				client.query<{ remaining: number; expired: boolean }>(
+					`SELECT remaining, coalesce(deadline <= now(), false) AS expired FROM ${groups}
+	WHERE parent_job_id = $1::bigint AND wait_id = $2::text FOR UPDATE`,
+					key
+				)
+			let group = (await lockGroup()).rows[0]
+			if (!group) {
+				const prepared = await wait.prepare()
+				if (prepared.skipped)
+					throw new Error(
+						`shouldSkipEnqueue skipped the children of wait "${wait.waitId}"`
+					)
+				await client.query(
+					`INSERT INTO ${groups} (parent_job_id, wait_id, remaining, deadline)
+	VALUES ($1::bigint, $2::text, $3::int, now() + $4::float8 * interval '1 millisecond')`,
+					[...key, wait.count, wait.timeout ?? null]
+				)
+				const added = await client.query<{ id: string | null }>(
+					prepared.text,
+					prepared.values
+				)
+				const ids = added.rows.map((row) => row.id)
+				if (ids.length !== wait.count || ids.some((id) => !id))
+					throw new Error(
+						`Wait "${wait.waitId}" enqueued ${ids.length} of ${wait.count} children; a jobKey may have been claimed concurrently`
+					)
+				await client.query(
+					`INSERT INTO ${waits} (parent_job_id, wait_id, idx, child_job_id)
+	SELECT $1::bigint, $2::text, child.idx - 1, child.id FROM unnest($3::bigint[]) WITH ORDINALITY AS child(id, idx)`,
+					[...key, ids]
+				)
+				// Their workers report a final state only for jobs carrying this mark.
+				await client.query(
+					`UPDATE ${quoted}._private_jobs SET payload = (payload::jsonb || '{"waited": true}'::jsonb)::json
+	WHERE id = ANY($1::bigint[]) AND json_typeof(payload) = 'object'`,
+					[ids]
+				)
+				group = { remaining: wait.count, expired: false }
+			}
+			let outcome: Awaited<ReturnType<typeof enterWait>>
+			if (group.remaining === 0 || group.expired) {
+				const rows = await client.query<{
+					id: string
+					result: ChildReport | null
+				}>(
+					`SELECT child_job_id::text AS id, result FROM ${waits}
+	WHERE parent_job_id = $1::bigint AND wait_id = $2::text ORDER BY idx`,
+					key
+				)
+				const checkpoint: WaitCheckpoint =
+					group.remaining === 0
+						? rows.rows.map((row) => ({ id: row.id, ...row.result! }))
+						: {
+								timedOut: rows.rows
+									.filter((row) => !row.result)
+									.map((row) => row.id)
+							}
+				await writeCheckpoint(
+					helpers,
+					schema,
+					String(helpers.job.id),
+					wait.waitId,
+					{ output: checkpoint },
+					client
+				)
+				// Children still running after a timeout no longer have a wait to report to.
+				await client.query(
+					`DELETE FROM ${groups} WHERE parent_job_id = $1::bigint AND wait_id = $2::text`,
+					key
+				)
+				outcome = { state: 'finished', checkpoint }
+			} else {
+				await client.query(
+					`UPDATE ${quoted}._private_jobs jobs SET
+	attempts = jobs.attempts - $3::int,
+	run_at = least(
+		CASE WHEN $3::int = 1 THEN 'infinity'::timestamptz ELSE jobs.run_at END,
+		coalesce(groups.deadline, ${NO_DEADLINE}) - exp(least(jobs.attempts - $3::int, 10)) * interval '1 second'
+	)
+FROM ${groups} groups
+WHERE jobs.id = $1::bigint AND groups.parent_job_id = $1::bigint AND groups.wait_id = $2::text`,
+					[...key, wait.suspended ? 0 : 1]
+				)
+				outcome = { state: 'suspended' }
+			}
+			await client.query('COMMIT')
+			return outcome
+		} catch (error) {
+			await client.query('ROLLBACK').catch(() => {})
+			if ((error as { code?: unknown }).code === '42P01')
+				throw new Error(
+					`ctx.step.triggerAndWait needs the ${WAIT_GROUPS_TABLE} and ${WAITS_TABLE} tables; run migrate()`,
+					{ cause: error }
+				)
+			throw error
+		}
+	})
+}
+
+/**
+ * Fail waits whose child finished without reporting (released by crash recovery on its
+ * last attempt, `failJobs`, deleted, or run by a worker that does not report), waking
+ * their parents. SKIP LOCKED lets every worker sweep at once; a child that reports
+ * deletes or finishes its row in the same statement, so a reported child never looks
+ * lost. Then wake parents whose wakeup was swallowed and drop groups of parents that no
+ * longer exist.
+ */
+export async function sweepWaits(
+	client: Pick<PoolClient, 'query'>,
+	schema: string
+): Promise<string[]> {
+	const quoted = quoteSchemaName(schema)
+	const waits = `${quoted}.${WAITS_TABLE}`
+	// Waits were never migrated in this schema.
+	const exists = await client.query<{ exists: boolean }>(
+		'SELECT to_regclass($1) IS NOT NULL AS exists',
+		[waits]
+	)
+	if (!exists.rows[0]?.exists) return []
+	const lost = await client.query<{ child_job_id: string }>(
+		`WITH lost AS (
+	SELECT waits.parent_job_id, waits.wait_id, waits.idx, jsonb_build_object('ok', false, 'error', jsonb_build_object(
+		'name', 'ChildJobLostError',
+		'message', CASE WHEN jobs.id IS NULL
+			THEN 'The child job finished without reporting a result (deleted, or run by a worker without wait support)'
+			ELSE coalesce(jobs.last_error, 'The child job failed permanently') END
+	)) AS result
+	FROM ${waits} waits
+	LEFT JOIN ${quoted}._private_jobs jobs ON jobs.id = waits.child_job_id
+	WHERE waits.result IS NULL
+	AND (jobs.id IS NULL OR (jobs.locked_at IS NULL AND jobs.attempts >= jobs.max_attempts))
+	FOR UPDATE OF waits SKIP LOCKED
+), reported AS (
+	UPDATE ${waits} waits SET result = lost.result, finished_at = now() FROM lost
+	WHERE waits.parent_job_id = lost.parent_job_id AND waits.wait_id = lost.wait_id
+	AND waits.idx = lost.idx AND waits.result IS NULL
+	RETURNING waits.parent_job_id, waits.wait_id, waits.child_job_id
+), ${wakeParents(quoted).join(', ')}
+SELECT child_job_id::text FROM reported`
+	)
+	// A child that reports before Graphile's batched failure update unlocks its suspending
+	// parent has that update add its backoff to the wakeup (about a second at attempt 0).
+	await client.query(
+		`UPDATE ${quoted}._private_jobs jobs SET run_at = now()
+FROM ${quoted}.${WAIT_GROUPS_TABLE} groups
+WHERE groups.remaining = 0 AND jobs.id = groups.parent_job_id AND jobs.locked_at IS NULL
+AND jobs.run_at > now() AND jobs.attempts < jobs.max_attempts`
+	)
+	// ponytail: one unbounded delete per sweep; batch it if orphaned groups ever pile up.
+	await client.query(
+		`DELETE FROM ${quoted}.${WAIT_GROUPS_TABLE} groups
+WHERE NOT EXISTS (SELECT 1 FROM ${quoted}._private_jobs jobs WHERE jobs.id = groups.parent_job_id)`
+	)
+	return lost.rows.map((row) => row.child_job_id)
 }

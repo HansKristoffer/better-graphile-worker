@@ -30,6 +30,7 @@ export type {
 	QueuePayload,
 	InferInput,
 	InferPayload,
+	InferOutput,
 	TasksOf,
 	InputsOf,
 	PayloadsOf,
@@ -64,6 +65,7 @@ export {
 	type JobClientOptions
 } from './job-client.js'
 export type { JobStep, StepCodec } from './steps.js'
+export type { WaitOptions, WaitResult } from './waits.js'
 export type { JobProgress, JobProgressSnapshot } from './progress.js'
 export type {
 	CompletedJob,
@@ -101,7 +103,9 @@ export {
 	StepPersistenceError,
 	ShutdownTimeoutError,
 	JobTimeoutError,
-	StepSerializationError
+	StepSerializationError,
+	ChildJobFailedError,
+	WaitTimeoutError
 } from './errors.js'
 export type { OtelApi } from './otel.js'
 export type { JsonValue, JsonCompatible } from './validation.js'

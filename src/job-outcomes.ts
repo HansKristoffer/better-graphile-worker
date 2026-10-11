@@ -2,6 +2,7 @@ import type { JobHelpers, WorkerUtils } from 'graphile-worker'
 import type { Pool } from 'pg'
 import { quoteSchemaName } from './schema-name.js'
 import { assertInteger } from './validation.js'
+import { WAIT_GROUPS_TABLE, WAITS_TABLE } from './waits.js'
 
 /** Off by default. `retention` is in milliseconds and defaults to 7 days. */
 export type JobOutcomesOption = false | { retention?: number }
@@ -26,6 +27,8 @@ export type JobState =
 	| (JobFields & { state: 'running'; runAt: string; lockedAt: string })
 	/** Failed an attempt and waits for `runAt` to retry. */
 	| (JobFields & { state: 'retrying'; runAt: string })
+	/** Suspended at `ctx.step.triggerAndWait` until these child jobs finish. */
+	| (JobFields & { state: 'waiting'; waitingOn: string[] })
 	/** Permanently failed: attempts exhausted, `NonRetriableError`, or `failJobs`. */
 	| (JobFields & { state: 'failed'; finishedAt: string })
 	| (JobFields & { state: 'completed'; finishedAt: string })
@@ -129,9 +132,13 @@ type LiveRow = {
 	run_at: Date
 	updated_at: Date
 	locked_at: Date | null
+	scheduled: boolean
 }
 
-type OutcomeRow = Omit<LiveRow, 'run_at' | 'updated_at' | 'locked_at'> & {
+type OutcomeRow = Omit<
+	LiveRow,
+	'run_at' | 'updated_at' | 'locked_at' | 'scheduled'
+> & {
 	state: 'completed' | 'failed' | 'continued'
 	continued_to: string | null
 	finished_at: Date
@@ -146,11 +153,37 @@ export async function queryJob(
 	const quoted = quoteSchemaName(schema)
 	return utils.withPgClient(async (client) => {
 		const live = await client.query<LiveRow>(
-			`SELECT id::text, task_identifier, attempts, max_attempts, created_at, last_error, run_at, updated_at, locked_at
+			`SELECT id::text, task_identifier, attempts, max_attempts, created_at, last_error, run_at, updated_at, locked_at,
+	run_at > now() AS scheduled
 FROM ${quoted}.jobs WHERE id = $1::bigint`,
 			[id]
 		)
-		if (live.rows[0]) return liveState(live.rows[0])
+		const row = live.rows[0]
+		if (row) {
+			const state = liveState(row)
+			if (state.state !== 'pending' && state.state !== 'retrying') return state
+			if (!row.scheduled) return state
+			// A suspended parent is not runnable until its children wake it.
+			const waitingOn = await client
+				.query<{ id: string }>(
+					`SELECT waits.child_job_id::text AS id FROM ${quoted}.${WAITS_TABLE} waits
+JOIN ${quoted}.${WAIT_GROUPS_TABLE} groups USING (parent_job_id, wait_id)
+WHERE waits.parent_job_id = $1::bigint AND waits.result IS NULL AND groups.remaining > 0
+ORDER BY groups.created_at, waits.idx`,
+					[id]
+				)
+				.then(
+					(result) => result.rows.map((child) => child.id),
+					(error: { code?: unknown }) => {
+						// undefined_table: waits were never migrated for this schema.
+						if (error.code !== '42P01') throw error
+						return []
+					}
+				)
+			if (!waitingOn.length) return state
+			const { runAt: _runAt, ...fields } = state
+			return { ...fields, state: 'waiting', waitingOn }
+		}
 		// Completed and continued outcomes commit with the job's deletion, so no lookup falls between the two.
 		let outcome: OutcomeRow | undefined
 		try {

@@ -16,6 +16,8 @@ type EnvelopeMetadata = {
 	[BGW_ENVELOPE_KEY]: typeof BGW_ENVELOPE_VERSION
 	steps?: StepCache
 	progress?: unknown
+	/** Set on children enqueued by a wait; their workers report the final state. */
+	waited?: boolean
 	_cron?: unknown
 	[TRACEPARENT_KEY]?: string
 }
