@@ -58,12 +58,10 @@ import { jobLogger, observe } from './observers.js'
 import {
 	continueJob,
 	enterWait,
-	retainPermanentFailure,
 	scheduleRetry,
 	settleLockedJob,
 	writeProgress
 } from './private-jobs.js'
-import type { JobOutcomes } from './job-outcomes.js'
 import {
 	createPgStepStore,
 	createStepRunner,
@@ -86,7 +84,8 @@ export type TaskListRuntime<
 	permanentFailure?: 'discard' | 'retain' | undefined
 	/** Applies to queues without their own `timeout`, in milliseconds. */
 	defaultTimeout?: number | undefined
-	jobOutcomes?: JobOutcomes | undefined
+	/** Record each job's final state in `bgw_job_outcomes`. */
+	jobOutcomes?: boolean | undefined
 	/** Settles once crash recovery has registered this worker; jobs wait for it. */
 	heartbeatReady?: () => Promise<void> | undefined
 	/** Every registered queue and prepared enqueue, used by `ctx.step.triggerAndWait`. */
@@ -112,20 +111,11 @@ function createAttempt(parent: AbortSignal, timeout: number | undefined) {
 	if (parent.aborted) forward()
 	else parent.addEventListener('abort', forward, { once: true })
 	let expired: JobTimeoutError | undefined
-	let continuing: Promise<boolean> | undefined
 	let timer: ReturnType<typeof setTimeout> | undefined
 	return {
 		signal: controller.signal,
 		assertActive() {
 			if (expired) throw expired
-		},
-		/** A continuation committing when the timeout fires decides the run's outcome. */
-		continuing<T>(work: Promise<T>): Promise<T> {
-			continuing = work.then(
-				() => true,
-				() => false
-			)
-			return work
 		},
 		/** Settles with `work`, or with a `JobTimeoutError` once the timeout passes. */
 		run<T>(work: Promise<T>, onAbandoned: (error?: unknown) => void) {
@@ -136,9 +126,7 @@ function createAttempt(parent: AbortSignal, timeout: number | undefined) {
 					const error = new JobTimeoutError(timeout)
 					expired = error
 					controller.abort(error)
-					void (continuing ?? Promise.resolve(false)).then((continued) =>
-						reject(continued ? new JobContinuedSignal() : error)
-					)
+					reject(error)
 					work.then(() => onAbandoned(), onAbandoned)
 				}, timeout)
 			})
@@ -152,18 +140,45 @@ function createAttempt(parent: AbortSignal, timeout: number | undefined) {
 
 type Attempt = ReturnType<typeof createAttempt>
 
+type Ending =
+	| { kind: 'continued'; jobId: string }
+	| { kind: 'waiting'; waitId: string }
+
 /**
- * Waits of one run, one transaction at a time so only the first suspension gives the
- * attempt back. Waits started after it still enqueue their children.
+ * Writes that can end the run, `ctx.continue()` and waits, one transaction at a time. A
+ * committed ending decides the run, even when its timeout fires meanwhile, and only the
+ * first wait to suspend gives the attempt back; waits after it still enqueue children.
  */
-function createWaits(
+function createEndings() {
+	let ended: Ending | undefined
+	let chain: Promise<unknown> = Promise.resolve()
+	return {
+		run<T>(work: () => Promise<T>): Promise<T> {
+			const result = chain.then(work, work)
+			chain = result.catch(() => {})
+			return result
+		},
+		current: () => ended,
+		end(ending: Ending) {
+			ended ??= ending
+		},
+		/** How the run ended, once in-flight endings settle. */
+		async settled() {
+			await chain
+			return ended
+		}
+	}
+}
+
+type Endings = ReturnType<typeof createEndings>
+
+function createWaitBackend(
 	helpers: JobHelpers,
 	runtime: TaskListRuntime,
-	attempt: Attempt
-) {
-	let suspendedOn: string | undefined
-	let chain: Promise<unknown> = Promise.resolve()
-	const backend: WaitBackend = {
+	attempt: Attempt,
+	endings: Endings
+): WaitBackend {
+	return {
 		async wait(id, queue, inputs, batch, options) {
 			const { queues, prepareJob, prepareJobs } = runtime
 			if (!queues || !prepareJob || !prepareJobs)
@@ -173,40 +188,32 @@ function createWaits(
 					queue.name,
 					queues.map((item) => item.name)
 				)
-			const run = async () => {
+			return endings.run(async () => {
 				attempt.assertActive()
+				const ended = endings.current()
+				if (ended?.kind === 'continued')
+					throw new Error(
+						'A wait cannot start after ctx.continue(); do not catch its rejection'
+					)
 				const entered = await enterWait(helpers, runtime.schema, {
 					waitId: id,
 					count: inputs.length,
 					timeout: options?.timeout,
-					suspended: suspendedOn !== undefined,
+					suspended: ended !== undefined,
 					prepare: () =>
 						batch
 							? prepareJobs(queue.name, inputs)
 							: prepareJob(queue.name, inputs[0])
 				})
 				if (entered.state === 'suspended') {
-					suspendedOn ??= id
+					endings.end({ kind: 'waiting', waitId: id })
 					throw new JobSuspendedSignal(id)
 				}
 				return { checkpoint: entered.checkpoint, persisted: true }
-			}
-			const result = chain.then(run, run)
-			chain = result.catch(() => {})
-			return result
-		}
-	}
-	return {
-		backend,
-		/** The wait id this run suspended on, once in-flight wait transactions settle. */
-		suspendedOn: async () => {
-			await chain
-			return suspendedOn
+			})
 		}
 	}
 }
-
-type Waits = ReturnType<typeof createWaits>
 
 function createJobContext(
 	jobId: string,
@@ -219,7 +226,7 @@ function createJobContext(
 	rawPayload: unknown,
 	attempt: Attempt,
 	progress: ProgressRunner,
-	waits: Waits
+	endings: Endings
 ): JobContext {
 	return {
 		jobId,
@@ -238,7 +245,14 @@ function createJobContext(
 			return runtime.createJobs(...args)
 		},
 		cron,
-		continue: createContinue(helpers, runtime, span, attempt, progress, waits),
+		continue: createContinue(
+			helpers,
+			runtime,
+			span,
+			attempt,
+			progress,
+			endings
+		),
 		progress: {
 			get: progress.get,
 			set: async (value) => {
@@ -267,7 +281,7 @@ function createJobContext(
 			}),
 			span,
 			assertActive: attempt.assertActive,
-			waits: waits.backend
+			waits: createWaitBackend(helpers, runtime, attempt, endings)
 		})
 	}
 }
@@ -278,31 +292,33 @@ function createContinue(
 	span: JobSpan,
 	attempt: Attempt,
 	progress: ProgressRunner,
-	waits: Waits
+	endings: Endings
 ): JobContext['continue'] {
 	let called = false
 	return async (options) => {
 		attempt.assertActive()
 		if (called) throw new Error('ctx.continue() was already called')
 		called = true
-		if (await waits.suspendedOn())
-			throw new Error(
-				'ctx.continue() cannot run after a wait suspended this run; do not catch its rejection'
-			)
 		const runAt = parseContinueRunAt(options)
 		const { traceparent } = injectTraceContext(undefined, runtime.otel)
-		// The continuation receives the latest value, so a lagging write does not matter.
-		await progress.close(false).catch(() => {})
-		const id = await attempt.continuing(
-			continueJob(
+		const id = await endings.run(async () => {
+			if (endings.current())
+				throw new Error(
+					'ctx.continue() cannot run after a wait suspended this run; do not catch its rejection'
+				)
+			// The continuation receives the latest value, so a lagging write does not matter.
+			await progress.close(false).catch(() => {})
+			const jobId = await continueJob(
 				helpers,
 				runtime.schema,
 				runAt,
 				traceparent,
-				runtime.jobOutcomes !== undefined,
+				runtime.jobOutcomes === true,
 				progress.get()
 			)
-		)
+			endings.end({ kind: 'continued', jobId })
+			return jobId
+		})
 		span.setAttributes({
 			'graphile.continued': true,
 			'graphile.continuation_job_id': id
@@ -388,7 +404,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 				schema: progressSchema,
 				write: (value) => writeProgress(helpers, runtime.schema, jobId, value)
 			})
-			const waits = createWaits(helpers, runtime, attempt)
+			const endings = createEndings()
 			const ctx = createJobContext(
 				jobId,
 				queueName,
@@ -400,7 +416,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 				payload,
 				attempt,
 				progress,
-				waits
+				endings
 			)
 			// Set by the wait that enqueued this job: report its final state to the parent.
 			const waited = isPayloadEnvelope(payload) && payload.waited === true
@@ -411,15 +427,19 @@ async function executeTask(options: ExecuteTaskOptions) {
 			let continued = false
 			let suspended: JobSuspendedSignal | undefined
 			let retryAt: Date | undefined
-			const report = async (finish: boolean, settled: ChildReport) => {
-				if (!runtime.jobOutcomes && !waited) return true
+			const settle = async (
+				settled: ChildReport,
+				row: Parameters<typeof settleLockedJob>[2]['row']
+			) => {
+				// Otherwise Graphile completes or fails the job itself.
+				if (!runtime.jobOutcomes && !waited && row !== 'exhaust') return true
+				const outcome = settled.ok
+					? { state: 'completed' as const }
+					: { state: 'failed' as const, error: settled.error.message }
 				return settleLockedJob(helpers, runtime.schema, {
-					outcome: runtime.jobOutcomes && {
-						state: settled.ok ? 'completed' : 'failed',
-						error: settled.ok ? undefined : settled.error.message
-					},
+					outcome: runtime.jobOutcomes ? outcome : undefined,
 					report: waited ? settled : undefined,
-					finish
+					row
 				})
 			}
 
@@ -446,14 +466,26 @@ async function executeTask(options: ExecuteTaskOptions) {
 						ctx.logger.warn('job.timed_out_handler_settled', attributes)
 					})
 				} catch (error) {
-					if (error instanceof JobContinuedSignal) continued = true
-					// A committed suspension decides the run, even against a timeout.
-					else if (!(await waits.suspendedOn())) throw error
+					// A committed ending decides the run, even against a timeout or an error
+					// the handler threw after catching its signal.
+					if (!(await endings.settled())) throw error
+					// The signal itself, or a timeout that raced the ending, is not news.
+					const isEndingOrRace =
+						error instanceof JobContinuedSignal ||
+						error instanceof JobSuspendedSignal ||
+						error instanceof JobTimeoutError
+					if (!isEndingOrRace)
+						ctx.logger.warn('job.error_after_ending', {
+							event: 'job.error_after_ending',
+							job_id: jobId,
+							error_message: String(error).slice(0, LOGGED_ERROR_MESSAGE_LIMIT)
+						})
 				}
-				// Also when the handler caught the signal: the row is already set up to wait.
-				const waitId = continued ? undefined : await waits.suspendedOn()
-				if (waitId !== undefined) {
-					suspended = new JobSuspendedSignal(waitId)
+				// Also when the handler caught its signal: the ending is already committed.
+				const ending = await endings.settled()
+				continued = ending?.kind === 'continued'
+				if (ending?.kind === 'waiting') {
+					suspended = new JobSuspendedSignal(ending.waitId)
 					// The job keeps its row, so the resumed run reads the latest value.
 					await progress.close(true).catch(() => {})
 					span.setAttributes({ 'graphile.waiting': true })
@@ -465,10 +497,10 @@ async function executeTask(options: ExecuteTaskOptions) {
 				// Like a checkpoint, a completion that cannot be recorded fails the attempt.
 				if (
 					!continued &&
-					!(await report(true, {
-						ok: true,
-						...(output === undefined ? {} : { output })
-					}))
+					!(await settle(
+						{ ok: true, ...(output === undefined ? {} : { output }) },
+						'delete'
+					))
 				)
 					throw new StepPersistenceError(jobId)
 
@@ -548,39 +580,42 @@ async function executeTask(options: ExecuteTaskOptions) {
 					})
 				}
 
+				const failure: ChildReport = {
+					ok: false,
+					error: { name: errorType, message: errorMessage }
+				}
+
+				if (!permanent && error instanceof RetryAtError)
+					retryAt = await scheduleRetry(helpers, runtime.schema, error.runAt)
+
+				// Retention must hold, like a checkpoint; throwing the original error then lets
+				// Graphile record it and release the lock.
+				const retain =
+					isNonRetriable(error) && runtime.permanentFailure !== 'discard'
+				if (retain) {
+					if (!(await settle(failure, 'exhaust')))
+						throw new StepPersistenceError(jobId)
+					throw error
+				}
+
 				// The job row stays (or Graphile deletes it on discard), so these writes are
 				// best effort; the wait sweep reports a failed child whose report was lost.
-				const recordFailure = async (finish: boolean) => {
-					await report(finish, {
-						ok: false,
-						error: { name: errorType ?? 'Error', message: errorMessage ?? '' }
-					}).catch((recordError) =>
+				if (permanent)
+					await settle(
+						failure,
+						isNonRetriable(error) ? 'delete' : 'keep'
+					).catch((recordError) =>
 						ctx.logger.error('job.outcome.failed', {
 							queue: queueName,
 							job_id: jobId,
 							error: String(recordError)
 						})
 					)
-				}
-
-				if (!permanent && error instanceof RetryAtError)
-					retryAt = await scheduleRetry(helpers, runtime.schema, error.runAt)
-
-				if (isNonRetriable(error)) {
-					if (runtime.permanentFailure !== 'discard') {
-						await retainPermanentFailure(helpers, runtime.schema)
-						await recordFailure(false)
-						throw error
-					}
-					await recordFailure(true)
-					return
-				}
-
-				if (permanent) await recordFailure(false)
+				// Discard: acknowledge, so Graphile deletes the job.
+				if (isNonRetriable(error)) return
 				throw error
 			} finally {
 				attempt.dispose()
-				await runtime.jobOutcomes?.prune(helpers)
 				const durationMs = Date.now() - startTime
 				const permanentlyFailed = status === 'failed' && permanent
 				await observe(runtime.hooks.onJobFinished, {

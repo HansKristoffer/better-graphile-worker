@@ -89,17 +89,15 @@ suite('durable job outcomes', () => {
 		await pool.end()
 	})
 
-	test('is off by default: no table and nothing to look up after completion', async () => {
+	test('is off by default: nothing to look up after completion', async () => {
 		const id = (await plain.createJob('ok', 'plain'))!
 		expect(await plain.getJob(id)).toMatchObject({ state: 'pending', id })
 		await plain.runOnce()
 		expect(await plain.getJob(id)).toEqual({ state: 'not_found', id })
-		const exists = await pool.query('SELECT to_regclass($1) AS name', [table])
-		expect(exists.rows[0].name).toBeNull()
+		expect(await outcome(id)).toBeUndefined()
 	})
 
 	test('records completions, releases serial lanes and prunes expired rows', async () => {
-		await worker.migrate()
 		seenWhileRunning.length = 0
 		await pool.query(
 			`INSERT INTO ${table} (job_id, task_identifier, state, attempts, max_attempts, created_at, finished_at)
@@ -135,6 +133,22 @@ suite('durable job outcomes', () => {
 			})
 		expect(await outcome('1')).toBeUndefined()
 		expect((await client.getJob(scheduled)).state).toBe('pending')
+	})
+
+	test('a started worker prunes expired outcomes without crash recovery', async () => {
+		await pool.query(
+			`INSERT INTO ${table} (job_id, task_identifier, state, attempts, max_attempts, created_at, finished_at)
+			VALUES (2, 'ok', 'completed', 1, 1, now(), now() - interval '30 days')`
+		)
+		const started = createBetterWorker({
+			...options,
+			jobOutcomes: {},
+			crashRecovery: false
+		})
+		await started.start()
+		// stop() waits for the first maintenance pass, which runs at start.
+		await started.stop()
+		expect(await outcome('2')).toBeUndefined()
 	})
 
 	test('a continued job points at its continuation', async () => {

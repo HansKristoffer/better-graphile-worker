@@ -10,7 +10,7 @@ import type { JobHelpers } from 'graphile-worker'
 import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
 import { createBetterWorker } from './create-better-worker.js'
-import { sweepDeadWorkers } from './crash-recovery.js'
+import { sweepDeadWorkers } from './maintenance.js'
 import { settleLockedJob, sweepWaits } from './private-jobs.js'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
@@ -476,7 +476,7 @@ suite('waiting on child jobs in PostgreSQL', () => {
 			[id]
 		)
 		await pool.query(
-			`INSERT INTO ${q}._bgw_worker_heartbeats VALUES ('dead-pool', now() - interval '1 hour')`
+			`INSERT INTO ${q}.bgw_worker_heartbeats VALUES ('dead-pool', now() - interval '1 hour')`
 		)
 		const client = await pool.connect()
 		try {
@@ -498,9 +498,10 @@ suite('waiting on child jobs in PostgreSQL', () => {
 		const id = (await worker.createJob('sync', ['abcd']))!
 		await parents.runOnce()
 		const [child] = await childIds(id)
+		const lockedAt = new Date()
 		await pool.query(
-			`UPDATE ${q}._private_jobs SET locked_by = 'child-pool', locked_at = now(), attempts = attempts + 1 WHERE id = $1`,
-			[child]
+			`UPDATE ${q}._private_jobs SET locked_by = 'child-pool', locked_at = $2, attempts = attempts + 1 WHERE id = $1`,
+			[child, lockedAt]
 		)
 		// Woken early (e.g. by its deadline or crash recovery), the parent replays. It
 		// holds the group lock and has not committed its suspend yet, so the child's
@@ -517,7 +518,7 @@ suite('waiting on child jobs in PostgreSQL', () => {
 		)
 		const reporting = settleLockedJob(
 			{
-				job: { id: child, locked_by: 'child-pool' },
+				job: { id: child, locked_by: 'child-pool', locked_at: lockedAt },
 				withPgClient: async (fn: (client: PoolClient) => unknown) => {
 					const client = await pool.connect()
 					try {
@@ -528,7 +529,7 @@ suite('waiting on child jobs in PostgreSQL', () => {
 				}
 			} as unknown as JobHelpers,
 			schema,
-			{ report: { ok: true, output: { upserted: 4 } }, finish: true }
+			{ report: { ok: true, output: { upserted: 4 } }, row: 'delete' }
 		)
 		// The child's statement takes its snapshot, then blocks on the group row.
 		for (;;) {

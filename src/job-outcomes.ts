@@ -1,5 +1,5 @@
-import type { JobHelpers, WorkerUtils } from 'graphile-worker'
-import type { Pool } from 'pg'
+import type { WorkerUtils } from 'graphile-worker'
+import type { PoolClient } from 'pg'
 import { quoteSchemaName } from './schema-name.js'
 import { assertInteger } from './validation.js'
 import { WAIT_GROUPS_TABLE, WAITS_TABLE } from './waits.js'
@@ -41,65 +41,20 @@ export type JobState =
 
 export const JOB_OUTCOMES_TABLE = 'bgw_job_outcomes'
 const DEFAULT_RETENTION = 7 * 24 * 60 * 60 * 1000
-const PRUNE_INTERVAL = 60_000
 
-export type JobOutcomes = {
-	/** Deletes expired outcomes at most once per interval; never throws. */
-	prune(helpers: JobHelpers): Promise<void>
-}
-
-export function resolveJobOutcomes(
-	option: JobOutcomesOption | undefined,
-	schema: string,
-	onError: (error: unknown) => void
-): JobOutcomes | undefined {
+/** The retention in milliseconds, or undefined when outcomes are off. */
+export function resolveOutcomeRetention(
+	option: JobOutcomesOption | undefined
+): number | undefined {
 	if (option === false || option === undefined) return undefined
 	const retention = option.retention ?? DEFAULT_RETENTION
 	assertInteger(retention, 'jobOutcomes.retention', 1)
-	const table = `${quoteSchemaName(schema)}.${JOB_OUTCOMES_TABLE}`
-	let lastPrune = 0
-	return {
-		async prune(helpers) {
-			const now = Date.now()
-			if (now - lastPrune < Math.min(retention, PRUNE_INTERVAL)) return
-			lastPrune = now
-			// ponytail: one unbounded delete per interval; batch it if a backlog ever locks too long.
-			await helpers
-				.withPgClient((client) =>
-					client.query(
-						`DELETE FROM ${table} WHERE job_id IN (
-	SELECT job_id FROM ${table}
-	WHERE finished_at < now() - make_interval(secs => $1::double precision / 1000)
-	FOR UPDATE SKIP LOCKED
-)`,
-						[retention]
-					)
-				)
-				.catch(onError)
-		}
-	}
+	return retention
 }
 
-export async function migrateJobOutcomes(
-	pgPool: Pool,
-	schema: string
-): Promise<void> {
-	const quoted = quoteSchemaName(schema)
-	const exists = await pgPool.query<{ exists: boolean }>(
-		'SELECT to_regclass($1) IS NOT NULL AS exists',
-		[`${quoted}.${JOB_OUTCOMES_TABLE}`]
-	)
-	// Checked first so a role without CREATE can still start workers once the table exists.
-	if (exists.rows[0]?.exists) return
-
-	const client = await pgPool.connect()
-	try {
-		await client.query('BEGIN')
-		// Concurrent CREATE ... IF NOT EXISTS can still collide on the catalog.
-		await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-			`${schema}.${JOB_OUTCOMES_TABLE}`
-		])
-		await client.query(`CREATE TABLE IF NOT EXISTS ${quoted}.${JOB_OUTCOMES_TABLE} (
+export function outcomeTablesSql(schema: string): string {
+	const table = `${quoteSchemaName(schema)}.${JOB_OUTCOMES_TABLE}`
+	return `CREATE TABLE IF NOT EXISTS ${table} (
 	job_id bigint PRIMARY KEY,
 	task_identifier text NOT NULL,
 	state text NOT NULL CHECK (state IN ('completed', 'failed', 'continued')),
@@ -109,17 +64,25 @@ export async function migrateJobOutcomes(
 	last_error text,
 	created_at timestamptz NOT NULL,
 	finished_at timestamptz NOT NULL DEFAULT now()
-)`)
-		await client.query(
-			`CREATE INDEX IF NOT EXISTS ${JOB_OUTCOMES_TABLE}_finished_at ON ${quoted}.${JOB_OUTCOMES_TABLE} (finished_at)`
-		)
-		await client.query('COMMIT')
-	} catch (error) {
-		await client.query('ROLLBACK').catch(() => {})
-		throw error
-	} finally {
-		client.release()
-	}
+);
+CREATE INDEX IF NOT EXISTS ${JOB_OUTCOMES_TABLE}_finished_at ON ${table} (finished_at);`
+}
+
+// ponytail: one unbounded delete per maintenance pass; batch it if a backlog ever locks too long.
+export async function pruneJobOutcomes(
+	client: Pick<PoolClient, 'query'>,
+	schema: string,
+	retention: number
+): Promise<void> {
+	const table = `${quoteSchemaName(schema)}.${JOB_OUTCOMES_TABLE}`
+	await client.query(
+		`DELETE FROM ${table} WHERE job_id IN (
+	SELECT job_id FROM ${table}
+	WHERE finished_at < now() - make_interval(secs => $1::double precision / 1000)
+	FOR UPDATE SKIP LOCKED
+)`,
+		[retention]
+	)
 }
 
 type LiveRow = {
@@ -164,39 +127,25 @@ FROM ${quoted}.jobs WHERE id = $1::bigint`,
 			if (state.state !== 'pending' && state.state !== 'retrying') return state
 			if (!row.scheduled) return state
 			// A suspended parent is not runnable until its children wake it.
-			const waitingOn = await client
-				.query<{ id: string }>(
-					`SELECT waits.child_job_id::text AS id FROM ${quoted}.${WAITS_TABLE} waits
+			const children = await client.query<{ id: string }>(
+				`SELECT waits.child_job_id::text AS id FROM ${quoted}.${WAITS_TABLE} waits
 JOIN ${quoted}.${WAIT_GROUPS_TABLE} groups USING (parent_job_id, wait_id)
 WHERE waits.parent_job_id = $1::bigint AND waits.result IS NULL AND groups.remaining > 0
 ORDER BY groups.created_at, waits.idx`,
-					[id]
-				)
-				.then(
-					(result) => result.rows.map((child) => child.id),
-					(error: { code?: unknown }) => {
-						// undefined_table: waits were never migrated for this schema.
-						if (error.code !== '42P01') throw error
-						return []
-					}
-				)
+				[id]
+			)
+			const waitingOn = children.rows.map((child) => child.id)
 			if (!waitingOn.length) return state
 			const { runAt: _runAt, ...fields } = state
 			return { ...fields, state: 'waiting', waitingOn }
 		}
 		// Completed and continued outcomes commit with the job's deletion, so no lookup falls between the two.
-		let outcome: OutcomeRow | undefined
-		try {
-			const result = await client.query<OutcomeRow>(
-				`SELECT job_id::text AS id, task_identifier, state, continued_to::text, attempts, max_attempts, last_error, created_at, finished_at
+		const outcomes = await client.query<OutcomeRow>(
+			`SELECT job_id::text AS id, task_identifier, state, continued_to::text, attempts, max_attempts, last_error, created_at, finished_at
 FROM ${quoted}.${JOB_OUTCOMES_TABLE} WHERE job_id = $1::bigint`,
-				[id]
-			)
-			outcome = result.rows[0]
-		} catch (error) {
-			// undefined_table: outcomes were never enabled for this schema.
-			if ((error as { code?: unknown }).code !== '42P01') throw error
-		}
+			[id]
+		)
+		const outcome = outcomes.rows[0]
 		return outcome ? outcomeState(outcome) : { state: 'not_found', id }
 	})
 }

@@ -11,12 +11,23 @@ import {
 	addIdempotentJobsSql,
 	addJobSql,
 	addJobsSql,
-	idempotencyMigrationSql,
+	IDEMPOTENCY_KEYS_TABLE,
+	idempotencyTablesSql,
 	type IdempotentJobSpec
 } from './enqueue-sql.js'
-import { ensureHeartbeatTable } from './crash-recovery.js'
-import { waitTablesSql } from './waits.js'
+import { HEARTBEATS_TABLE, heartbeatTableSql } from './maintenance.js'
+import { JOB_OUTCOMES_TABLE, outcomeTablesSql } from './job-outcomes.js'
+import { WAIT_GROUPS_TABLE, WAITS_TABLE, waitTablesSql } from './waits.js'
 import { assertValidSchemaName, quoteSchemaName } from './schema-name.js'
+
+/** Tables this library owns, beside Graphile's in its schema. */
+const LIBRARY_TABLES = [
+	IDEMPOTENCY_KEYS_TABLE,
+	HEARTBEATS_TABLE,
+	JOB_OUTCOMES_TABLE,
+	WAIT_GROUPS_TABLE,
+	WAITS_TABLE
+]
 
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
 /** The producer's public-SQL adapter deliberately performs no migrations. */
@@ -42,6 +53,8 @@ export type WorkerClient = {
 	withPgClient: WorkerUtils['withPgClient']
 	getUtils(): Promise<WorkerUtils>
 	migrate(): Promise<void>
+	/** Whether `migrate()` has created this library's tables in the schema. */
+	hasTables(): Promise<boolean>
 	release(): Promise<void>
 	retryJobs(ids: readonly string[]): Promise<string[]>
 }
@@ -132,10 +145,24 @@ export function createWorkerClient(options: {
 		release,
 		async migrate() {
 			await getUtils() // makeWorkerUtils initializes/migrates once.
-			// Text without values runs as one implicit transaction.
-			await options.pgPool.query(idempotencyMigrationSql(schema))
-			await options.pgPool.query(waitTablesSql(schema))
-			await ensureHeartbeatTable(options.pgPool, schema)
+			// Text without values runs as one implicit transaction; the lock serializes
+			// concurrent migrations, which would otherwise collide on the catalog.
+			await options.pgPool.query(
+				[
+					`SELECT pg_advisory_xact_lock(hashtext('better-graphile-worker:migrate'));`,
+					idempotencyTablesSql(schema),
+					heartbeatTableSql(schema),
+					outcomeTablesSql(schema),
+					waitTablesSql(schema)
+				].join('\n')
+			)
+		},
+		async hasTables() {
+			const result = await options.pgPool.query<{ ready: boolean }>(
+				'SELECT bool_and(to_regclass($1 || name) IS NOT NULL) AS ready FROM unnest($2::text[]) AS name',
+				[`${sqlSchema}.`, LIBRARY_TABLES]
+			)
+			return result.rows[0]?.ready === true
 		},
 		async retryJobs(ids) {
 			if (!ids.length) return []

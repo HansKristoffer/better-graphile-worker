@@ -317,7 +317,7 @@ function fakeJobHelpers(): JobHelpers {
 			created_at: new Date()
 		},
 		withPgClient: async (fn: (client: unknown) => Promise<unknown>) =>
-			fn({ query: async () => ({ rowCount: 1 }) }),
+			fn({ query: async () => ({ rowCount: 1, rows: [{ owned: 1 }] }) }),
 		abortSignal: new AbortController().signal
 	} as unknown as JobHelpers
 }

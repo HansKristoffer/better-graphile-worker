@@ -346,16 +346,13 @@ suite('long-running, per-tenant workloads', () => {
 		expect(await jobs('slice')).toHaveLength(0)
 	})
 
-	test('a failure after continue never retries the original job', async () => {
+	test('an error after continue neither fails nor retries the continued run', async () => {
 		await worker.createJob('slice', { run: '2', mode: 'fail-after' })
 		sliceRuns = 0
 		await worker.runOnce()
 		const rows = await jobs('slice')
-		expect(rows).toHaveLength(2)
-		const [original, continuation] = rows
-		expect(original.key).toBeNull()
-		expect(original.attempts).toBe(original.max_attempts)
-		expect(continuation).toMatchObject({ key: 'slice:2', attempts: 0 })
+		expect(rows).toHaveLength(1)
+		expect(rows[0]).toMatchObject({ key: 'slice:2', attempts: 0 })
 		await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 	})
 
