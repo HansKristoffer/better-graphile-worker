@@ -11,6 +11,7 @@ import {
 	type JobHelpers
 } from 'graphile-worker'
 import type { Pool } from 'pg'
+import type z from 'zod'
 import {
 	type JobContext,
 	CRON_INIT_SUFFIX,
@@ -41,6 +42,7 @@ import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
 import { continueJob, retainPermanentFailure } from './private-jobs.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
+import { createPgProgressRunner, type ProgressRunner } from './progress.js'
 
 export type TaskListRuntime<
 	TQueues extends readonly QueueContract[] = readonly QueueContract[]
@@ -65,7 +67,8 @@ function createJobContext(
 	hooks: BetterWorkerHooks,
 	runtime: TaskListRuntime,
 	cron: JobContext['cron'],
-	rawPayload: unknown
+	rawPayload: unknown,
+	progress: ProgressRunner
 ): JobContext {
 	return {
 		jobId,
@@ -78,7 +81,8 @@ function createJobContext(
 		createJob: runtime.createJob,
 		createJobs: runtime.createJobs,
 		cron,
-		continue: createContinue(helpers, runtime, span),
+		continue: createContinue(helpers, runtime, span, progress),
+		progress: progress as JobContext['progress'],
 		logger: jobLogger(hooks, {
 			queue: queueName,
 			jobId,
@@ -102,7 +106,8 @@ function createJobContext(
 function createContinue(
 	helpers: JobHelpers,
 	runtime: TaskListRuntime,
-	span: JobSpan
+	span: JobSpan,
+	progress: ProgressRunner
 ): JobContext['continue'] {
 	let called = false
 	return async (options) => {
@@ -110,7 +115,15 @@ function createContinue(
 		called = true
 		const runAt = parseContinueRunAt(options)
 		const { traceparent } = injectTraceContext(undefined, runtime.otel)
-		const id = await continueJob(helpers, runtime.schema, runAt, traceparent)
+		// The continuation receives the latest value, so a lagging write does not matter.
+		await progress.close(false).catch(() => {})
+		const id = await continueJob(
+			helpers,
+			runtime.schema,
+			runAt,
+			traceparent,
+			progress.get()
+		)
 		span.setAttributes({
 			'graphile.continued': true,
 			'graphile.continuation_job_id': id
@@ -132,6 +145,7 @@ type ExecuteTaskOptions = {
 	executor: TaskExecutorFn
 	extraAttributes?: Record<string, string | number>
 	runtime: TaskListRuntime
+	progressSchema?: z.ZodType | undefined
 }
 
 function isNonRetriable(error: unknown): boolean {
@@ -146,7 +160,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 		operation,
 		executor,
 		extraAttributes,
-		runtime
+		runtime,
+		progressSchema
 	} = options
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
@@ -181,6 +196,13 @@ async function executeTask(options: ExecuteTaskOptions) {
 				span.setAttribute('messaging.producer.span_id', link.context.spanId)
 			}
 
+			const progress = createPgProgressRunner({
+				helpers,
+				schema: runtime.schema,
+				jobId,
+				initial: isPayloadEnvelope(payload) ? payload.progress : undefined,
+				progressSchema
+			})
 			const ctx = createJobContext(
 				jobId,
 				queueName,
@@ -189,7 +211,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 				runtime.hooks,
 				runtime,
 				cron,
-				payload
+				payload,
+				progress
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
@@ -205,6 +228,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 					if (!(error instanceof JobContinuedSignal)) throw error
 					continued = true
 				}
+				// Graphile deletes completed jobs, progress included.
+				await progress.close(false).catch(() => {})
 
 				const durationMs = Date.now() - startTime
 				span.setAttributes({ 'graphile.duration_ms': durationMs })
@@ -224,6 +249,17 @@ async function executeTask(options: ExecuteTaskOptions) {
 				})
 			} catch (error) {
 				status = 'failed'
+				// Retries read the latest progress, such as a retry budget.
+				await progress.close(true).catch((progressError: unknown) => {
+					ctx.logger.warn('job.progress.write_failed', {
+						event: 'job.progress.write_failed',
+						job_id: jobId,
+						error_message: String(progressError).slice(
+							0,
+							LOGGED_ERROR_MESSAGE_LIMIT
+						)
+					})
+				})
 				const durationMs = Date.now() - startTime
 				errorMessage = error instanceof Error ? error.message : String(error)
 				errorType = error instanceof Error ? error.name : 'Unknown'
@@ -364,6 +400,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					progressSchema: q.progressSchema,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = await parseQueuePayload(q, cleanPayload)
 						await q.processFn(validatedPayload, ctx)
@@ -377,6 +414,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					progressSchema: q.progressSchema,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = q.inputSchema
 							? await parseQueuePayload(q, cleanPayload)

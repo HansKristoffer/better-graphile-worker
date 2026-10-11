@@ -7,9 +7,11 @@ import { bindCreateJob, createJobsApi } from './create-job.js'
 import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import { getOtel, type OtelApi } from './otel.js'
+import { queryJobProgress } from './admin.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
+	GetJobProgressFn,
 	JobsApi,
 	PrepareJobFn,
 	PrepareJobsFn
@@ -34,6 +36,8 @@ export type JobClient<TQueues extends readonly QueueContract[]> = {
 	readonly prepareJob: PrepareJobFn<TQueues>
 	readonly prepareJobs: PrepareJobsFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
+	/** Read a job's `ctx.progress` value; null once the job no longer exists. */
+	readonly getJobProgress: GetJobProgressFn<TQueues>
 	migrate(): Promise<void>
 	release(): Promise<void>
 	getWorkerUtils(): Promise<WorkerUtils>
@@ -70,6 +74,14 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		prepareJob,
 		prepareJobs,
 		jobs: createJobsApi(createJob, options.queues),
+		getJobProgress: ((queue: string, jobId: string) =>
+			queryJobProgress(
+				client,
+				schema,
+				options.queues,
+				queue,
+				jobId
+			)) as GetJobProgressFn<TQueues>,
 		migrate() {
 			return client.migrate()
 		},

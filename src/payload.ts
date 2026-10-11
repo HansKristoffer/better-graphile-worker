@@ -15,6 +15,7 @@ export type StepCache = Record<string, StepCacheEntry>
 type EnvelopeMetadata = {
 	[BGW_ENVELOPE_KEY]: typeof BGW_ENVELOPE_VERSION
 	steps?: StepCache
+	progress?: unknown
 	_cron?: unknown
 	[TRACEPARENT_KEY]?: string
 }
@@ -120,4 +121,8 @@ export function extractStepCache(payload: unknown): StepCache {
 					: { output: entry.output }
 	}
 	return cache
+}
+export function extractProgress(payload: unknown): unknown {
+	assertPayloadEnvelope(payload)
+	return payload.progress
 }

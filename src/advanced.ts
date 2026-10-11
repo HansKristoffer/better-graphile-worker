@@ -19,6 +19,7 @@ export {
 	extractProducerLink,
 	extractCronMeta,
 	extractStepCache,
+	extractProgress,
 	isPayloadEnvelope,
 	type PayloadEnvelope,
 	type StepCache
@@ -29,8 +30,19 @@ export {
 	createPgStepStore,
 	type StepStore
 } from './steps.js'
+export {
+	createProgressRunner,
+	createPgProgressRunner,
+	PROGRESS_WRITE_INTERVAL_MS,
+	type ProgressRunner
+} from './progress.js'
 export { getOtel, createNoopSpan } from './otel.js'
-export { queryJobCounts, queryRecentJobs, mergeJobStats } from './admin.js'
+export {
+	queryJobCounts,
+	queryRecentJobs,
+	queryJobProgress,
+	mergeJobStats
+} from './admin.js'
 
 export { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 export { assertUniqueQueueNames } from './define-queues.js'

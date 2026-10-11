@@ -20,6 +20,7 @@ export {
 	type CronSchedule,
 	type JobContext,
 	type JobCronMeta,
+	type ProgressSchemaOf,
 	type JobLogger,
 	type JobSpan
 } from './queue.js'
@@ -44,7 +45,9 @@ export type {
 	CreateJobsForQueueFn,
 	JobsApi,
 	CronQueueName,
-	JobOptions
+	JobOptions,
+	QueueProgress,
+	GetJobProgressFn
 } from './types.js'
 export type { StopOptions } from './job-options.js'
 export {
@@ -62,6 +65,7 @@ export {
 	type JobClientOptions
 } from './job-client.js'
 export type { JobStep, StepCodec } from './steps.js'
+export type { JobProgress, JobProgressSnapshot } from './progress.js'
 export type {
 	CompletedJob,
 	CompletedJobStatus,

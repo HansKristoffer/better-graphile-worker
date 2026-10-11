@@ -10,7 +10,7 @@ Ordinary enqueue goes through Graphile's public SQL functions. That keeps produc
 
 ## One wire format, no legacy readers
 
-Every job carries a version-2 envelope ([`src/payload.ts`](../../src/payload.ts)): the producer's wire input, W3C trace context, and step checkpoints in separate fields. Workers reject anything else as a permanent failure. Readers for older formats were removed in 2.0. The cost is that an envelope change is a major release that requires draining old jobs first. Do not add a compatibility reader without that discussion.
+Every job carries a version-2 envelope ([`src/payload.ts`](../../src/payload.ts)): the producer's wire input, W3C trace context, and step checkpoints in separate fields. Workers reject anything else as a permanent failure. Readers for older formats were removed in 2.0. The cost is that an envelope change is a major release that requires draining old jobs first. Do not add a compatibility reader without that discussion. The exception is a new optional field such as `progress`: workers ignore fields they do not know and continuations copy them, so adding one is not a format change.
 
 Wire inputs are restricted to plain JSON values ([`src/validation.ts`](../../src/validation.ts)). JSON serialization would otherwise turn a Date into a string, drop a nested `undefined` or throw on a bigint at enqueue. The handler would receive a different value than the producer sent, or the enqueue would fail late.
 
@@ -20,7 +20,7 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 ## Private table access is isolated and pinned
 
-Continuations, permanent-failure retention, step checkpoints and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
+Continuations, permanent-failure retention, step checkpoints, progress and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
 Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
 
@@ -28,6 +28,7 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 
 - A continuation enqueues the next run and marks the current run as never-retry in one transaction. Otherwise a crash between the two could produce a retry next to the continuation.
 - Step checkpoints are patched atomically into the envelope and serialized per job. A failed checkpoint write is never treated as completed.
+- Progress lives in the envelope beside the checkpoints, so it uses the same lock check and survives retries. Its writes are throttled, so the latest value can be in memory only: a failing attempt writes it before Graphile records the failure, and a continuation receives it inside its transaction.
 - Retention exhausts the job's attempt budget and then rethrows the original error, so Graphile records the error and releases the lock itself.
 
 None of this makes external effects exactly-once: a process can crash after an effect but before its checkpoint. That limit belongs in user documentation, not in more machinery.
