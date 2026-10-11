@@ -1,6 +1,6 @@
 # better-graphile-worker
 
-Typed Graphile Worker queues with Zod schemas, cron and cron-init, durable step checkpoints, and optional OpenTelemetry. You own the PostgreSQL pool.
+Typed Graphile Worker queues with Zod schemas, cron and cron-init, durable step checkpoints, job progress, and optional OpenTelemetry. You own the PostgreSQL pool.
 
 ## Install
 
@@ -107,7 +107,7 @@ await producer.release()
 
 Separate handlers infer context enqueue methods from the complete registry and use queue names. Use `satisfies QueueHandlers<typeof queues>` for a reusable handler registry. Handler-free contracts require a handler registry on workers and harnesses. Inline definitions cannot also supply a registry.
 
-Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. Concurrent utility requests share one initialization. Release/stop never close your pool.
+Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. Only `migrate()` also creates the idempotency-key table. Concurrent utility requests share one initialization. Release/stop never close your pool.
 
 `isRegularQueue`, `isCronQueue`, `isCronInitQueue` and `hasInputSchema` preserve literal names, concrete schemas and any inline handlers while narrowing variants. Contract guards do not invent handler functions; worker construction checks the required functions.
 
@@ -129,7 +129,7 @@ Defaults follow explicit job options, then `deriveJobOptions` (or cron options f
 
 ## Lanes, transactions and long-running jobs
 
-`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority` and `flags` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to `createJob`, `createJobs`, `jobs.*`, `ctx.createJob` and cron-init fan-out, which maintains one pending job per key. A repeated tick can still create another job if the previous occurrence is running or has completed; enforce business idempotency in your own tables. Plain cron queues have no input and cannot derive options.
+`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority`, `flags`, `idempotencyKey` and `idempotencyTtl` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to `createJob`, `createJobs`, `jobs.*`, `ctx.createJob` and cron-init fan-out. A `jobKey` only holds while its job is pending: a repeated tick creates another job once the previous one is running or has completed. Use an [idempotency key](#idempotency-keys) to hold the key for a period of time instead. Plain cron queues have no input and cannot derive options.
 
 ```ts
 const advanceRun = defineQueue({
@@ -149,6 +149,32 @@ const advanceRun = defineQueue({
 })
 ```
 
+### Idempotency keys
+
+`idempotencyKey` enqueues at most one job per key and queue within `idempotencyTtl`, even after that job ran, completed or failed. A duplicate enqueues nothing and returns the original job's id; that job may no longer exist. The TTL counts from the first enqueue and defaults to 30 days. Pass milliseconds or a whole number with a unit: `'90s'`, `'30m'`, `'2h'`, `'7d'`.
+
+```ts
+const syncBank = defineQueue({
+  name: 'syncBank',
+  inputSchema: z.object({ userId: z.string() }),
+  // At most one bank sync per user every 2 hours.
+  deriveJobOptions: ({ userId }) => ({ idempotencyKey: `bank:${userId}`, idempotencyTtl: '2h' }),
+  processFn: async ({ userId }) => { /* ... */ }
+})
+await worker.jobs.syncBank({ userId }) // enqueues
+await worker.jobs.syncBank({ userId }) // returns the same id, enqueues nothing
+await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}` })
+```
+
+- Keys are scoped to the queue: the same key on two queues creates two jobs. A cron-init `triggerCron` keys the `{name}_cron-init` task.
+- Concurrent producers with the same key create one job; the others wait for it to commit and get its id.
+- The key is checked before `jobKey`. A duplicate does not replace or reschedule a pending job with the same `jobKey`. A new key enqueues through Graphile as usual, and records whichever job `jobKey` produced.
+- Batches take per-item keys from `deriveJobOptions`; `createJobs` options accept `idempotencyTtl` but no shared `idempotencyKey`. A key repeated within a batch returns the first item's id. Cron-init fan-out with a derived key processes each item once per TTL.
+- Enqueue without the key to force a run. A continuation keeps running the same job and does not touch its key.
+- Return types are unchanged; a duplicate looks like a successful enqueue. Prepared statements return a `deduplicated` column when a key applies, and producer spans record `job.deduplicated`.
+- Keys live in the `bgw_idempotency_keys` table in the Graphile schema, created by `migrate()`. Each keyed enqueue deletes up to 100 expired keys. An enqueue-only role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on that table.
+- The test harness records keys in `enqueued[].options` but does not deduplicate.
+
 `prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction; Graphile 0.17.3 can return fewer jobs if a worker claims an existing key during enqueue. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
 ```ts
@@ -165,7 +191,7 @@ await prisma.$transaction(async (tx) => {
 
 Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
-`ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps carry over; cron metadata does not. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt and uses Graphile's exponential backoff. Keep cursors and other progress in your own tables.
+`ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt and uses Graphile's exponential backoff. Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.
 
 Re-adding a key held by a running job clears that job's key and exhausts its attempts, so it will not be retried if it later fails. Only the job's own continuation should reuse its key. If another producer has already replaced a running job's key, its continuation remains unkeyed and does not overwrite the replacement.
 
@@ -197,7 +223,7 @@ const worker = createBetterWorker({ pgPool, queues, defaultTimeout: 20 * 60_000 
 
 The clock covers one attempt: each retry and each continuation starts a fresh one, and a cron-init queue's timeout also applies to its `initFn`. There is no per-job override; give jobs with different limits their own queues. When the time is up, `ctx.signal` aborts with a `JobTimeoutError` as its `reason`, and the attempt fails with `JobTimeoutError` whether or not the handler stops. Graphile releases the lock and lane at once. Normal retry rules apply, so the timeout spends an attempt and backs off, and on the last attempt it is a permanent failure. `onJobFinished` and the `job.completed` log report `errorType: 'JobTimeoutError'`, and Graphile stores the message as `last_error`. `getQueueDefinitions()` shows each queue's effective timeout.
 
-JavaScript cannot kill a function. A handler that ignores its signal keeps running, detached, in your process; a retry can run next to it. Everything it starts through the context after the timeout is refused with `JobTimeoutError`: `ctx.step.run`, `ctx.continue()`, `ctx.createJob` and `ctx.createJobs`. A checkpoint that was already being written lands only if it commits before the failure is recorded; it can never be written into a later attempt. Raw `ctx.helpers` and your own side effects are not guarded, so pass `ctx.signal` to HTTP and database clients and check it in loops. When the detached handler finally settles, a `job.timed_out_handler_settled` warning is logged. Synchronous code that never yields blocks the event loop, so no timeout can fire.
+JavaScript cannot kill a function. A handler that ignores its signal keeps running, detached, in your process; a retry can run next to it. Everything it starts through the context after the timeout is refused with `JobTimeoutError`: `ctx.step.run`, `ctx.progress.set` and `flush`, `ctx.continue()`, `ctx.createJob` and `ctx.createJobs`. A checkpoint or progress write already in flight lands only if it commits before the failure is recorded; it can never be written into a later attempt. Raw `ctx.helpers` and your own side effects are not guarded, so pass `ctx.signal` to HTTP and database clients and check it in loops. When the detached handler finally settles, a `job.timed_out_handler_settled` warning is logged. Synchronous code that never yields blocks the event loop, so no timeout can fire.
 
 `ctx.continue()` after the timeout is refused, so keep time slices well inside it. A continuation that is already committing when the timeout fires wins, and the run counts as continued. During graceful shutdown, Graphile aborts `ctx.signal` with its own reason after `gracefulShutdownAbortTimeout`; `ctx.continue()` still works then. A hung handler cannot hold up `stop()` past its timeout: the attempt fails and shutdown proceeds without waiting for the detached handler.
 
@@ -207,18 +233,18 @@ Producer inputs use `z.input`; consumers receive `z.output`. Both use async pars
 
 Wire inputs must contain plain JSON values: strings, finite numbers, booleans, null, arrays and plain objects. Dates, bigints, functions, class instances, cycles and nested undefined values are rejected. Encode dates as strings at the producer; a schema can transform those strings into Dates in the handler. Root `undefined` is supported for optional/defaulted inputs and restored before parsing. `validateOnEnqueue: false` skips schema checks, but still enforces the JSON wire format.
 
-All new jobs, including scheduled cron, use a version-2 envelope with payload, trace metadata and optional checkpoints in separate fields. Business fields named `__trace`, `traceparent`, `__bgw` or `steps` survive inside the payload. Only this format is accepted. Raw Graphile producers must supply the current envelope; prefer instance enqueue methods.
+All new jobs, including scheduled cron, use a version-2 envelope with payload, trace metadata, optional checkpoints and progress in separate fields. Business fields named `__trace`, `traceparent`, `__bgw`, `steps` or `progress` survive inside the payload. Only this format is accepted. Raw Graphile producers must supply the current envelope; prefer instance enqueue methods.
 
 Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown by your handler, such as validating a downstream response, follows normal retry behavior.
 
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
 
-Continuation, retention, checkpointing, job outcomes and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
+Continuation, retention, checkpointing, job outcomes, progress and payload debugging use an isolated adapter for Graphile 0.17's private jobs table. The peer range is bounded accordingly; upgrades require its PostgreSQL regression suite.
 
 ## Context and durable steps
 
-Contexts include `jobId`, the task `queue`, `attempt`, `maxAttempts`, `logger`, `span`, `signal` (aborted on shutdown or [timeout](#timeouts)), raw Graphile `helpers`, typed `createJob`/`createJobs`, `continue`, and `cron` metadata (`ts: Date`, optional `backfilled`). Cron-init contexts use the suffixed task name.
+Contexts include `jobId`, the task `queue`, `attempt`, `maxAttempts`, `logger`, `span`, `signal` (aborted on shutdown or [timeout](#timeouts)), raw Graphile `helpers`, typed `createJob`/`createJobs`, `continue`, `step`, `progress`, and `cron` metadata (`ts: Date`, optional `backfilled`). Cron-init contexts use the suffixed task name.
 
 ```ts
 const user = await ctx.step.run('fetch-user-v1', async () => {
@@ -243,6 +269,38 @@ const when = await ctx.step.run('timestamp-v1', () => new Date(), {
 
 Use the same result type and codec for every use of an ID. Version IDs when the stored format changes. Checkpoints cannot guarantee exactly-once external effects: a process can crash after an effect but before its checkpoint. External effects must be idempotent. Steps memoize results; they do not implement suspended workflows or durable sleeps.
 
+## Progress
+
+`ctx.progress` stores one JSON value on the running job, such as a phase, counts or a retry budget. Other processes read it by job id, for example an admin endpoint that polls. An optional `progressSchema` types and validates it; without one, any JSON value is accepted.
+
+```ts
+const importOrders = defineQueue({
+  name: 'importOrders',
+  inputSchema: z.object({ shopId: z.string() }),
+  progressSchema: z.object({ phase: z.enum(['fetch', 'write']), done: z.number(), retriesLeft: z.number() }),
+  processFn: async ({ shopId }, ctx) => {
+    const retriesLeft = ctx.progress.get()?.retriesLeft ?? 3 // survives retries
+    await ctx.progress.set({ phase: 'fetch', done: 0, retriesLeft })
+    const orders = await fetchOrders(shopId)
+    for (const [index, order] of orders.entries()) {
+      await saveOrder(order)
+      await ctx.progress.set({ phase: 'write', done: index + 1, retriesLeft })
+    }
+  }
+})
+
+// API or admin process, with the worker or a job client:
+const job = await producer.getJobProgress('importOrders', jobId)
+// null: no such job. job.progress: undefined until the job sets it.
+```
+
+- `set` validates the value, makes it visible to `get()` at once and schedules a write. The first value is written immediately; later values within one second coalesce into a single trailing write, so a tight loop costs at most about one `UPDATE` per second. `await ctx.progress.flush()` writes now. A failed write rejects the next `set` or `flush`, then is retried.
+- Progress is stored in the job's row next to step checkpoints, and writes require the worker's current lock. A stale worker cannot overwrite it.
+- When an attempt fails, its latest value is written before Graphile schedules the retry, so the next attempt's `get()` returns it. `ctx.continue()` hands the latest value to the continuation.
+- Graphile deletes a job when it succeeds, and its progress with it: `getJobProgress` then returns `null`. Record final results in your own tables. A continuation has a new job id, so a reader holding the old id also gets `null`. With [`jobOutcomes`](#looking-up-a-job-after-it-finishes) enabled, `getJob(id)` tells the two apart and gives the continuation's id in `continuedTo`.
+- The `progressSchema` output must be JSON; encode dates as strings. Readers get the stored value without parsing it again, so a value written under an older schema is returned as it was stored. Change the shape compatibly, or version it.
+- `getJobProgress` takes the queue name so the result is typed, and returns `null` for a job of a different queue. A cron-init `initFn` has untyped progress that it can only use itself.
+
 ## Lifecycle and observability
 
 Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
@@ -262,6 +320,7 @@ const last = first.at(-1)
 if (last) await worker.listJobs({ limit: 50, state: 'failed', includePayload: false, before: last.cursor })
 await worker.retryJobs(['123'])
 await worker.failJobs(['123'], 'gave up')
+await worker.getJobProgress('importOrders', '123')
 worker.getQueueDefinitions()
 ```
 
@@ -321,7 +380,7 @@ await harness.process('sendEmail', { to: 'person@example.com' })
 console.log(harness.logs, harness.enqueued, harness.continued)
 ```
 
-The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; different queues never share checkpoints. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
 
 ## Types and major-version migration
 
@@ -329,7 +388,7 @@ The harness invokes handlers directly without Graphile acknowledgement/retry hoo
 
 Low-level builders, SQL adapters and payload helpers are available exclusively from `better-graphile-worker/advanced`. Application code should use instance methods. The package root exports constructors, contract helpers, public types and errors.
 
-Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
+Custom adapters must implement `EnqueueAdapter.addIdempotentJobs(specs)` to accept `idempotencyKey`; without it, keyed enqueues are rejected. Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
 
 This implementation requires a **major release**. There are no deprecated aliases or readers for the previous wire format:
 

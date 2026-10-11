@@ -1,5 +1,5 @@
 /** Version-specific SQL for Graphile Worker 0.17.x; keep private-table access here. */
-import type { JobHelpers } from 'graphile-worker'
+import type { JobHelpers, WorkerUtils } from 'graphile-worker'
 import type { PoolClient } from 'pg'
 import { addJobSql } from './enqueue-sql.js'
 import { StepPersistenceError } from './errors.js'
@@ -88,36 +88,82 @@ export function recordJobOutcome(
 	)
 }
 
-export async function writeCheckpoint(
+/**
+ * Patch the locked job's envelope; `$1` is the job id, `$2` the lock owner and `$3` the
+ * lock time, which tells this attempt apart from a later one by the same worker pool.
+ */
+async function patchEnvelope(
 	helpers: JobHelpers,
 	schema: string,
 	jobId: string,
-	id: string,
-	checkpoint: unknown
+	patched: string,
+	values: unknown[]
 ): Promise<void> {
 	const quoted = quoteSchemaName(schema)
 	const result = await helpers.withPgClient((client) =>
 		client.query(
 			`WITH owned AS (
 		SELECT id, payload::jsonb AS data FROM ${quoted}._private_jobs
-		WHERE id = $1::bigint AND locked_by = $4::text AND date_trunc('milliseconds', locked_at) = $5::timestamptz FOR UPDATE
-	) UPDATE ${quoted}._private_jobs jobs SET
-		payload = jsonb_set(
-			owned.data,
-			'{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($2::text, $3::jsonb), true
-		), updated_at = now()
+		WHERE id = $1::bigint AND locked_by = $2::text AND date_trunc('milliseconds', locked_at) = $3::timestamptz FOR UPDATE
+	) UPDATE ${quoted}._private_jobs jobs SET payload = ${patched}, updated_at = now()
 		FROM owned WHERE jobs.id = owned.id AND owned.data->>'__bgw' = '2' AND owned.data ? 'payload'`,
-			[
-				jobId,
-				id,
-				JSON.stringify(checkpoint),
-				helpers.job.locked_by,
-				helpers.job.locked_at
-			]
+			[jobId, helpers.job.locked_by, helpers.job.locked_at, ...values]
 		)
 	)
-
 	if (result.rowCount !== 1) throw new StepPersistenceError(jobId)
+}
+
+export function writeCheckpoint(
+	helpers: JobHelpers,
+	schema: string,
+	jobId: string,
+	id: string,
+	checkpoint: unknown
+): Promise<void> {
+	return patchEnvelope(
+		helpers,
+		schema,
+		jobId,
+		`jsonb_set(owned.data, '{steps}', CASE WHEN jsonb_typeof(owned.data->'steps') = 'object' THEN owned.data->'steps' ELSE '{}'::jsonb END || jsonb_build_object($4::text, $5::jsonb), true)`,
+		[id, JSON.stringify(checkpoint)]
+	)
+}
+
+export function writeProgress(
+	helpers: JobHelpers,
+	schema: string,
+	jobId: string,
+	value: unknown
+): Promise<void> {
+	return patchEnvelope(
+		helpers,
+		schema,
+		jobId,
+		`jsonb_set(owned.data, '{progress}', $4::jsonb, true)`,
+		[JSON.stringify(value)]
+	)
+}
+
+/** Null when no job of this task exists; completed jobs are deleted by Graphile. */
+export async function readProgress(
+	withPgClient: WorkerUtils['withPgClient'],
+	schema: string,
+	identifier: string,
+	jobId: string
+): Promise<{ progress: unknown } | null> {
+	const quoted = quoteSchemaName(schema)
+	const result = await withPgClient((client) =>
+		client.query<{ progress: unknown; has_progress: boolean }>(
+			`SELECT jobs.payload::jsonb->'progress' AS progress, jobs.payload::jsonb ? 'progress' AS has_progress
+FROM ${quoted}._private_jobs jobs
+JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id
+WHERE jobs.id = $1::bigint AND tasks.identifier = $2::text`,
+			[jobId, identifier]
+		)
+	)
+	const row = result.rows[0]
+	if (!row) return null
+	return { progress: row.has_progress ? row.progress : undefined }
 }
 
 export function payloadDebugJoin(quotedSchema: string): {
@@ -131,15 +177,17 @@ export function payloadDebugJoin(quotedSchema: string): {
 }
 
 /**
- * Enqueue the same job (lane, key, priority, flags, max_attempts, steps) and stop the
- * current one from retrying, in one transaction. Returns the continuation's id.
+ * Enqueue the same job (lane, key, priority, flags, max_attempts, steps, progress) and
+ * stop the current one from retrying, in one transaction. Returns the continuation's id.
+ * `progress` carries the latest in-memory value, which may not be written yet.
  */
 export async function continueJob(
 	helpers: JobHelpers,
 	schema: string,
 	runAt: Date | undefined,
 	traceparent: string | undefined,
-	recordOutcome = false
+	recordOutcome = false,
+	progress?: unknown
 ): Promise<string> {
 	const quoted = quoteSchemaName(schema)
 	// pg decodes locked_at to Date, which only retains milliseconds.
@@ -170,6 +218,7 @@ FOR UPDATE OF jobs`,
 			if (!job) throw new StepPersistenceError(String(helpers.job.id))
 			// Same logical job: keep input and steps; a continuation is not a cron fire.
 			const { _cron, traceparent: _previous, ...envelope } = job.payload
+			if (progress !== undefined) envelope.progress = progress
 			const { text, values } = addJobSql(
 				schema,
 				job.identifier,

@@ -99,6 +99,8 @@ describe('attempt timeout', () => {
 					ctx.createJob('defaulted', 'child'),
 					ctx.createJobs('defaulted', ['child']),
 					ctx.step.run('late', () => 1),
+					ctx.progress.set(1),
+					ctx.progress.flush(),
 					ctx.continue()
 				])
 			},
@@ -116,12 +118,9 @@ describe('attempt timeout', () => {
 		release.resolve()
 		// Logged once the detached handler finally returns.
 		await warned.promise
-		expect(late.map((result) => result.status)).toEqual([
-			'rejected',
-			'rejected',
-			'rejected',
-			'rejected'
-		])
+		expect(late.map((result) => result.status)).toEqual(
+			Array(6).fill('rejected')
+		)
 		for (const result of late)
 			expect((result as PromiseRejectedResult).reason).toBeInstanceOf(
 				JobTimeoutError
@@ -282,6 +281,7 @@ describe.skipIf(!enabled)('attempt timeout in PostgreSQL', () => {
 				late.resolve(
 					await Promise.allSettled([
 						ctx.step.run('late', () => 1),
+						ctx.progress.set({ late: true }),
 						ctx.createJob('stuck', { hang: false })
 					])
 				)
@@ -323,10 +323,11 @@ describe.skipIf(!enabled)('attempt timeout in PostgreSQL', () => {
 
 		release.resolve()
 		await late.promise
-		// The detached handler's step and child enqueue never reached the database.
+		// The detached handler's step, progress and child enqueue never reached the database.
 		const after = await rows()
 		expect(after).toHaveLength(1)
 		expect(after[0].payload.steps).toBeUndefined()
+		expect(after[0].payload.progress).toBeUndefined()
 		await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 	})
 

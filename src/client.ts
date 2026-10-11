@@ -7,7 +7,13 @@ import {
 	type WorkerUtils
 } from 'graphile-worker'
 import type { Pool } from 'pg'
-import { addJobSql, addJobsSql } from './enqueue-sql.js'
+import {
+	addIdempotentJobsSql,
+	addJobSql,
+	addJobsSql,
+	idempotencyMigrationSql,
+	type IdempotentJobSpec
+} from './enqueue-sql.js'
 import { assertValidSchemaName, quoteSchemaName } from './schema-name.js'
 
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
@@ -19,7 +25,16 @@ export type EnqueueAdapter = {
 		specs: readonly AddJobsJobSpec[],
 		jobKeyPreserveRunAt?: boolean
 	): Promise<readonly Job[]>
+	/**
+	 * Enqueue in spec order, honoring each spec's idempotency key. Required to enqueue with
+	 * `idempotencyKey`; adapters without it reject such jobs.
+	 */
+	addIdempotentJobs?(
+		specs: readonly IdempotentJobSpec[]
+	): Promise<readonly EnqueuedJob[]>
 }
+/** `deduplicated` is true when an idempotency key returned an earlier job instead. */
+export type EnqueuedJob = { id: string; deduplicated: boolean }
 export type WorkerClient = {
 	readonly enqueue: EnqueueAdapter
 	withPgClient: WorkerUtils['withPgClient']
@@ -91,6 +106,14 @@ export function createWorkerClient(options: {
 				...job,
 				task_identifier: specs[index]!.identifier
 			}))
+		},
+		async addIdempotentJobs(specs) {
+			if (!specs.length) return []
+			const { text, values } = addIdempotentJobsSql(schema, specs)
+			const result = await options.pgPool.query<EnqueuedJob>(text, values)
+			if (result.rows.length !== specs.length)
+				throw new Error('Idempotent enqueue returned fewer jobs than requested')
+			return result.rows
 		}
 	}
 	return {
@@ -106,8 +129,10 @@ export function createWorkerClient(options: {
 		getUtils,
 		release,
 		async migrate() {
-			await getUtils()
-		}, // makeWorkerUtils initializes/migrates once.
+			await getUtils() // makeWorkerUtils initializes/migrates once.
+			// Text without values runs as one implicit transaction.
+			await options.pgPool.query(idempotencyMigrationSql(schema))
+		},
 		async retryJobs(ids) {
 			if (!ids.length) return []
 			const result = await options.pgPool.query<{ id: string }>(
