@@ -84,6 +84,7 @@ export type {
 	ListJobsOptions,
 	JobListState
 } from './admin.js'
+export type { JobOutcomesOption, JobState } from './job-outcomes.js'
 export type { GraphileRunnerOverrides } from './worker.js'
 export {
 	NonRetriableError,

@@ -39,6 +39,13 @@ import {
 	type GraphileRunnerOverrides
 } from './worker.js'
 import { jobLogger } from './observers.js'
+import {
+	migrateJobOutcomes,
+	queryJob,
+	resolveJobOutcomes,
+	type JobOutcomesOption,
+	type JobState
+} from './job-outcomes.js'
 import { createLifecycle } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
@@ -70,6 +77,8 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	/** Fail attempts that run longer than this many milliseconds; queues override it with `timeout`. */
 	defaultTimeout?: number
 	completedJobs?: CompletedJobsOption
+	/** Record final job states in PostgreSQL so `getJob` can read them after completion. */
+	jobOutcomes?: JobOutcomesOption
 	graphile?: GraphileRunnerOverrides | undefined
 	otel?: { api: OtelApi | null }
 	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
@@ -116,6 +125,7 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	getCompletedJobsStats(): CompletedJobStats
 	getJobStats(): Promise<WorkerJobStatsRow[]>
 	listJobs(options?: ListJobsOptions): Promise<ListedJob[]>
+	getJob(id: string): Promise<JobState>
 	retryJobs(ids: string[]): Promise<string[]>
 	failJobs(ids: string[], reason?: string): Promise<string[]>
 	getQueueDefinitions(): QueueDefinition[]
@@ -195,6 +205,15 @@ export function createBetterWorker<
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
+	const jobOutcomes = resolveJobOutcomes(options.jobOutcomes, schema, (error) =>
+		logger.error('job.outcome.prune_failed', { error: String(error) })
+	)
+	// Workers create the table on start too, so enabling the option cannot fail every job.
+	const ensureOutcomes = async () => {
+		if (!jobOutcomes) return
+		await client.migrate()
+		await migrateJobOutcomes(options.pgPool, schema)
+	}
 	const runtime = {
 		hooks,
 		completedJobs,
@@ -204,13 +223,15 @@ export function createBetterWorker<
 		schema,
 		otel,
 		permanentFailure: options.permanentFailure,
-		defaultTimeout: options.defaultTimeout
+		defaultTimeout: options.defaultTimeout,
+		jobOutcomes
 	}
 
 	const lifecycle = createLifecycle({
 		start: async () => {
 			logger.info('Starting graphile-worker')
 			logRegisteredQueues(queues, logger)
+			await ensureOutcomes()
 			return startRunner({
 				pgPool: options.pgPool,
 				schema,
@@ -239,20 +260,24 @@ export function createBetterWorker<
 		get promise() {
 			return lifecycle.promise
 		},
-		migrate: () => client.migrate(),
+		migrate: async () => {
+			await client.migrate()
+			await ensureOutcomes()
+		},
 		start: () => lifecycle.start(),
 		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
-			lifecycle.runOnce(() =>
-				runOnceTasks({
+			lifecycle.runOnce(async () => {
+				await ensureOutcomes()
+				await runOnceTasks({
 					pgPool: options.pgPool,
 					schema,
 					taskList: buildTaskList(queues, runtime),
 					noHandleSignals: true,
 					graphile: options.graphile
 				})
-			),
+			}),
 		triggerCron: (name, opts) => producer.triggerCron(name, opts),
 
 		getWorkerUtils() {
@@ -284,6 +309,7 @@ export function createBetterWorker<
 			const utils = client
 			return queryRecentJobs(utils, schema, listOptions)
 		},
+		getJob: (id) => queryJob(client, schema, id),
 		retryJobs: (ids) => client.retryJobs(ids),
 		async failJobs(ids, reason) {
 			const utils = await client.getUtils()

@@ -7,7 +7,7 @@ import type { JobOptions } from './job-options.js'
 import { assertInteger } from './validation.js'
 
 const HELP = `better-graphile-worker CLI
-Commands: list-queues | schema <queue> | create-job <queue> [json] | stats | list-jobs | retry <id> | fail <id> [reason] | run-once
+Commands: list-queues | schema <queue> | create-job <queue> [json] | stats | list-jobs | get-job <id> | retry <id> | fail <id> [reason] | run-once
 Options: --json --priority <n> --run-at <iso> --max-attempts <n> --job-key <key> --queue <name> --state <pending|running|failed> --limit <n> --offset <n> -h, --help`
 function number(
 	value: string | undefined,
@@ -141,6 +141,9 @@ export function createCli<T extends readonly QueueContract[]>(
 					)
 					break
 				}
+				case 'get-job':
+					print(await worker.getJob(required(args[0], 'Job id')))
+					break
 				case 'retry':
 					print({
 						retried: await worker.retryJobs([required(args[0], 'Job id')])

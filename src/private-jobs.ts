@@ -1,7 +1,9 @@
 /** Version-specific SQL for Graphile Worker 0.17.x; keep private-table access here. */
 import type { JobHelpers } from 'graphile-worker'
+import type { PoolClient } from 'pg'
 import { addJobSql } from './enqueue-sql.js'
 import { StepPersistenceError } from './errors.js'
+import { JOB_OUTCOMES_TABLE } from './job-outcomes.js'
 import { compact } from './options.js'
 import { quoteSchemaName } from './schema-name.js'
 export async function retainPermanentFailure(
@@ -17,6 +19,73 @@ export async function retainPermanentFailure(
 	if (result.rowCount !== 1)
 		throw new StepPersistenceError(String(helpers.job.id))
 	// Throwing the original error lets Graphile persist last_error and release its lock.
+}
+
+/**
+ * Upserts the locked job's outcome. With `finish`, also completes the job the way
+ * Graphile's complete_jobs does (delete it, release its lane) in the same statement;
+ * Graphile's own completion then finds nothing to delete. Returns false without a lock.
+ */
+async function writeOutcome(
+	client: Pick<PoolClient, 'query'>,
+	helpers: JobHelpers,
+	schema: string,
+	outcome: {
+		state: 'completed' | 'failed' | 'continued'
+		error?: string | undefined
+		continuedTo?: string
+		finish: boolean
+	}
+): Promise<boolean> {
+	const quoted = quoteSchemaName(schema)
+	const finishSql = outcome.finish
+		? `, deleted AS (
+	DELETE FROM ${quoted}._private_jobs jobs USING owned WHERE jobs.id = owned.id RETURNING jobs.job_queue_id
+), unlocked AS (
+	UPDATE ${quoted}._private_job_queues queues SET locked_by = NULL, locked_at = NULL
+	FROM deleted WHERE queues.id = deleted.job_queue_id AND queues.locked_by = $2::text
+)`
+		: ''
+	const result = await client.query<{ recorded: number }>(
+		`WITH owned AS (
+	SELECT jobs.id, tasks.identifier, jobs.attempts, jobs.max_attempts, jobs.created_at
+	FROM ${quoted}._private_jobs jobs
+	JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id
+	WHERE jobs.id = $1::bigint AND jobs.locked_by = $2::text AND jobs.locked_at IS NOT NULL
+	FOR UPDATE OF jobs
+), recorded AS (
+	INSERT INTO ${quoted}.${JOB_OUTCOMES_TABLE}
+		(job_id, task_identifier, state, continued_to, attempts, max_attempts, last_error, created_at)
+	SELECT id, identifier, $3::text, $5::bigint, attempts, max_attempts, $4::text, created_at FROM owned
+	ON CONFLICT (job_id) DO UPDATE SET state = excluded.state, continued_to = excluded.continued_to,
+		attempts = excluded.attempts, max_attempts = excluded.max_attempts,
+		last_error = excluded.last_error, finished_at = now()
+	RETURNING job_id
+)${finishSql}
+SELECT count(*)::int AS recorded FROM recorded`,
+		[
+			helpers.job.id,
+			helpers.job.locked_by,
+			outcome.state,
+			outcome.error ?? null,
+			outcome.continuedTo ?? null
+		]
+	)
+	return result.rows[0]?.recorded === 1
+}
+
+export function recordJobOutcome(
+	helpers: JobHelpers,
+	schema: string,
+	outcome: {
+		state: 'completed' | 'failed'
+		error?: string | undefined
+		finish: boolean
+	}
+): Promise<boolean> {
+	return helpers.withPgClient((client) =>
+		writeOutcome(client, helpers, schema, outcome)
+	)
 }
 
 export async function writeCheckpoint(
@@ -69,7 +138,8 @@ export async function continueJob(
 	helpers: JobHelpers,
 	schema: string,
 	runAt: Date | undefined,
-	traceparent: string | undefined
+	traceparent: string | undefined,
+	recordOutcome = false
 ): Promise<string> {
 	const quoted = quoteSchemaName(schema)
 	// pg decodes locked_at to Date, which only retains milliseconds.
@@ -122,6 +192,15 @@ FOR UPDATE OF jobs`,
 				`UPDATE ${quoted}._private_jobs SET max_attempts = attempts WHERE id = $1::bigint AND locked_by = $2::text`,
 				params.slice(0, 2)
 			)
+			if (
+				recordOutcome &&
+				!(await writeOutcome(client, helpers, schema, {
+					state: 'continued',
+					continuedTo: id,
+					finish: true
+				}))
+			)
+				throw new StepPersistenceError(String(helpers.job.id))
 			await client.query('COMMIT')
 			return id
 		} catch (error) {

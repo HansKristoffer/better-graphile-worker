@@ -37,7 +37,8 @@ import {
 import {
 	JobContinuedSignal,
 	JobTimeoutError,
-	NonRetriableError
+	NonRetriableError,
+	StepPersistenceError
 } from './errors.js'
 import {
 	extractCronMeta,
@@ -48,7 +49,12 @@ import {
 } from './payload.js'
 import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
-import { continueJob, retainPermanentFailure } from './private-jobs.js'
+import {
+	continueJob,
+	recordJobOutcome,
+	retainPermanentFailure
+} from './private-jobs.js'
+import type { JobOutcomes } from './job-outcomes.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
 
 export type TaskListRuntime<
@@ -64,6 +70,7 @@ export type TaskListRuntime<
 	permanentFailure?: 'discard' | 'retain' | undefined
 	/** Applies to queues without their own `timeout`, in milliseconds. */
 	defaultTimeout?: number | undefined
+	jobOutcomes?: JobOutcomes | undefined
 }
 
 export { extractProducerLink } from './payload.js'
@@ -183,7 +190,13 @@ function createContinue(
 		const runAt = parseContinueRunAt(options)
 		const { traceparent } = injectTraceContext(undefined, runtime.otel)
 		const id = await attempt.continuing(
-			continueJob(helpers, runtime.schema, runAt, traceparent)
+			continueJob(
+				helpers,
+				runtime.schema,
+				runAt,
+				traceparent,
+				runtime.jobOutcomes !== undefined
+			)
 		)
 		span.setAttributes({
 			'graphile.continued': true,
@@ -300,6 +313,14 @@ async function executeTask(options: ExecuteTaskOptions) {
 					if (!(error instanceof JobContinuedSignal)) throw error
 					continued = true
 				}
+				// Like a checkpoint, a completion that cannot be recorded fails the attempt.
+				if (runtime.jobOutcomes && !continued) {
+					const recorded = await recordJobOutcome(helpers, runtime.schema, {
+						state: 'completed',
+						finish: true
+					})
+					if (!recorded) throw new StepPersistenceError(jobId)
+				}
 
 				const durationMs = Date.now() - startTime
 				span.setAttributes({ 'graphile.duration_ms': durationMs })
@@ -360,17 +381,37 @@ async function executeTask(options: ExecuteTaskOptions) {
 					})
 				}
 
+				// The job row stays (or Graphile deletes it on discard), so these writes are best effort.
+				const recordFailure = async (finish: boolean) => {
+					if (!runtime.jobOutcomes) return
+					await recordJobOutcome(helpers, runtime.schema, {
+						state: 'failed',
+						error: errorMessage,
+						finish
+					}).catch((recordError) =>
+						ctx.logger.error('job.outcome.failed', {
+							queue: queueName,
+							job_id: jobId,
+							error: String(recordError)
+						})
+					)
+				}
+
 				if (isNonRetriable(error)) {
 					if (runtime.permanentFailure !== 'discard') {
 						await retainPermanentFailure(helpers, runtime.schema)
+						await recordFailure(false)
 						throw error
 					}
+					await recordFailure(true)
 					return
 				}
 
+				if (permanent) await recordFailure(false)
 				throw error
 			} finally {
 				attempt.dispose()
+				await runtime.jobOutcomes?.prune(helpers)
 				const durationMs = Date.now() - startTime
 				const permanentlyFailed = status === 'failed' && permanent
 				await observe(runtime.hooks.onJobFinished, {
