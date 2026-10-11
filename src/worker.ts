@@ -8,8 +8,10 @@ import {
 	type TaskList,
 	type CronItem,
 	type CronMatcher,
-	type JobHelpers
+	type JobHelpers,
+	type WorkerEvents
 } from 'graphile-worker'
+import { EventEmitter } from 'node:events'
 import type { Pool } from 'pg'
 import type z from 'zod'
 import {
@@ -66,6 +68,8 @@ export type TaskListRuntime<
 	otel?: OtelApi | null
 	permanentFailure?: 'discard' | 'retain' | undefined
 	jobOutcomes?: JobOutcomes | undefined
+	/** Settles once crash recovery has registered this worker; jobs wait for it. */
+	heartbeatReady?: () => Promise<void> | undefined
 }
 
 export { extractProducerLink } from './payload.js'
@@ -182,6 +186,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 		: { link: null, cleanPayload: undefined }
 	const cron = extractCronMeta(payload)
 	const statusCodes = otelStatusCodes(runtime.otel)
+	await runtime.heartbeatReady?.()
 
 	await withActiveSpan(
 		'graphile-worker',
@@ -592,22 +597,39 @@ export async function startRunner(options: {
 	pollInterval: number
 	noHandleSignals: boolean
 	graphile?: GraphileRunnerOverrides | undefined
+	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
+	onPoolCreate?: ((poolId: string) => void) | undefined
 }): Promise<Runner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
+	const { onPoolCreate, graphile } = options
+	// An emitter nested in a preset's `extends` is not found here and gets replaced.
+	const events =
+		graphile?.events ??
+		graphile?.preset?.worker?.events ??
+		(new EventEmitter() as WorkerEvents)
+	const listener = ({ workerPool }: { workerPool: { id: string } }) =>
+		onPoolCreate?.(workerPool.id)
+	events.on('pool:create', listener)
 
-	return run(
-		compact({
-			...withDurableCompletion(options.graphile),
-			pgPool: options.pgPool,
-			schema: options.schema,
-			taskList: options.taskList,
-			parsedCronItems,
-			noHandleSignals: options.noHandleSignals,
-			concurrency: options.concurrency,
-			pollInterval: options.pollInterval
-		})
-	)
+	try {
+		return await run(
+			compact({
+				...withDurableCompletion(graphile),
+				events,
+				pgPool: options.pgPool,
+				schema: options.schema,
+				taskList: options.taskList,
+				parsedCronItems,
+				noHandleSignals: options.noHandleSignals,
+				concurrency: options.concurrency,
+				pollInterval: options.pollInterval
+			})
+		)
+	} finally {
+		// run() emits pool:create synchronously before it resolves.
+		events.off('pool:create', listener)
+	}
 }
 
 export async function runOnceTasks(options: {

@@ -255,3 +255,32 @@ FOR UPDATE OF jobs`,
 		}
 	})
 }
+
+/**
+ * Release jobs and lanes locked by dead worker pools, like Graphile's failJobs: record
+ * the error and back off. The attempt taken when the job was locked stays spent, so a
+ * job that keeps killing its worker exhausts max_attempts and fails permanently.
+ */
+export async function releaseJobsLockedBy(
+	client: PoolClient,
+	schema: string,
+	workerIds: readonly string[]
+): Promise<string[]> {
+	const quoted = quoteSchemaName(schema)
+	const result = await client.query<{ id: string }>(
+		`WITH jobs AS (
+	UPDATE ${quoted}._private_jobs SET
+		last_error = 'Worker ' || locked_by || ' stopped sending heartbeats (crashed or blocked); released by crash recovery',
+		run_at = greatest(now(), run_at) + exp(least(attempts, 10)) * interval '1 second',
+		locked_by = NULL, locked_at = NULL
+	WHERE locked_by = ANY($1::text[])
+	RETURNING id
+), queues AS (
+	UPDATE ${quoted}._private_job_queues SET locked_by = NULL, locked_at = NULL
+	WHERE locked_by = ANY($1::text[])
+)
+SELECT id::text FROM jobs`,
+		[workerIds]
+	)
+	return result.rows.map((row) => row.id)
+}
