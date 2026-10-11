@@ -87,6 +87,7 @@ export type {
 export type { GraphileRunnerOverrides } from './worker.js'
 export {
 	NonRetriableError,
+	RetryAtError,
 	UnknownQueueError,
 	JobValidationError,
 	DuplicateQueueError,

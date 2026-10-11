@@ -20,7 +20,7 @@ The producer stores `z.input`, never the transformed output, and the consumer pa
 
 ## Private table access is isolated and pinned
 
-Continuations, permanent-failure retention, step checkpoints and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
+Continuations, permanent-failure retention, retry scheduling, step checkpoints and payload debugging need Graphile 0.17's `_private_jobs` table, which is not a public API. All of that SQL lives in [`src/private-jobs.ts`](../../src/private-jobs.ts), and the `graphile-worker` peer range is bounded to 0.17.x because of it. Raising the range means rerunning the PostgreSQL regression suite against the new version.
 
 Every write there is conditioned on `locked_by` matching the current worker. A worker that lost its lock, for example after Graphile's stale-lock reclaim, must not overwrite the new owner's state.
 
@@ -29,6 +29,7 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 - A continuation enqueues the next run and marks the current run as never-retry in one transaction. Otherwise a crash between the two could produce a retry next to the continuation.
 - Step checkpoints are patched atomically into the envelope and serialized per job. A failed checkpoint write is never treated as completed.
 - Retention exhausts the job's attempt budget and then rethrows the original error, so Graphile records the error and releases the lock itself.
+- `RetryAtError` moves the locked job's `run_at` back by Graphile's backoff for that attempt and then rethrows, so Graphile's own failure update lands on the requested time. The alternative, re-enqueueing a copy like a continuation, would hit the time exactly but change the job id on every retry. The cost of keeping Graphile's update is that a time sooner than its backoff waits for the backoff. Recording the failure and unlocking ourselves is not safe either: after the task returns, Graphile's success path deletes the row by id without checking the lock, and its failure path would add its backoff again if a worker in the same pool had already relocked the job.
 
 None of this makes external effects exactly-once: a process can crash after an effect but before its checkpoint. That limit belongs in user documentation, not in more machinery.
 

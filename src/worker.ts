@@ -29,7 +29,11 @@ import {
 	parseQueuePayload,
 	resolveEnqueueSpec
 } from './create-job.js'
-import { JobContinuedSignal, NonRetriableError } from './errors.js'
+import {
+	JobContinuedSignal,
+	NonRetriableError,
+	RetryAtError
+} from './errors.js'
 import {
 	extractCronMeta,
 	extractProducerLink,
@@ -39,7 +43,11 @@ import {
 } from './payload.js'
 import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
-import { continueJob, retainPermanentFailure } from './private-jobs.js'
+import {
+	continueJob,
+	retainPermanentFailure,
+	scheduleRetry
+} from './private-jobs.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
 
 export type TaskListRuntime<
@@ -196,6 +204,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 			let errorMessage: string | undefined
 			let permanent = false
 			let continued = false
+			let retryAt: Date | undefined
 
 			try {
 				assertPayloadEnvelope(payload)
@@ -225,12 +234,18 @@ async function executeTask(options: ExecuteTaskOptions) {
 			} catch (error) {
 				status = 'failed'
 				const durationMs = Date.now() - startTime
-				errorMessage = error instanceof Error ? error.message : String(error)
-				errorType = error instanceof Error ? error.name : 'Unknown'
+				// RetryAtError only carries scheduling; report what actually went wrong.
+				const reported =
+					error instanceof RetryAtError && error.cause !== undefined
+						? error.cause
+						: error
+				errorMessage =
+					reported instanceof Error ? reported.message : String(reported)
+				errorType = reported instanceof Error ? reported.name : 'Unknown'
 
 				span.setStatus({ code: statusCodes.ERROR, message: errorMessage })
 				span.recordException(
-					error instanceof Error ? error : new Error(String(error))
+					reported instanceof Error ? reported : new Error(String(reported))
 				)
 				span.setAttributes({
 					'graphile.duration_ms': durationMs,
@@ -243,7 +258,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 				if (permanent) {
 					await observe(runtime.hooks.onPermanentFailure, {
-						error,
+						error: reported,
 						queue: queueName,
 						jobId,
 						operation,
@@ -264,6 +279,9 @@ async function executeTask(options: ExecuteTaskOptions) {
 						error: errorMessage
 					})
 				}
+
+				if (!permanent && error instanceof RetryAtError)
+					retryAt = await scheduleRetry(helpers, runtime.schema, error.runAt)
 
 				if (isNonRetriable(error)) {
 					if (runtime.permanentFailure !== 'discard') {
@@ -288,6 +306,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					maxAttempts: helpers.job.max_attempts,
 					errorType,
 					errorMessage,
+					...(retryAt ? { retryAt } : {}),
 					...(continued ? { continued } : {})
 				})
 				const level = status === 'success' ? 'info' : 'error'
@@ -301,6 +320,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					duration_ms: durationMs,
 					status,
 					...(continued ? { continued } : {}),
+					...(retryAt ? { retry_at: retryAt.toISOString() } : {}),
 					...(errorType ? { error_type: errorType } : {}),
 					...(errorMessage === undefined
 						? {}

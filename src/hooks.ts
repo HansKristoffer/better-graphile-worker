@@ -43,6 +43,8 @@ export type JobFinishedEvent = {
 	errorType?: string | undefined
 	/** The failed attempt's error message, untrimmed. */
 	errorMessage?: string | undefined
+	/** The attempt threw `RetryAtError`; the next attempt runs at this time. */
+	retryAt?: Date
 	/** The run ended with `ctx.continue()`; a continuation job was enqueued. */
 	continued?: boolean
 }

@@ -5,6 +5,31 @@ export class NonRetriableError extends Error {
 	}
 }
 
+/**
+ * Throw from a handler to spend this attempt and run the next one no earlier than
+ * `runAt`. Pass the original error as `cause`: its name and message are what logs,
+ * hooks and Graphile's `last_error` record.
+ */
+export class RetryAtError extends Error {
+	readonly runAt: Date
+	constructor(runAt: Date | string, options?: ErrorOptions) {
+		const date = new Date(runAt)
+		if (!Number.isFinite(date.getTime()))
+			throw new RangeError('runAt must be a valid timestamp')
+		const cause = options?.cause
+		super(
+			cause instanceof Error
+				? cause.message
+				: cause === undefined
+					? `Retry at ${date.toISOString()}`
+					: String(cause),
+			options
+		)
+		this.name = 'RetryAtError'
+		this.runAt = date
+	}
+}
+
 export class UnknownQueueError extends Error {
 	constructor(
 		readonly queueName: string,

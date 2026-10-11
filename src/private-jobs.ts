@@ -19,6 +19,29 @@ export async function retainPermanentFailure(
 	// Throwing the original error lets Graphile persist last_error and release its lock.
 }
 
+/**
+ * Graphile's failure update sets `run_at = greatest(now(), run_at) + exp(least(attempts, 10))s`.
+ * Shifting run_at back by that backoff while we hold the lock makes the retry land on
+ * `runAt`, or on the default backoff when that is later. Returns the expected retry time.
+ */
+export async function scheduleRetry(
+	helpers: JobHelpers,
+	schema: string,
+	runAt: Date
+): Promise<Date> {
+	const backoff = `exp(least(attempts, 10)) * interval '1 second'`
+	const result = await helpers.withPgClient((client) =>
+		client.query<{ retry_at: Date }>(
+			`UPDATE ${quoteSchemaName(schema)}._private_jobs SET run_at = $3::timestamptz - ${backoff} WHERE id = $1::bigint AND locked_by = $2::text AND locked_at IS NOT NULL RETURNING greatest(now(), run_at) + ${backoff} AS retry_at`,
+			[helpers.job.id, helpers.job.locked_by, runAt]
+		)
+	)
+	const row = result.rows[0]
+	if (!row) throw new StepPersistenceError(String(helpers.job.id))
+	// Throwing the original error lets Graphile record it, spend the attempt and unlock.
+	return row.retry_at
+}
+
 export async function writeCheckpoint(
 	helpers: JobHelpers,
 	schema: string,
