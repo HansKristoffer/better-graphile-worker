@@ -204,18 +204,11 @@ export function createBetterWorker<
 	const jobOutcomes = resolveJobOutcomes(options.jobOutcomes, schema, (error) =>
 		logger.error('job.outcome.prune_failed', { error: String(error) })
 	)
-	let outcomesReady: Promise<void> | undefined
 	// Workers create the table on start too, so enabling the option cannot fail every job.
-	const ensureOutcomes = () => {
-		if (!jobOutcomes) return Promise.resolve()
-		outcomesReady ??= client
-			.migrate()
-			.then(() => migrateJobOutcomes(options.pgPool, schema))
-			.catch((error) => {
-				outcomesReady = undefined
-				throw error
-			})
-		return outcomesReady
+	const ensureOutcomes = async () => {
+		if (!jobOutcomes) return
+		await client.migrate()
+		await migrateJobOutcomes(options.pgPool, schema)
 	}
 	const runtime = {
 		hooks,

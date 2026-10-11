@@ -222,16 +222,13 @@ async function executeTask(options: ExecuteTaskOptions) {
 					continued = true
 				}
 				// Like a checkpoint, a completion that cannot be recorded fails the attempt.
-				if (
-					runtime.jobOutcomes &&
-					!continued &&
-					!(await recordJobOutcome(helpers, runtime.schema, {
+				if (runtime.jobOutcomes && !continued) {
+					const recorded = await recordJobOutcome(helpers, runtime.schema, {
 						state: 'completed',
-						error: null,
 						finish: true
-					}))
-				)
-					throw new StepPersistenceError(jobId)
+					})
+					if (!recorded) throw new StepPersistenceError(jobId)
+				}
 
 				const durationMs = Date.now() - startTime
 				span.setAttributes({ 'graphile.duration_ms': durationMs })
@@ -294,18 +291,18 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 				// The job row stays (or Graphile deletes it on discard), so these writes are best effort.
 				const recordFailure = async (finish: boolean) => {
-					if (runtime.jobOutcomes)
-						await recordJobOutcome(helpers, runtime.schema, {
-							state: 'failed',
-							error: errorMessage ?? null,
-							finish
-						}).catch((recordError) =>
-							ctx.logger.error('job.outcome.failed', {
-								queue: queueName,
-								job_id: jobId,
-								error: String(recordError)
-							})
-						)
+					if (!runtime.jobOutcomes) return
+					await recordJobOutcome(helpers, runtime.schema, {
+						state: 'failed',
+						error: errorMessage,
+						finish
+					}).catch((recordError) =>
+						ctx.logger.error('job.outcome.failed', {
+							queue: queueName,
+							job_id: jobId,
+							error: String(recordError)
+						})
+					)
 				}
 
 				if (isNonRetriable(error)) {

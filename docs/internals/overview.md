@@ -29,7 +29,7 @@ Every write there is conditioned on `locked_by` matching the current worker. A w
 - A continuation enqueues the next run and marks the current run as never-retry in one transaction. Otherwise a crash between the two could produce a retry next to the continuation.
 - Step checkpoints are patched atomically into the envelope and serialized per job. A failed checkpoint write is never treated as completed.
 - Retention exhausts the job's attempt budget and then rethrows the original error, so Graphile records the error and releases the lock itself.
-- With `jobOutcomes`, the worker completes successful jobs itself, replicating Graphile 0.17's `complete_jobs` (delete the row, release its lane) in the same statement as the outcome insert. Graphile's completion then deletes nothing. Recording after Graphile's completion could not be atomic, and recording before it would report a job as completed while a crash left it to run again. Failure outcomes need no such care because a failed job keeps its row, and `getJob` prefers the live row over the outcome.
+- With `jobOutcomes`, the worker completes successful jobs itself, replicating Graphile 0.17's `complete_jobs` (delete the row, release its lane) in the same statement as the outcome insert. Graphile's completion then deletes nothing. Recording after Graphile's completion could not be atomic, and recording before it would report a job as completed while a crash left it to run again. Failure outcomes are best effort, because a failed job keeps its row unless the queue discards it, and `getJob` prefers the live row over the outcome.
 
 None of this makes external effects exactly-once: a process can crash after an effect but before its checkpoint. That limit belongs in user documentation, not in more machinery.
 

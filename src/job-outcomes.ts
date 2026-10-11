@@ -86,7 +86,9 @@ export async function migrateJobOutcomes(
 		'SELECT to_regclass($1) IS NOT NULL AS exists',
 		[`${quoted}.${JOB_OUTCOMES_TABLE}`]
 	)
+	// Checked first so a role without CREATE can still start workers once the table exists.
 	if (exists.rows[0]?.exists) return
+
 	const client = await pgPool.connect()
 	try {
 		await client.query('BEGIN')
@@ -98,7 +100,7 @@ export async function migrateJobOutcomes(
 	job_id bigint PRIMARY KEY,
 	task_identifier text NOT NULL,
 	state text NOT NULL CHECK (state IN ('completed', 'failed', 'continued')),
-	continued_to bigint,
+	continued_to bigint CHECK ((state = 'continued') = (continued_to IS NOT NULL)),
 	attempts integer NOT NULL,
 	max_attempts integer NOT NULL,
 	last_error text,
@@ -140,8 +142,7 @@ export async function queryJob(
 	schema: string,
 	id: string
 ): Promise<JobState> {
-	if (typeof id !== 'string' || !/^[1-9][0-9]*$/.test(id))
-		throw new RangeError('Invalid job id')
+	if (!/^[1-9][0-9]*$/.test(id)) throw new RangeError('Invalid job id')
 	const quoted = quoteSchemaName(schema)
 	return utils.withPgClient(async (client) => {
 		const live = await client.query<LiveRow>(

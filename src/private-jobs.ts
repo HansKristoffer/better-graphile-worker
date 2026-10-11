@@ -21,8 +21,6 @@ export async function retainPermanentFailure(
 	// Throwing the original error lets Graphile persist last_error and release its lock.
 }
 
-type JobOutcomeState = 'completed' | 'failed' | 'continued'
-
 /**
  * Upserts the locked job's outcome. With `finish`, also completes the job the way
  * Graphile's complete_jobs does (delete it, release its lane) in the same statement;
@@ -33,14 +31,14 @@ async function writeOutcome(
 	helpers: JobHelpers,
 	schema: string,
 	outcome: {
-		state: JobOutcomeState
-		error: string | null
+		state: 'completed' | 'failed' | 'continued'
+		error?: string | undefined
 		continuedTo?: string
 		finish: boolean
 	}
 ): Promise<boolean> {
 	const quoted = quoteSchemaName(schema)
-	const finish = outcome.finish
+	const finishSql = outcome.finish
 		? `, deleted AS (
 	DELETE FROM ${quoted}._private_jobs jobs USING owned WHERE jobs.id = owned.id RETURNING jobs.job_queue_id
 ), unlocked AS (
@@ -63,13 +61,13 @@ async function writeOutcome(
 		attempts = excluded.attempts, max_attempts = excluded.max_attempts,
 		last_error = excluded.last_error, finished_at = now()
 	RETURNING job_id
-)${finish}
+)${finishSql}
 SELECT count(*)::int AS recorded FROM recorded`,
 		[
 			helpers.job.id,
 			helpers.job.locked_by,
 			outcome.state,
-			outcome.error,
+			outcome.error ?? null,
 			outcome.continuedTo ?? null
 		]
 	)
@@ -81,7 +79,7 @@ export function recordJobOutcome(
 	schema: string,
 	outcome: {
 		state: 'completed' | 'failed'
-		error: string | null
+		error?: string | undefined
 		finish: boolean
 	}
 ): Promise<boolean> {
@@ -192,7 +190,6 @@ FOR UPDATE OF jobs`,
 				recordOutcome &&
 				!(await writeOutcome(client, helpers, schema, {
 					state: 'continued',
-					error: null,
 					continuedTo: id,
 					finish: true
 				}))

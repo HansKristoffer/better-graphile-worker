@@ -98,7 +98,7 @@ suite('durable job outcomes', () => {
 		expect(exists.rows[0].name).toBeNull()
 	})
 
-	test('records completions atomically, releases serial lanes, and prunes expired rows', async () => {
+	test('records completions, releases serial lanes and prunes expired rows', async () => {
 		await worker.migrate()
 		seenWhileRunning.length = 0
 		await pool.query(
@@ -198,6 +198,6 @@ suite('durable job outcomes', () => {
 			state: 'not_found',
 			id: '987654321'
 		})
-		expect(client.getJob('1; DROP')).rejects.toThrow(RangeError)
+		await expect(client.getJob('1; DROP')).rejects.toThrow(RangeError)
 	})
 })
