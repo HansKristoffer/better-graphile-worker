@@ -23,7 +23,7 @@ import {
 	type OtelApi
 } from './otel.js'
 import { observe } from './observers.js'
-import { assertInteger, assertJsonValue } from './validation.js'
+import { assertInteger, assertJsonValue, parseDuration } from './validation.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -32,10 +32,19 @@ import type {
 	PrepareJobFn,
 	PrepareJobsFn
 } from './types.js'
-import { addJobSql, addJobsSql } from './enqueue-sql.js'
+import {
+	addIdempotentJobsSql,
+	addJobSql,
+	addJobsSql,
+	type IdempotentJobSpec
+} from './enqueue-sql.js'
 import { assertValidSchemaName } from './schema-name.js'
 
 export const DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS = 4
+const DEFAULT_IDEMPOTENCY_TTL = 30 * 86_400_000
+/** A Graphile task spec plus an idempotency key and its TTL in milliseconds. */
+export type EnqueueSpec = TaskSpec &
+	Pick<IdempotentJobSpec, 'idempotencyKey' | 'idempotencyTtl'>
 export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	queues: T
 	enqueue: EnqueueAdapter
@@ -84,7 +93,7 @@ function deriveOptions(
 		throw new TypeError(
 			`deriveJobOptions for "${queue.name}" must return a plain object synchronously`
 		)
-	for (const key of ['queueName', 'jobKey'] as const)
+	for (const key of ['queueName', 'jobKey', 'idempotencyKey'] as const)
 		if (
 			derived[key] !== undefined &&
 			(typeof derived[key] !== 'string' || !derived[key])
@@ -114,8 +123,22 @@ function deriveOptions(
 		jobKey: derived.jobKey,
 		jobKeyMode: derived.jobKeyMode,
 		priority: derived.priority,
-		flags: derived.flags
+		flags: derived.flags,
+		idempotencyKey: derived.idempotencyKey,
+		idempotencyTtl: derived.idempotencyTtl
 	})
+}
+
+/** The idempotent path calls add_job per item, so each keyed spec carries the batch mode. */
+function withBatchKeyMode(
+	specs: readonly IdempotentJobSpec[],
+	preserveRunAt: boolean
+): IdempotentJobSpec[] {
+	return specs.map((spec) =>
+		preserveRunAt && spec.jobKey !== undefined
+			? { ...spec, jobKeyMode: 'preserve_run_at' }
+			: spec
+	)
 }
 
 export function resolveEnqueueSpec(
@@ -124,7 +147,7 @@ export function resolveEnqueueSpec(
 	defaultMaxAttempts: number,
 	cron = false,
 	derived?: DerivedJobOptions
-): TaskSpec {
+): EnqueueSpec {
 	// Precedence: explicit call options, derived options, then queue defaults.
 	const options: JobOptions | undefined = derived
 		? { ...derived, ...compact(explicit ?? {}) }
@@ -140,6 +163,17 @@ export function resolveEnqueueSpec(
 	if (priority !== undefined) assertInteger(priority, 'priority', -32768, 32767)
 	if (options?.runAt && !Number.isFinite(new Date(options.runAt).getTime()))
 		throw new RangeError('runAt must be a valid timestamp')
+	const idempotencyKey = options?.idempotencyKey
+	if (
+		idempotencyKey !== undefined &&
+		(typeof idempotencyKey !== 'string' || !idempotencyKey)
+	)
+		throw new TypeError('idempotencyKey must be a non-empty string')
+	// A TTL without a key is validated but has nothing to hold.
+	const idempotencyTtl =
+		options?.idempotencyTtl === undefined
+			? DEFAULT_IDEMPOTENCY_TTL
+			: parseDuration(options.idempotencyTtl, 'idempotencyTtl')
 	return compact({
 		maxAttempts,
 		priority,
@@ -154,7 +188,9 @@ export function resolveEnqueueSpec(
 			resolveSerialQueueName(queue.serial, queue.name),
 		runAt: options?.runAt,
 		jobKey: options?.jobKey ?? cronOptions?.jobKey,
-		jobKeyMode: options?.jobKeyMode ?? cronOptions?.jobKeyMode
+		jobKeyMode: options?.jobKeyMode ?? cronOptions?.jobKeyMode,
+		idempotencyKey,
+		idempotencyTtl: idempotencyKey === undefined ? undefined : idempotencyTtl
 	})
 }
 
@@ -182,6 +218,13 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			if (queue.cronOptions?.backfillPeriod !== undefined)
 				assertInteger(queue.cronOptions.backfillPeriod, 'backfillPeriod', 0)
 		}
+	}
+	function enqueueIdempotent(specs: readonly IdempotentJobSpec[]) {
+		if (!options.enqueue.addIdempotentJobs)
+			throw new TypeError(
+				'idempotencyKey requires an enqueue adapter with addIdempotentJobs'
+			)
+		return options.enqueue.addIdempotentJobs(specs)
 	}
 	function find(name: string) {
 		const queue = registry.get(name)
@@ -274,12 +317,13 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			)
 		if (
 			jobOptions?.jobKeyMode !== undefined ||
-			jobOptions?.jobKey !== undefined
+			jobOptions?.jobKey !== undefined ||
+			jobOptions?.idempotencyKey !== undefined
 		)
 			throw new Error(
-				'createJobs cannot use jobKey or jobKeyMode; derive per-item keys with deriveJobOptions'
+				'createJobs cannot use jobKey, jobKeyMode or idempotencyKey; derive per-item keys with deriveJobOptions'
 			)
-		const specs: AddJobsJobSpec[] = []
+		const specs: (AddJobsJobSpec & EnqueueSpec)[] = []
 		resolveEnqueueSpec(queue, jobOptions, defaultMaxAttempts)
 		const keys = new Map<string, number>()
 		let keyMode: string | undefined
@@ -309,7 +353,11 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			}
 			specs.push({ identifier: name, ...spec, payload })
 		}
-		return { specs, preserveRunAt: keyMode === 'preserve_run_at' }
+		return {
+			specs,
+			preserveRunAt: keyMode === 'preserve_run_at',
+			idempotent: specs.some((spec) => spec.idempotencyKey !== undefined)
+		}
 	}
 	async function enqueueOne(
 		name: string,
@@ -331,11 +379,19 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 					'job.batch': false,
 					'job.max_attempts': spec.maxAttempts ?? defaultMaxAttempts
 				})
-				const job = await options.enqueue.addJob(
-					task,
-					injectTraceContext(payload, api),
-					spec
-				)
+				const traced = injectTraceContext(payload, api)
+				if (spec.idempotencyKey !== undefined) {
+					const [job] = await enqueueIdempotent([
+						{ identifier: task, payload: traced, ...spec }
+					])
+					if (!job) throw new Error('Idempotent enqueue returned no job')
+					span.setAttributes({
+						'job.id': job.id,
+						'job.deduplicated': job.deduplicated
+					})
+					return job.id
+				}
+				const job = await options.enqueue.addJob(task, traced, spec)
 				span.setAttribute('job.id', String(job.id))
 				return String(job.id)
 			})
@@ -348,7 +404,11 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	): Promise<string[]> {
 		return observed(name, async () => {
 			if (hooks.shouldSkipEnqueue?.()) return []
-			const { specs, preserveRunAt } = await resolveMany(name, data, jobOptions)
+			const { specs, preserveRunAt, idempotent } = await resolveMany(
+				name,
+				data,
+				jobOptions
+			)
 			return producerSpan(`createJobs: ${name}`, async (span) => {
 				span.setAttributes({
 					'job.queue': name,
@@ -356,14 +416,24 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 					'job.batch_size': data.length
 				})
 				if (!specs.length) return []
-				const jobs = await options.enqueue.addJobs(
-					specs.map((spec) => ({
-						...spec,
-						payload: injectTraceContext(spec.payload, api)
-					})),
-					preserveRunAt
-				)
-				const ids = jobs.map((job) => String(job.id))
+				const traced = specs.map((spec) => ({
+					...spec,
+					payload: injectTraceContext(spec.payload, api)
+				}))
+				let ids: string[]
+				if (idempotent) {
+					const jobs = await enqueueIdempotent(
+						withBatchKeyMode(traced, preserveRunAt)
+					)
+					ids = jobs.map((job) => job.id)
+					span.setAttribute(
+						'job.deduplicated_count',
+						jobs.filter((job) => job.deduplicated).length
+					)
+				} else {
+					const jobs = await options.enqueue.addJobs(traced, preserveRunAt)
+					ids = jobs.map((job) => String(job.id))
+				}
 				span.setAttribute('job.created_count', ids.length)
 				if (ids.length <= 50) span.setAttribute('job.ids', ids.join(','))
 				return ids
@@ -385,10 +455,15 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			)
 			return producerSpan(`prepareJob: ${task}`, async (span) => {
 				span.setAttributes({ 'job.queue': task, 'job.batch': false })
+				const traced = injectTraceContext(payload, api)
 				return {
 					queue: task,
 					skipped: false,
-					...addJobSql(schema, task, injectTraceContext(payload, api), spec)
+					...(spec.idempotencyKey === undefined
+						? addJobSql(schema, task, traced, spec)
+						: addIdempotentJobsSql(schema, [
+								{ identifier: task, payload: traced, ...spec }
+							]))
 				}
 			})
 		})
@@ -400,7 +475,11 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	): Promise<PreparedJob> {
 		return observed(name, async () => {
 			if (hooks.shouldSkipEnqueue?.()) return skippedJob(name)
-			const { specs, preserveRunAt } = await resolveMany(name, data, jobOptions)
+			const { specs, preserveRunAt, idempotent } = await resolveMany(
+				name,
+				data,
+				jobOptions
+			)
 			if (!specs.length) return { ...skippedJob(name), skipped: false }
 			return producerSpan(`prepareJobs: ${name}`, async (span) => {
 				span.setAttributes({
@@ -408,17 +487,19 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 					'job.batch': true,
 					'job.batch_size': data.length
 				})
+				const traced = specs.map((spec) => ({
+					...spec,
+					payload: injectTraceContext(spec.payload, api)
+				}))
 				return {
 					queue: name,
 					skipped: false,
-					...addJobsSql(
-						schema,
-						specs.map((spec) => ({
-							...spec,
-							payload: injectTraceContext(spec.payload, api)
-						})),
-						preserveRunAt
-					)
+					...(idempotent
+						? addIdempotentJobsSql(
+								schema,
+								withBatchKeyMode(traced, preserveRunAt)
+							)
+						: addJobsSql(schema, traced, preserveRunAt))
 				}
 			})
 		})

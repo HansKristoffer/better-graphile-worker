@@ -46,7 +46,7 @@ export type {
 	CronQueueName,
 	JobOptions
 } from './types.js'
-export type { StopOptions } from './job-options.js'
+export type { Duration, StopOptions } from './job-options.js'
 export {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA,

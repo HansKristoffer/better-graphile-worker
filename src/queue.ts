@@ -2,6 +2,7 @@ import type { CronItemOptions, CronMatcher, JobHelpers } from 'graphile-worker'
 import type z from 'zod'
 import type { JobLogger, JobSpan } from './hooks.js'
 import type { JobStep } from './steps.js'
+import type { Duration } from './job-options.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -34,6 +35,8 @@ export type DerivedJobOptions = {
 	jobKeyMode?: 'replace' | 'preserve_run_at' | 'unsafe_dedupe'
 	priority?: number
 	flags?: readonly string[]
+	idempotencyKey?: string
+	idempotencyTtl?: Duration
 }
 
 export type JobCronMeta = {
