@@ -1,11 +1,11 @@
-import type { Pool } from 'pg'
+import type { Pool, PoolClient } from 'pg'
 import type { JobLogger } from './hooks.js'
 import { releaseJobsLockedBy } from './private-jobs.js'
 import { quoteSchemaName } from './schema-name.js'
 import { assertInteger } from './validation.js'
 
 export type CrashRecoveryOptions = {
-	/** How often each running worker records that it is alive, in ms. Default 30 seconds. */
+	/** How often each started worker records that it is alive, in ms. Default 30 seconds. */
 	heartbeatInterval?: number
 	/**
 	 * How old a heartbeat must be before its worker counts as dead, in ms. Default 5
@@ -18,12 +18,13 @@ export type CrashRecoveryOptions = {
 const HEARTBEATS = '_bgw_worker_heartbeats'
 const MAX_TIMER = 2147483647
 
+/** On unless explicitly disabled. */
 export function resolveCrashRecovery(
 	option: boolean | CrashRecoveryOptions | undefined
 ) {
-	if (!option) return undefined
+	if (option === false) return undefined
 	const { heartbeatInterval = 30_000, staleAfter = 300_000 } =
-		option === true ? {} : option
+		option === true || option === undefined ? {} : option
 	assertInteger(
 		heartbeatInterval,
 		'crashRecovery.heartbeatInterval',
@@ -61,12 +62,11 @@ export async function ensureHeartbeatTable(
  * lets every live worker sweep without two of them releasing the same worker.
  */
 export async function sweepDeadWorkers(
-	pgPool: Pool,
+	client: PoolClient,
 	schema: string,
 	staleAfter: number
 ) {
 	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
-	const client = await pgPool.connect()
 	try {
 		await client.query('BEGIN')
 		const dead = await client.query<{ worker_id: string }>(
@@ -86,14 +86,13 @@ export async function sweepDeadWorkers(
 	} catch (error) {
 		await client.query('ROLLBACK').catch(() => {})
 		throw error
-	} finally {
-		client.release()
 	}
 }
 
 /**
  * Heartbeat for one Graphile worker pool (its id is the jobs' locked_by), sweeping dead
- * workers after each beat. It runs on the worker's own event loop, beside its jobs.
+ * workers after each beat. It runs on the worker's own event loop, beside its jobs, but
+ * holds its own pool connection so jobs holding every other one cannot starve it.
  * `ready` settles after the first beat; jobs wait for it so none can do work (and crash
  * the process) before its worker is registered.
  */
@@ -109,12 +108,38 @@ export function startHeartbeat(options: {
 	let registered = false
 	let stopped = false
 	let timer: ReturnType<typeof setTimeout> | undefined
+	let held: PoolClient | undefined
+	async function connection() {
+		if (held) return held
+		const client = await pgPool.connect()
+		// A held client has no pool listener; an unhandled 'error' would crash the process.
+		client.on('error', (error) => discard(client, error))
+		held = client
+		return client
+	}
+	function discard(client: PoolClient, error: Error) {
+		if (held !== client) return
+		held = undefined
+		client.release(error)
+	}
+	// Reconnect on the next beat after any failure rather than reusing a suspect client.
+	async function withConnection<T>(work: (client: PoolClient) => Promise<T>) {
+		const client = await connection()
+		try {
+			return await work(client)
+		} catch (error) {
+			discard(client, error instanceof Error ? error : new Error(String(error)))
+			throw error
+		}
+	}
 	async function beat() {
-		const result = await pgPool.query<{ inserted: boolean }>(
-			`INSERT INTO ${table} (worker_id, last_seen_at) VALUES ($1, now())
+		const result = await withConnection((client) =>
+			client.query<{ inserted: boolean }>(
+				`INSERT INTO ${table} (worker_id, last_seen_at) VALUES ($1, now())
 ON CONFLICT (worker_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
 RETURNING xmax = 0 AS inserted`,
-			[workerId]
+				[workerId]
+			)
 		)
 		if (registered && result.rows[0]?.inserted)
 			logger.error('worker.crash_recovery.presumed_dead', {
@@ -136,10 +161,8 @@ RETURNING xmax = 0 AS inserted`,
 	}
 	async function sweep() {
 		try {
-			const { workerIds, jobIds } = await sweepDeadWorkers(
-				pgPool,
-				schema,
-				config.staleAfter
+			const { workerIds, jobIds } = await withConnection((client) =>
+				sweepDeadWorkers(client, schema, config.staleAfter)
 			)
 			// Stopped workers leave their row behind; only released jobs are news.
 			if (jobIds.length)
@@ -170,6 +193,8 @@ RETURNING xmax = 0 AS inserted`,
 			stopped = true
 			clearTimeout(timer)
 			await pending
+			held?.release()
+			held = undefined
 		}
 	}
 }

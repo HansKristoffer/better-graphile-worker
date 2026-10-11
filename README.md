@@ -169,7 +169,7 @@ Immediate enqueue rejects missing Graphile results, but successful peers in a ba
 
 Re-adding a key held by a running job clears that job's key and exhausts its attempts, so it will not be retried if it later fails. Only the job's own continuation should reuse its key. If another producer has already replaced a running job's key, its continuation remains unkeyed and does not overwrite the replacement.
 
-`process` limits an instance to some queues (and their cron schedules) while enqueueing still covers all of them, so separate instances give workloads their own concurrency. Two instances with disjoint lists never schedule the same cron. `runOnce()` follows the same list. Contract-mode workers still need handlers for every queue. Size a shared pool for `Σ concurrency + 1 LISTEN connection per instance + producer headroom`.
+`process` limits an instance to some queues (and their cron schedules) while enqueueing still covers all of them, so separate instances give workloads their own concurrency. Two instances with disjoint lists never schedule the same cron. `runOnce()` follows the same list. Contract-mode workers still need handlers for every queue. Size a shared pool for `Σ concurrency + 2 per started instance (LISTEN and crash-recovery heartbeat) + producer headroom`.
 
 ```ts
 const exportsWorker = createBetterWorker({ pgPool, queues, process: ['exportRun'], concurrency: 2 })
@@ -177,27 +177,27 @@ const apiWorker = createBetterWorker({ pgPool, queues, process: ['advanceRun'], 
 await Promise.all([exportsWorker.start(), apiWorker.start()])
 ```
 
-After a hard crash (OOM, `SIGKILL`), Graphile keeps a job and its serial lane locked for at least 4 hours, until its periodic stale-lock scan runs. Keep individual executions below 4 hours as well: Graphile can reclaim a live job beyond that threshold. Short slices and graceful shutdown reduce how often that happens; they do not unlock it sooner.
+Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold.
 
 ### Crash recovery
 
-`crashRecovery` releases a crashed worker's jobs within minutes instead of hours. It is off by default.
+On its own, Graphile keeps a job and its serial lane locked for at least 4 hours after a hard crash (OOM, `SIGKILL`). Started workers shorten that to about `staleAfter`, 5 minutes by default.
 
 ```ts
 const worker = createBetterWorker({
   pgPool,
   queues,
-  crashRecovery: { heartbeatInterval: 30_000, staleAfter: 300_000 } // or `true` for these defaults
+  crashRecovery: { heartbeatInterval: 30_000, staleAfter: 300_000 } // the defaults; `false` turns it off
 })
 ```
 
 Each started worker records a heartbeat every `heartbeatInterval` milliseconds and, after each one, looks for workers whose last heartbeat is older than `staleAfter`. The sweep unlocks their jobs and lanes with the error `Worker <pool id> stopped sending heartbeats (crashed or blocked); released by crash recovery`, and Graphile retries them with its normal backoff. The crashed run keeps its attempt, so a job that keeps running out of memory eventually fails permanently and shows up as failed in `listJobs`. `onPermanentFailure` does not fire for it, because no handler ran; watch for `worker.crash_recovery.released` warnings in your logs. Any number of instances can sweep at once.
 
-The risk is a worker that is alive but cannot heartbeat for `staleAfter`. It looks dead, so its job runs twice. The heartbeat shares the job's event loop and pool, so it stops when a handler blocks the event loop synchronously (CPU-bound work, synchronous I/O) or when every pool connection is held by jobs. Keep `staleAfter` well above your longest synchronous stretch and give the pool a spare connection per instance. A worker that comes back logs `worker.crash_recovery.presumed_dead`. When it finishes the job, Graphile deletes it, even if another worker is still running it. `staleAfter` must be at least three heartbeat intervals.
+The risk is a worker that is alive but cannot heartbeat for `staleAfter`. It looks dead, so its job runs a second time while the first run is still going, even in a serial lane. The heartbeat holds its own pool connection, so busy jobs cannot starve it, but it shares the event loop with your handlers. A handler that blocks the event loop synchronously (CPU-bound work, synchronous I/O) for `staleAfter` stops it. Keep `staleAfter` well above your longest synchronous stretch, or turn crash recovery off for that worker. A worker that comes back logs `worker.crash_recovery.presumed_dead`. When it finishes the job, Graphile deletes it, even if another worker is still running it. `staleAfter` must be at least three heartbeat intervals.
 
-- Only workers started with `crashRecovery` heartbeat. Jobs held by other workers, including `runOnce()`, are left to Graphile's 4-hour scan, so enable it on every instance.
+- Only started workers heartbeat. Jobs held by `runOnce()`, by workers with `crashRecovery: false` or by workers on an older version of this library are left to Graphile's 4-hour scan.
 - Handlers wait for the worker's first heartbeat before they run.
-- The heartbeat table, `_bgw_worker_heartbeats` in the Graphile schema, is created by `migrate()`. A worker with `crashRecovery` also creates it on start if it is missing. Stopped workers leave their row; a later sweep removes it.
+- The heartbeat table, `_bgw_worker_heartbeats` in the Graphile schema, is created by `migrate()`. A worker also creates it on start if it is missing. If the worker's role cannot, the worker logs `worker.crash_recovery.disabled` and runs without crash recovery; with `crashRecovery` set explicitly, `start()` fails instead. Stopped workers leave their row; a later sweep removes it.
 
 ## Payloads and failure policy
 

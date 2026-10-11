@@ -33,13 +33,11 @@ await createBetterWorker({
 }).start()`
 
 describe('crash recovery options', () => {
-	test('is off unless enabled and defaults conservatively', () => {
-		expect(resolveCrashRecovery(undefined)).toBeUndefined()
+	test('is on with conservative defaults unless turned off', () => {
+		const defaults = { heartbeatInterval: 30_000, staleAfter: 300_000 }
+		expect(resolveCrashRecovery(undefined)).toEqual(defaults)
+		expect(resolveCrashRecovery(true)).toEqual(defaults)
 		expect(resolveCrashRecovery(false)).toBeUndefined()
-		expect(resolveCrashRecovery(true)).toEqual({
-			heartbeatInterval: 30_000,
-			staleAfter: 300_000
-		})
 	})
 
 	test('rejects a threshold that tolerates fewer than two missed heartbeats', () => {
@@ -81,6 +79,14 @@ suite('crash recovery in PostgreSQL', () => {
 			WHERE id = (SELECT job_queue_id FROM ${q}._private_jobs WHERE id = $1)`,
 			[id, workerId]
 		)
+	}
+	const sweep = async () => {
+		const client = await pool.connect()
+		try {
+			return await sweepDeadWorkers(client, schema, 60_000)
+		} finally {
+			client.release()
+		}
 	}
 	const beatAs = (workerId: string, age: string) =>
 		pool.query(
@@ -125,7 +131,7 @@ suite('crash recovery in PostgreSQL', () => {
 		await beatAs('pool-dead', '1 hour')
 		await beatAs('pool-alive', '0 seconds')
 
-		const swept = await sweepDeadWorkers(pool, schema, 60_000)
+		const swept = await sweep()
 
 		expect(swept).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
 		expect(await job(dead!)).toEqual({
@@ -153,11 +159,53 @@ suite('crash recovery in PostgreSQL', () => {
 		await lockAs(id!, 'pool-oom')
 		await beatAs('pool-oom', '1 hour')
 
-		await sweepDeadWorkers(pool, schema, 60_000)
+		await sweep()
 
 		const [failed] = await worker.listJobs({ state: 'failed' })
 		expect(failed?.id).toBe(id!)
 		expect(failed?.lastError).toBe(released('pool-oom'))
+	})
+
+	test('the default starts without recovery when the role cannot create the table', async () => {
+		const role = `bgw_limited_${process.pid}`
+		const url = new URL(process.env.DATABASE_URL!)
+		url.username = role
+		url.password = role
+		await pool.query(`DROP TABLE ${q}._bgw_worker_heartbeats`)
+		await pool.query(`CREATE ROLE ${role} LOGIN BYPASSRLS PASSWORD '${role}'`)
+		await pool.query(`GRANT USAGE ON SCHEMA ${q} TO ${role}`)
+		await pool.query(`GRANT ALL ON ALL TABLES IN SCHEMA ${q} TO ${role}`)
+		await pool.query(`GRANT ALL ON ALL SEQUENCES IN SCHEMA ${q} TO ${role}`)
+		const limited = new Pool({ connectionString: url.href })
+		limited.on('error', () => {})
+		const warnings: string[] = []
+		const workerAs = (crashRecovery?: boolean) =>
+			createBetterWorker({
+				pgPool: limited,
+				schema,
+				queues: contracts,
+				...(crashRecovery === undefined ? {} : { crashRecovery }),
+				hooks: {
+					createLogger: () => ({ ...quiet, warn: (m) => void warnings.push(m) })
+				},
+				handlers: { sync: async () => {} }
+			})
+		try {
+			const byDefault = workerAs()
+			await byDefault.start()
+			await byDefault.stop()
+			expect(warnings).toContain('worker.crash_recovery.disabled')
+
+			await expect(workerAs(true).start()).rejects.toMatchObject({
+				code: '42501',
+				message: expect.stringContaining('permission denied for schema')
+			})
+		} finally {
+			await limited.end()
+			await pool.query(`DROP OWNED BY ${role}`)
+			await pool.query(`DROP ROLE ${role}`)
+			await worker.migrate()
+		}
 	})
 
 	test('a live worker retries the job and lane of a SIGKILLed worker', async () => {

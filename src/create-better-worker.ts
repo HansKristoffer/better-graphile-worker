@@ -85,7 +85,8 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	process?: readonly NoInfer<QueueName<TQueues>>[]
 	/**
 	 * Heartbeat this worker and release jobs (and lanes) held by workers that stopped
-	 * heartbeating, instead of waiting for Graphile's 4-hour stale-lock scan. Opt-in.
+	 * heartbeating, instead of waiting for Graphile's 4-hour stale-lock scan. On by
+	 * default; `false` turns it off.
 	 */
 	crashRecovery?: boolean | CrashRecoveryOptions | undefined
 }
@@ -217,11 +218,28 @@ export function createBetterWorker<
 		heartbeatReady: () => heartbeat?.ready
 	}
 
+	async function prepareCrashRecovery() {
+		if (!crashRecovery) return undefined
+		try {
+			await ensureHeartbeatTable(options.pgPool, schema)
+			return crashRecovery
+		} catch (error) {
+			// The default must not break a locked-down role that upgraded without migrate().
+			const cannotCreate = (error as { code?: string }).code === '42501'
+			if (options.crashRecovery !== undefined || !cannotCreate) throw error
+			logger.warn('worker.crash_recovery.disabled', {
+				reason:
+					'The heartbeat table is missing and this role cannot create it; run migrate()'
+			})
+			return undefined
+		}
+	}
+
 	const lifecycle = createLifecycle({
 		start: async () => {
 			logger.info('Starting graphile-worker')
 			logRegisteredQueues(queues, logger)
-			if (crashRecovery) await ensureHeartbeatTable(options.pgPool, schema)
+			const recovery = await prepareCrashRecovery()
 			const runner = await startRunner({
 				pgPool: options.pgPool,
 				schema,
@@ -232,13 +250,13 @@ export function createBetterWorker<
 				noHandleSignals: true,
 				graphile: options.graphile,
 				onPoolCreate:
-					crashRecovery &&
+					recovery &&
 					((workerId) => {
 						heartbeat = startHeartbeat({
 							pgPool: options.pgPool,
 							schema,
 							workerId,
-							config: crashRecovery,
+							config: recovery,
 							logger
 						})
 					})
