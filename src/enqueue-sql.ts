@@ -110,7 +110,7 @@ export type IdempotentJobSpec = Omit<AddJobsJobSpec, 'jobKeyMode'> &
 		idempotencyTtl?: number
 	}
 
-export const IDEMPOTENCY_KEYS_TABLE = 'bgw_idempotency_keys'
+const IDEMPOTENCY_KEYS_TABLE = 'bgw_idempotency_keys'
 const ADD_JOBS_FUNCTION = 'bgw_add_jobs'
 
 /**
@@ -143,13 +143,13 @@ export function addIdempotentJobsSql(
 	}
 }
 
+// ponytail: each call prunes at most 100 expired keys; add a periodic sweep if keys outpace keyed enqueues.
 /**
  * Creates the idempotency table and its enqueue function. Must run after Graphile's own
  * migration. A key row is claimed with INSERT ... ON CONFLICT, which waits for a concurrent
  * claimer to commit, so concurrent producers create one job. The job id is written in a
  * later statement, which is why this is a function and not one prepared statement.
  */
-// ponytail: each call prunes at most 100 expired keys; add a periodic sweep if keys outpace keyed enqueues.
 export function idempotencyMigrationSql(schema: string): string {
 	const quoted = quoteSchemaName(schema)
 	const table = `${quoted}.${IDEMPOTENCY_KEYS_TABLE}`

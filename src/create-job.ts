@@ -43,7 +43,7 @@ import { assertValidSchemaName } from './schema-name.js'
 export const DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS = 4
 const DEFAULT_IDEMPOTENCY_TTL = 30 * 86_400_000
 /** A Graphile task spec plus an idempotency key and its TTL in milliseconds. */
-export type EnqueueSpec = TaskSpec &
+type EnqueueSpec = TaskSpec &
 	Pick<IdempotentJobSpec, 'idempotencyKey' | 'idempotencyTtl'>
 export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	queues: T
