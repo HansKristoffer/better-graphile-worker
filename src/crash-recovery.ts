@@ -15,14 +15,12 @@ export type CrashRecoveryOptions = {
 	staleAfter?: number
 }
 
-export type ResolvedCrashRecovery = Required<CrashRecoveryOptions>
-
 const HEARTBEATS = '_bgw_worker_heartbeats'
 const MAX_TIMER = 2147483647
 
 export function resolveCrashRecovery(
 	option: boolean | CrashRecoveryOptions | undefined
-): ResolvedCrashRecovery | undefined {
+) {
 	if (!option) return undefined
 	const { heartbeatInterval = 30_000, staleAfter = 300_000 } =
 		option === true ? {} : option
@@ -32,12 +30,7 @@ export function resolveCrashRecovery(
 		1,
 		MAX_TIMER
 	)
-	assertInteger(
-		staleAfter,
-		'crashRecovery.staleAfter',
-		3 * heartbeatInterval,
-		Number.MAX_SAFE_INTEGER
-	)
+	assertInteger(staleAfter, 'crashRecovery.staleAfter', 3 * heartbeatInterval)
 	return { heartbeatInterval, staleAfter }
 }
 
@@ -71,7 +64,7 @@ export async function sweepDeadWorkers(
 	pgPool: Pool,
 	schema: string,
 	staleAfter: number
-): Promise<{ workerIds: string[]; jobIds: string[] }> {
+) {
 	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
 	const client = await pgPool.connect()
 	try {
@@ -108,9 +101,9 @@ export function startHeartbeat(options: {
 	pgPool: Pool
 	schema: string
 	workerId: string
-	config: ResolvedCrashRecovery
+	config: Required<CrashRecoveryOptions>
 	logger: JobLogger
-}): { ready: Promise<void>; stop(): Promise<void> } {
+}) {
 	const { pgPool, schema, workerId, config, logger } = options
 	const table = `${quoteSchemaName(schema)}.${HEARTBEATS}`
 	let registered = false
@@ -168,7 +161,7 @@ RETURNING xmax = 0 AS inserted`,
 		timer = setTimeout(() => {
 			pending = beatSafely().then(sweep).then(schedule)
 		}, config.heartbeatInterval)
-		timer.unref?.()
+		timer.unref()
 	}
 	void pending.then(schedule)
 	return {

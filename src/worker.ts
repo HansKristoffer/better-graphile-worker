@@ -531,10 +531,11 @@ export async function startRunner(options: {
 	const events =
 		graphile?.events ??
 		graphile?.preset?.worker?.events ??
-		(onPoolCreate ? (new EventEmitter() as WorkerEvents) : undefined)
+		(new EventEmitter() as WorkerEvents)
 	const listener = ({ workerPool }: { workerPool: { id: string } }) =>
 		onPoolCreate?.(workerPool.id)
-	if (onPoolCreate) events?.on('pool:create', listener)
+	events.on('pool:create', listener)
+
 	try {
 		return await run(
 			compact({
@@ -551,7 +552,7 @@ export async function startRunner(options: {
 		)
 	} finally {
 		// run() emits pool:create synchronously before it resolves.
-		if (onPoolCreate) events?.off('pool:create', listener)
+		events.off('pool:create', listener)
 	}
 }
 

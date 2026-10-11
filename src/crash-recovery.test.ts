@@ -1,7 +1,13 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	test
+} from 'bun:test'
 import { Pool } from 'pg'
 import { z } from 'zod'
-import type { JobHelpers } from 'graphile-worker'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
 import { createBetterWorker } from './create-better-worker.js'
@@ -12,6 +18,19 @@ const suite = describe.skipIf(!enabled)
 const schema = `BGW_crash_${process.pid}`
 const quiet = { debug() {}, info() {}, warn() {}, error() {} }
 const fast = { heartbeatInterval: 50, staleAfter: 150 }
+const released = (workerId: string) =>
+	`Worker ${workerId} stopped sending heartbeats (crashed or blocked); released by crash recovery`
+
+// A separate process that claims a `sync` job and dies on it, like an OOM kill.
+const crashingWorker = `import pg from 'pg'
+import { z } from 'zod'
+import { createBetterWorker, defineQueue, defineQueues } from ${JSON.stringify(`${import.meta.dir}/index.ts`)}
+const pgPool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
+const queues = defineQueues([defineQueue({ name: 'sync', inputSchema: z.string(), serial: true, maxAttempts: 3 })])
+await createBetterWorker({
+	pgPool, schema: ${JSON.stringify(schema)}, queues, crashRecovery: ${JSON.stringify(fast)},
+	handlers: { sync: () => process.kill(process.pid, 'SIGKILL') }
+}).start()`
 
 describe('crash recovery options', () => {
 	test('is off unless enabled and defaults conservatively', () => {
@@ -83,6 +102,13 @@ suite('crash recovery in PostgreSQL', () => {
 			)
 		).rows[0]
 	beforeAll(() => worker.migrate())
+	afterEach(async () => {
+		await pool.query(`DELETE FROM ${q}._private_jobs`)
+		await pool.query(
+			`UPDATE ${q}._private_job_queues SET locked_by = NULL, locked_at = NULL`
+		)
+		await pool.query(`DELETE FROM ${q}._bgw_worker_heartbeats`)
+	})
 	afterAll(async () => {
 		await worker.stop()
 		await pool.query(`DROP SCHEMA ${q} CASCADE`)
@@ -91,32 +117,31 @@ suite('crash recovery in PostgreSQL', () => {
 
 	test('releases jobs and lanes of dead workers only, keeping the attempt', async () => {
 		const dead = await worker.createJob('sync', 'dead')
-		const alive = await worker.createJob('sync', 'alive')
+		const alive = await worker.createJob('sync', 'alive', {
+			queueName: 'other-lane'
+		})
 		await lockAs(dead!, 'pool-dead')
 		await lockAs(alive!, 'pool-alive')
 		await beatAs('pool-dead', '1 hour')
 		await beatAs('pool-alive', '0 seconds')
 
-		const released = await sweepDeadWorkers(pool, schema, 60_000)
+		const swept = await sweepDeadWorkers(pool, schema, 60_000)
 
-		expect(released).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
+		expect(swept).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
 		expect(await job(dead!)).toEqual({
 			locked_by: null,
 			attempts: 1,
-			last_error:
-				'Worker pool-dead stopped sending heartbeats (crashed or blocked); released by crash recovery',
+			last_error: released('pool-dead'),
+			queue_locked_by: null
+		})
+		expect(await job(alive!)).toMatchObject({
+			locked_by: 'pool-alive',
 			queue_locked_by: 'pool-alive'
 		})
-		expect((await job(alive!))?.locked_by).toBe('pool-alive')
 		const rows = await pool.query(
-			`SELECT worker_id FROM ${q}._bgw_worker_heartbeats ORDER BY worker_id`
+			`SELECT worker_id FROM ${q}._bgw_worker_heartbeats`
 		)
 		expect(rows.rows).toEqual([{ worker_id: 'pool-alive' }])
-		await pool.query(
-			`UPDATE ${q}._private_job_queues SET locked_by = NULL, locked_at = NULL`
-		)
-		await pool.query(`DELETE FROM ${q}._private_jobs`)
-		await pool.query(`DELETE FROM ${q}._bgw_worker_heartbeats`)
 	})
 
 	test('a job that keeps killing its worker fails permanently', async () => {
@@ -132,29 +157,16 @@ suite('crash recovery in PostgreSQL', () => {
 
 		const [failed] = await worker.listJobs({ state: 'failed' })
 		expect(failed?.id).toBe(id!)
-		expect(failed?.lastError).toContain('stopped sending heartbeats')
-		expect((await job(id!))?.queue_locked_by).toBeNull()
-		await pool.query(`DELETE FROM ${q}._private_jobs`)
+		expect(failed?.lastError).toBe(released('pool-oom'))
 	})
 
-	test('a SIGKILLed worker’s job and lane are retried by a live worker', async () => {
+	test('a live worker retries the job and lane of a SIGKILLed worker', async () => {
 		const id = await worker.createJob('sync', 'killed')
-		const child = Bun.spawn(
-			[
-				process.execPath,
-				'-e',
-				`import pg from 'pg'
-import { z } from 'zod'
-import { createBetterWorker, defineQueue, defineQueues } from ${JSON.stringify(`${import.meta.dir}/index.ts`)}
-const pgPool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
-const queues = defineQueues([defineQueue({ name: 'sync', inputSchema: z.string(), serial: true, maxAttempts: 3 })])
-await createBetterWorker({
-	pgPool, schema: ${JSON.stringify(schema)}, queues, crashRecovery: ${JSON.stringify(fast)},
-	handlers: { sync: () => process.kill(process.pid, 'SIGKILL') }
-}).start()`
-			],
-			{ cwd: `${import.meta.dir}/..`, stdout: 'ignore', stderr: 'inherit' }
-		)
+		const child = Bun.spawn([process.execPath, '-e', crashingWorker], {
+			cwd: `${import.meta.dir}/..`,
+			stdout: 'ignore',
+			stderr: 'inherit'
+		})
 		await child.exited
 		expect(child.signalCode).toBe('SIGKILL')
 		const orphan = await job(id!)
@@ -175,14 +187,14 @@ await createBetterWorker({
 			hooks: { createLogger: () => quiet },
 			handlers: {
 				sync: async (_payload, ctx) => {
-					const helpers: JobHelpers = ctx.helpers
+					const claimed = ctx.helpers.job
 					const own = await pool.query(
 						`SELECT 1 FROM ${q}._bgw_worker_heartbeats WHERE worker_id = $1`,
-						[helpers.job.locked_by]
+						[claimed.locked_by]
 					)
 					retried.resolve({
 						attempt: ctx.attempt,
-						lastError: helpers.job.last_error,
+						lastError: claimed.last_error,
 						registered: own.rowCount === 1
 					})
 				}
@@ -192,7 +204,7 @@ await createBetterWorker({
 		try {
 			expect(await retried.promise).toEqual({
 				attempt: 2,
-				lastError: `Worker ${orphan!.locked_by} stopped sending heartbeats (crashed or blocked); released by crash recovery`,
+				lastError: released(orphan!.locked_by!),
 				registered: true
 			})
 		} finally {

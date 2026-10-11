@@ -204,6 +204,7 @@ export function createBetterWorker<
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
+	let heartbeat: ReturnType<typeof startHeartbeat> | undefined
 	const runtime = {
 		hooks,
 		completedJobs,
@@ -215,7 +216,6 @@ export function createBetterWorker<
 		permanentFailure: options.permanentFailure,
 		heartbeatReady: () => heartbeat?.ready
 	}
-	let heartbeat: ReturnType<typeof startHeartbeat> | undefined
 
 	const lifecycle = createLifecycle({
 		start: async () => {
@@ -247,7 +247,7 @@ export function createBetterWorker<
 				throw error
 			})
 			const beating = heartbeat
-			if (!crashRecovery || !beating) return runner
+			if (!beating) return runner
 			// Keep beating until every job has settled, including a graceful drain.
 			return {
 				promise: runner.promise.finally(() => beating.stop()),
