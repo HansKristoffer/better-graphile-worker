@@ -1,4 +1,6 @@
-import { payloadDebugJoin } from './private-jobs.js'
+import { payloadDebugJoin, readProgress } from './private-jobs.js'
+import { UnknownQueueError } from './errors.js'
+import type { JobProgressSnapshot } from './progress.js'
 import { assertInteger } from './validation.js'
 import type { WorkerUtils } from 'graphile-worker'
 import type z from 'zod'
@@ -15,6 +17,8 @@ export type QueueDefinition = {
 	cron: string | null
 	serial: boolean | string | null
 	maxAttempts: number
+	/** Attempt timeout in milliseconds, including the worker default; null when unlimited. */
+	timeout: number | null
 	priority: number | null
 	hasInputSchema: boolean
 	inputSchema: z.ZodType | null
@@ -62,12 +66,30 @@ export type ListJobsOptions = {
 	before?: { createdAt: string; id: string }
 }
 
+export async function queryJobProgress(
+	utils: Pick<WorkerUtils, 'withPgClient'>,
+	schema: string,
+	queues: readonly QueueContract[],
+	queue: string,
+	jobId: string
+): Promise<JobProgressSnapshot | null> {
+	if (!queues.some((item) => item.name === queue))
+		throw new UnknownQueueError(
+			queue,
+			queues.map((item) => item.name)
+		)
+	if (typeof jobId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(jobId))
+		throw new RangeError('Invalid job id')
+	return readProgress(utils.withPgClient, schema, queue, jobId)
+}
+
 const DEFAULT_LIST_LIMIT = 100
 const MAX_LIST_LIMIT = 1000
 
 export function getQueueDefinitions(
 	queues: readonly QueueContract[],
-	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
+	defaultMaxAttempts = DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+	defaultTimeout?: number
 ): QueueDefinition[] {
 	return queues.map((queue) => ({
 		name: queue.name,
@@ -75,6 +97,7 @@ export function getQueueDefinitions(
 		cron: formatCronSchedule(queue.cron),
 		serial: queue.serial ?? null,
 		maxAttempts: queue.maxAttempts ?? defaultMaxAttempts,
+		timeout: queue.timeout ?? defaultTimeout ?? null,
 		priority: queue.priority ?? null,
 		hasInputSchema: hasInputSchema(queue),
 		inputSchema: hasInputSchema(queue) ? queue.inputSchema : null

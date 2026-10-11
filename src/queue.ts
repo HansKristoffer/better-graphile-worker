@@ -1,7 +1,9 @@
 import type { CronItemOptions, CronMatcher, JobHelpers } from 'graphile-worker'
 import type z from 'zod'
 import type { JobLogger, JobSpan } from './hooks.js'
+import type { ProgressOf } from './progress.js'
 import type { JobStep } from './steps.js'
+import type { Duration } from './job-options.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -34,6 +36,8 @@ export type DerivedJobOptions = {
 	jobKeyMode?: 'replace' | 'preserve_run_at' | 'unsafe_dedupe'
 	priority?: number
 	flags?: readonly string[]
+	idempotencyKey?: string
+	idempotencyTtl?: Duration
 }
 
 export type JobCronMeta = {
@@ -68,27 +72,43 @@ export type JobContext<
 	logger: JobLogger
 	span: JobSpan
 	helpers: JobHelpers
+	/**
+	 * Aborts on graceful shutdown, or with a `JobTimeoutError` reason when the attempt
+	 * exceeds its queue's `timeout`.
+	 */
 	signal: AbortSignal
 	createJob: CreateJobFn<TQueues>
 	createJobs: CreateJobsFn<TQueues>
 	cron?: JobCronMeta | undefined
 	step: JobStep
+	/** Progress readable from outside the worker; typed by the queue's `progressSchema`. */
+	progress: ProgressOf<
+		ProgressSchemaOf<Extract<TQueues[number], { name: TName }>>
+	>
 	/**
 	 * End this run successfully and enqueue the same job again (same input, lane, key,
-	 * priority, flags and steps, fresh attempts). Code after it never runs.
+	 * priority, flags, steps and progress, fresh attempts). Code after it never runs.
 	 */
 	continue(options?: ContinueOptions): Promise<never>
 }
 
 export type QueueContract<
 	TName extends string = string,
-	TSchema extends z.ZodType | undefined = z.ZodType | undefined
+	TSchema extends z.ZodType | undefined = z.ZodType | undefined,
+	TProgress extends z.ZodType | undefined = z.ZodType | undefined
 > = {
 	readonly name: TName
 	readonly inputSchema?: TSchema
+	/** Validates `ctx.progress.set()` values; its output must be JSON. */
+	readonly progressSchema?: TProgress
 	readonly maxAttempts?: number
 	readonly priority?: number
 	readonly flags?: readonly string[]
+	/**
+	 * Fail an attempt that runs longer than this many milliseconds. Each retry and
+	 * continuation starts a fresh clock. Overrides the worker's `defaultTimeout`.
+	 */
+	readonly timeout?: number
 	/** Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`. */
 	readonly serial?: boolean | string
 	readonly cron?: CronSchedule
@@ -99,64 +119,86 @@ export type QueueContract<
 	): DerivedJobOptions
 }
 
+/** A queue's `progressSchema`, or undefined when it has none. */
+export type ProgressSchemaOf<Q> = Q extends {
+	readonly progressSchema?: infer P extends z.ZodType | undefined
+}
+	? P
+	: undefined
+
 /** Shared contracts cannot carry competing inline handler implementations. */
 export type HandlerFreeQueueContract<Q extends QueueContract = QueueContract> =
 	Q & { readonly processFn?: never; readonly initFn?: never }
 
 export type RegularQueueContract<
 	S extends z.ZodType,
-	N extends string = string
-> = QueueContract<N, S> & {
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = QueueContract<N, S, P> & {
 	readonly inputSchema: S
 	readonly cron?: never
 	readonly cronOptions?: never
 }
-export type CronQueueContract<N extends string = string> = QueueContract<
-	N,
-	undefined
-> & {
+export type CronQueueContract<
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = QueueContract<N, undefined, P> & {
 	readonly cron: CronSchedule
 	readonly inputSchema?: never
 	readonly deriveJobOptions?: never
 }
 export type CronInitQueueContract<
 	S extends z.ZodType,
-	N extends string = string
-> = QueueContract<N, S> & {
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = QueueContract<N, S, P> & {
 	readonly cron: CronSchedule
 	readonly inputSchema: S
 }
 
 /** Inline handlers enqueue through queue references to preserve schema inference. */
-export type InlineJobContext<TName extends string = string> = Omit<
+export type InlineJobContext<
+	TName extends string = string,
+	TProgress = ProgressOf<undefined>
+> = Omit<
 	JobContext<readonly QueueContract[], TName>,
-	'createJob' | 'createJobs'
+	'createJob' | 'createJobs' | 'progress'
 > & {
 	createJob: CreateJobForQueueFn
 	createJobs: CreateJobsForQueueFn
+	progress: TProgress
 }
 
-type InlineProcessHandler<S extends z.ZodType | undefined, N extends string> = (
+type InlineProcessHandler<
+	S extends z.ZodType | undefined,
+	N extends string,
+	P extends z.ZodType | undefined
+> = (
 	payload: S extends z.ZodType ? z.output<S> : undefined,
-	ctx: InlineJobContext<N>
+	ctx: InlineJobContext<N, ProgressOf<P>>
 ) => Promise<void> | void
 
 export type RegularQueue<
 	S extends z.ZodType,
-	N extends string = string
-> = RegularQueueContract<S, N> & {
-	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>>
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = RegularQueueContract<S, N, P> & {
+	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>, NoInfer<P>>
 	readonly initFn?: never
 }
-export type CronQueue<N extends string = string> = CronQueueContract<N> & {
-	readonly processFn: InlineProcessHandler<undefined, NoInfer<N>>
+export type CronQueue<
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = CronQueueContract<N, P> & {
+	readonly processFn: InlineProcessHandler<undefined, NoInfer<N>, NoInfer<P>>
 	readonly initFn?: never
 }
 export type CronInitQueue<
 	S extends z.ZodType,
-	N extends string = string
-> = CronInitQueueContract<S, N> & {
-	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>>
+	N extends string = string,
+	P extends z.ZodType | undefined = undefined
+> = CronInitQueueContract<S, N, P> & {
+	readonly processFn: InlineProcessHandler<NoInfer<S>, NoInfer<N>, NoInfer<P>>
 	readonly initFn: (
 		ctx: InlineJobContext<`${NoInfer<N>}_cron-init`>
 	) => Promise<readonly z.input<NoInfer<S>>[]> | readonly z.input<NoInfer<S>>[]
@@ -172,11 +214,11 @@ type InlineQueueDefinition<Q extends QueueContract> = Q extends {
 	cron: CronSchedule
 	inputSchema: infer S extends z.ZodType
 }
-	? CronInitQueue<S, Q['name']>
+	? CronInitQueue<S, Q['name'], ProgressSchemaOf<Q>>
 	: Q extends { inputSchema: infer S extends z.ZodType }
-		? RegularQueue<S, Q['name']>
+		? RegularQueue<S, Q['name'], ProgressSchemaOf<Q>>
 		: Q extends { cron: CronSchedule }
-			? CronQueue<Q['name']>
+			? CronQueue<Q['name'], ProgressSchemaOf<Q>>
 			: never
 
 export type InlineQueues<T extends readonly QueueContract[]> = {
@@ -184,24 +226,40 @@ export type InlineQueues<T extends readonly QueueContract[]> = {
 }
 
 /** Define a queue with inferred inline handlers, or a shared handler-free contract. */
-export function defineQueue<S extends z.ZodType, const N extends string>(
-	config: RegularQueue<S, N>
-): RegularQueue<S, N>
-export function defineQueue<const N extends string>(
-	config: CronQueue<N>
-): CronQueue<N>
-export function defineQueue<S extends z.ZodType, const N extends string>(
-	config: CronInitQueue<S, N>
-): CronInitQueue<S, N>
-export function defineQueue<S extends z.ZodType, const N extends string>(
-	config: HandlerFreeQueueContract<RegularQueueContract<S, N>>
-): RegularQueueContract<S, N>
-export function defineQueue<const N extends string>(
-	config: HandlerFreeQueueContract<CronQueueContract<N>>
-): CronQueueContract<N>
-export function defineQueue<S extends z.ZodType, const N extends string>(
-	config: HandlerFreeQueueContract<CronInitQueueContract<S, N>>
-): CronInitQueueContract<S, N>
+export function defineQueue<
+	S extends z.ZodType,
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(config: RegularQueue<S, N, P>): RegularQueue<S, N, P>
+export function defineQueue<
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(config: CronQueue<N, P>): CronQueue<N, P>
+export function defineQueue<
+	S extends z.ZodType,
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(config: CronInitQueue<S, N, P>): CronInitQueue<S, N, P>
+export function defineQueue<
+	S extends z.ZodType,
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(
+	config: HandlerFreeQueueContract<RegularQueueContract<S, N, P>>
+): RegularQueueContract<S, N, P>
+export function defineQueue<
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(
+	config: HandlerFreeQueueContract<CronQueueContract<N, P>>
+): CronQueueContract<N, P>
+export function defineQueue<
+	S extends z.ZodType,
+	const N extends string,
+	P extends z.ZodType | undefined = undefined
+>(
+	config: HandlerFreeQueueContract<CronInitQueueContract<S, N, P>>
+): CronInitQueueContract<S, N, P>
 export function defineQueue(config: QueueContract): QueueContract {
 	return config
 }

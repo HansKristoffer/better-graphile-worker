@@ -146,8 +146,9 @@ describe('payload metadata', () => {
 describe('createPgStepStore', () => {
 	test('sends only the new checkpoint and verifies the lock owner', async () => {
 		let params: unknown[] = []
+		const lockedAt = new Date()
 		const helpers = {
-			job: { locked_by: 'worker-1' },
+			job: { locked_by: 'worker-1', locked_at: lockedAt },
 			withPgClient: async (fn: (client: unknown) => Promise<unknown>) =>
 				fn({
 					query: async (_sql: string, values: unknown[]) => {
@@ -165,9 +166,10 @@ describe('createPgStepStore', () => {
 		await store.set('fetch-user', { id: 'u1' })
 		expect(params).toEqual([
 			'1',
+			'worker-1',
+			lockedAt,
 			'fetch-user',
-			JSON.stringify({ output: { id: 'u1' } }),
-			'worker-1'
+			JSON.stringify({ output: { id: 'u1' } })
 		])
 		expect(store.get('fetch-user')).toEqual({ output: { id: 'u1' } })
 	})

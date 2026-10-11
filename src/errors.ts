@@ -79,6 +79,17 @@ export class ShutdownTimeoutError extends Error {
 	}
 }
 
+/**
+ * An attempt ran longer than its queue's `timeout`. It follows the normal retry
+ * rules; it is also the `ctx.signal.reason` handed to the timed-out handler.
+ */
+export class JobTimeoutError extends Error {
+	constructor(readonly timeout: number) {
+		super(`Job attempt exceeded its ${timeout}ms timeout`)
+		this.name = 'JobTimeoutError'
+	}
+}
+
 export class DuplicateQueueError extends Error {
 	constructor(readonly queueName: string) {
 		super(`Duplicate queue name "${queueName}"`)

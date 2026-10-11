@@ -77,7 +77,7 @@ Most code changes do not need a documentation change beyond the README. Agents c
 
 ## How it works
 
-`defineQueue` produces a definition; `defineQueues` checks a tuple of them. `createBetterWorker` turns them into a Graphile task list and cron items ([`src/worker.ts`](src/worker.ts)) and binds typed enqueue methods ([`src/create-job.ts`](src/create-job.ts)). Enqueue validates the wire input, derives options, wraps it in an envelope and inserts it through Graphile's public SQL functions. A worker unwraps the envelope, parses the payload, builds the job context and runs `processFn`. Steps, continuations and permanent-failure retention need the private table and commit atomically with the job's lock.
+`defineQueue` produces a definition; `defineQueues` checks a tuple of them. `createBetterWorker` turns them into a Graphile task list and cron items ([`src/worker.ts`](src/worker.ts)) and binds typed enqueue methods ([`src/create-job.ts`](src/create-job.ts)). Enqueue validates the wire input, derives options, wraps it in an envelope and inserts it through Graphile's public SQL functions. A worker unwraps the envelope, parses the payload, builds the job context and runs `processFn`. Steps, continuations, permanent-failure retention and job outcomes need the private table and commit atomically with the job's lock.
 
 Design decisions and their reasons: [docs/internals/overview.md](docs/internals/overview.md).
 

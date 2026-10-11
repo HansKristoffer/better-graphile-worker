@@ -44,9 +44,11 @@ export type {
 	CreateJobsForQueueFn,
 	JobsApi,
 	CronQueueName,
-	JobOptions
+	JobOptions,
+	QueueProgress,
+	GetJobProgressFn
 } from './types.js'
-export type { StopOptions } from './job-options.js'
+export type { Duration, StopOptions } from './job-options.js'
 export {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA,
@@ -62,6 +64,7 @@ export {
 	type JobClientOptions
 } from './job-client.js'
 export type { JobStep, StepCodec } from './steps.js'
+export type { JobProgress, JobProgressSnapshot } from './progress.js'
 export type {
 	CompletedJob,
 	CompletedJobStatus,
@@ -84,7 +87,9 @@ export type {
 	ListJobsOptions,
 	JobListState
 } from './admin.js'
+export type { JobOutcomesOption, JobState } from './job-outcomes.js'
 export type { GraphileRunnerOverrides } from './worker.js'
+export type { CrashRecoveryOptions } from './crash-recovery.js'
 export {
 	NonRetriableError,
 	RetryAtError,
@@ -95,6 +100,7 @@ export {
 	InvalidSchemaNameError,
 	StepPersistenceError,
 	ShutdownTimeoutError,
+	JobTimeoutError,
 	StepSerializationError
 } from './errors.js'
 export type { OtelApi } from './otel.js'

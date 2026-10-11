@@ -8,9 +8,12 @@ import {
 	type TaskList,
 	type CronItem,
 	type CronMatcher,
-	type JobHelpers
+	type JobHelpers,
+	type WorkerEvents
 } from 'graphile-worker'
+import { EventEmitter } from 'node:events'
 import type { Pool } from 'pg'
+import type z from 'zod'
 import {
 	type JobContext,
 	CRON_INIT_SUFFIX,
@@ -22,7 +25,12 @@ import {
 } from './queue.js'
 import type { NormalizedQueue } from './registry.js'
 import type { CompletedJobsStore } from './completed-jobs-store.js'
-import type { BetterWorkerHooks, JobLogger, JobSpan } from './hooks.js'
+import type {
+	BetterWorkerHooks,
+	JobLogger,
+	JobSpan,
+	LogAttributes
+} from './hooks.js'
 import type { CreateJobFn, CreateJobsFn } from './types.js'
 import {
 	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
@@ -31,8 +39,10 @@ import {
 } from './create-job.js'
 import {
 	JobContinuedSignal,
+	JobTimeoutError,
 	NonRetriableError,
-	RetryAtError
+	RetryAtError,
+	StepPersistenceError
 } from './errors.js'
 import {
 	extractCronMeta,
@@ -45,10 +55,14 @@ import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
 import { jobLogger, observe } from './observers.js'
 import {
 	continueJob,
+	recordJobOutcome,
 	retainPermanentFailure,
-	scheduleRetry
+	scheduleRetry,
+	writeProgress
 } from './private-jobs.js'
+import type { JobOutcomes } from './job-outcomes.js'
 import { createPgStepStore, createStepRunner } from './steps.js'
+import { createProgressRunner, type ProgressRunner } from './progress.js'
 
 export type TaskListRuntime<
 	TQueues extends readonly QueueContract[] = readonly QueueContract[]
@@ -61,9 +75,65 @@ export type TaskListRuntime<
 	schema: string
 	otel?: OtelApi | null
 	permanentFailure?: 'discard' | 'retain' | undefined
+	/** Applies to queues without their own `timeout`, in milliseconds. */
+	defaultTimeout?: number | undefined
+	jobOutcomes?: JobOutcomes | undefined
+	/** Settles once crash recovery has registered this worker; jobs wait for it. */
+	heartbeatReady?: () => Promise<void> | undefined
 }
 
 export { extractProducerLink } from './payload.js'
+
+/**
+ * One run's signal and deadline. JavaScript cannot stop a handler that ignores its
+ * signal, so on timeout the run is failed without it: the handler keeps running
+ * detached, and everything it starts afterwards through the context is refused.
+ */
+function createAttempt(parent: AbortSignal, timeout: number | undefined) {
+	const controller = new AbortController()
+	const forward = () => controller.abort(parent.reason)
+	if (parent.aborted) forward()
+	else parent.addEventListener('abort', forward, { once: true })
+	let expired: JobTimeoutError | undefined
+	let continuing: Promise<boolean> | undefined
+	let timer: ReturnType<typeof setTimeout> | undefined
+	return {
+		signal: controller.signal,
+		assertActive() {
+			if (expired) throw expired
+		},
+		/** A continuation committing when the timeout fires decides the run's outcome. */
+		continuing<T>(work: Promise<T>): Promise<T> {
+			continuing = work.then(
+				() => true,
+				() => false
+			)
+			return work
+		},
+		/** Settles with `work`, or with a `JobTimeoutError` once the timeout passes. */
+		run(work: Promise<void>, onAbandoned: (error?: unknown) => void) {
+			if (timeout === undefined) return work
+			return new Promise<void>((resolve, reject) => {
+				work.then(resolve, reject)
+				timer = setTimeout(() => {
+					const error = new JobTimeoutError(timeout)
+					expired = error
+					controller.abort(error)
+					void (continuing ?? Promise.resolve(false)).then((continued) =>
+						reject(continued ? new JobContinuedSignal() : error)
+					)
+					work.then(() => onAbandoned(), onAbandoned)
+				}, timeout)
+			})
+		},
+		dispose() {
+			clearTimeout(timer)
+			parent.removeEventListener('abort', forward)
+		}
+	}
+}
+
+type Attempt = ReturnType<typeof createAttempt>
 
 function createJobContext(
 	jobId: string,
@@ -73,7 +143,9 @@ function createJobContext(
 	hooks: BetterWorkerHooks,
 	runtime: TaskListRuntime,
 	cron: JobContext['cron'],
-	rawPayload: unknown
+	rawPayload: unknown,
+	attempt: Attempt,
+	progress: ProgressRunner
 ): JobContext {
 	return {
 		jobId,
@@ -82,11 +154,28 @@ function createJobContext(
 		maxAttempts: helpers.job.max_attempts,
 		span,
 		helpers,
-		signal: helpers.abortSignal,
-		createJob: runtime.createJob,
-		createJobs: runtime.createJobs,
+		signal: attempt.signal,
+		createJob: async (...args) => {
+			attempt.assertActive()
+			return runtime.createJob(...args)
+		},
+		createJobs: async (...args) => {
+			attempt.assertActive()
+			return runtime.createJobs(...args)
+		},
 		cron,
-		continue: createContinue(helpers, runtime, span),
+		continue: createContinue(helpers, runtime, span, attempt, progress),
+		progress: {
+			get: progress.get,
+			set: async (value) => {
+				attempt.assertActive()
+				return progress.set(value)
+			},
+			flush: async () => {
+				attempt.assertActive()
+				return progress.flush()
+			}
+		} as JobContext['progress'],
 		logger: jobLogger(hooks, {
 			queue: queueName,
 			jobId,
@@ -102,7 +191,8 @@ function createJobContext(
 					? rawPayload
 					: injectTraceContext(undefined, null)
 			}),
-			span
+			span,
+			assertActive: attempt.assertActive
 		})
 	}
 }
@@ -110,15 +200,29 @@ function createJobContext(
 function createContinue(
 	helpers: JobHelpers,
 	runtime: TaskListRuntime,
-	span: JobSpan
+	span: JobSpan,
+	attempt: Attempt,
+	progress: ProgressRunner
 ): JobContext['continue'] {
 	let called = false
 	return async (options) => {
+		attempt.assertActive()
 		if (called) throw new Error('ctx.continue() was already called')
 		called = true
 		const runAt = parseContinueRunAt(options)
 		const { traceparent } = injectTraceContext(undefined, runtime.otel)
-		const id = await continueJob(helpers, runtime.schema, runAt, traceparent)
+		// The continuation receives the latest value, so a lagging write does not matter.
+		await progress.close(false).catch(() => {})
+		const id = await attempt.continuing(
+			continueJob(
+				helpers,
+				runtime.schema,
+				runAt,
+				traceparent,
+				runtime.jobOutcomes !== undefined,
+				progress.get()
+			)
+		)
 		span.setAttributes({
 			'graphile.continued': true,
 			'graphile.continuation_job_id': id
@@ -140,6 +244,8 @@ type ExecuteTaskOptions = {
 	executor: TaskExecutorFn
 	extraAttributes?: Record<string, string | number>
 	runtime: TaskListRuntime
+	timeout: number | undefined
+	progressSchema?: z.ZodType | undefined
 }
 
 function isNonRetriable(error: unknown): boolean {
@@ -154,7 +260,9 @@ async function executeTask(options: ExecuteTaskOptions) {
 		operation,
 		executor,
 		extraAttributes,
-		runtime
+		runtime,
+		timeout,
+		progressSchema
 	} = options
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
@@ -163,6 +271,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 		: { link: null, cleanPayload: undefined }
 	const cron = extractCronMeta(payload)
 	const statusCodes = otelStatusCodes(runtime.otel)
+	await runtime.heartbeatReady?.()
 
 	await withActiveSpan(
 		'graphile-worker',
@@ -189,6 +298,12 @@ async function executeTask(options: ExecuteTaskOptions) {
 				span.setAttribute('messaging.producer.span_id', link.context.spanId)
 			}
 
+			const attempt = createAttempt(helpers.abortSignal, timeout)
+			const progress = createProgressRunner({
+				initial: isPayloadEnvelope(payload) ? payload.progress : undefined,
+				schema: progressSchema,
+				write: (value) => writeProgress(helpers, runtime.schema, jobId, value)
+			})
 			const ctx = createJobContext(
 				jobId,
 				queueName,
@@ -197,7 +312,9 @@ async function executeTask(options: ExecuteTaskOptions) {
 				runtime.hooks,
 				runtime,
 				cron,
-				payload
+				payload,
+				attempt,
+				progress
 			)
 			let status: 'success' | 'failed' = 'success'
 			let errorType: string | undefined
@@ -209,10 +326,37 @@ async function executeTask(options: ExecuteTaskOptions) {
 			try {
 				assertPayloadEnvelope(payload)
 				try {
-					await executor(ctx, cleanPayload)
+					await attempt.run(executor(ctx, cleanPayload), (error) => {
+						const attributes: LogAttributes = {
+							event: 'job.timed_out_handler_settled',
+							queue: queueName,
+							job_id: jobId,
+							attempt: helpers.job.attempts,
+							duration_ms: Date.now() - startTime
+						}
+						if (error !== undefined) {
+							const message =
+								error instanceof Error ? error.message : String(error)
+							attributes.error_message = message.slice(
+								0,
+								LOGGED_ERROR_MESSAGE_LIMIT
+							)
+						}
+						ctx.logger.warn('job.timed_out_handler_settled', attributes)
+					})
 				} catch (error) {
 					if (!(error instanceof JobContinuedSignal)) throw error
 					continued = true
+				}
+				// Graphile deletes completed jobs, progress included.
+				await progress.close(false).catch(() => {})
+				// Like a checkpoint, a completion that cannot be recorded fails the attempt.
+				if (runtime.jobOutcomes && !continued) {
+					const recorded = await recordJobOutcome(helpers, runtime.schema, {
+						state: 'completed',
+						finish: true
+					})
+					if (!recorded) throw new StepPersistenceError(jobId)
 				}
 
 				const durationMs = Date.now() - startTime
@@ -233,6 +377,17 @@ async function executeTask(options: ExecuteTaskOptions) {
 				})
 			} catch (error) {
 				status = 'failed'
+				// Retries read the latest progress, such as a retry budget.
+				await progress.close(true).catch((progressError: unknown) => {
+					ctx.logger.warn('job.progress.write_failed', {
+						event: 'job.progress.write_failed',
+						job_id: jobId,
+						error_message: String(progressError).slice(
+							0,
+							LOGGED_ERROR_MESSAGE_LIMIT
+						)
+					})
+				})
 				const durationMs = Date.now() - startTime
 				// RetryAtError only carries scheduling; report what actually went wrong.
 				const reported =
@@ -280,19 +435,40 @@ async function executeTask(options: ExecuteTaskOptions) {
 					})
 				}
 
+				// The job row stays (or Graphile deletes it on discard), so these writes are best effort.
+				const recordFailure = async (finish: boolean) => {
+					if (!runtime.jobOutcomes) return
+					await recordJobOutcome(helpers, runtime.schema, {
+						state: 'failed',
+						error: errorMessage,
+						finish
+					}).catch((recordError) =>
+						ctx.logger.error('job.outcome.failed', {
+							queue: queueName,
+							job_id: jobId,
+							error: String(recordError)
+						})
+					)
+				}
+
 				if (!permanent && error instanceof RetryAtError)
 					retryAt = await scheduleRetry(helpers, runtime.schema, error.runAt)
 
 				if (isNonRetriable(error)) {
 					if (runtime.permanentFailure !== 'discard') {
 						await retainPermanentFailure(helpers, runtime.schema)
+						await recordFailure(false)
 						throw error
 					}
+					await recordFailure(true)
 					return
 				}
 
+				if (permanent) await recordFailure(false)
 				throw error
 			} finally {
+				attempt.dispose()
+				await runtime.jobOutcomes?.prune(helpers)
 				const durationMs = Date.now() - startTime
 				const permanentlyFailed = status === 'failed' && permanent
 				await observe(runtime.hooks.onJobFinished, {
@@ -343,6 +519,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 
 	for (const queue of queues) {
 		const q = queue
+		const timeout = q.timeout ?? runtime.defaultTimeout
 		if (q.initFn) {
 			const initFn = q.initFn
 			const processingTaskName = q.name
@@ -356,6 +533,7 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					operation: 'init',
 					extraAttributes: { 'graphile.target_queue': processingTaskName },
 					runtime: erasedRuntime,
+					timeout,
 					executor: async (ctx, _cleanPayload) => {
 						const items = await initFn(ctx)
 
@@ -365,11 +543,9 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 						ctx.span.setAttribute('graphile.init_items_count', items.length)
 
 						if (items.length > 0) {
-							const jobIds = await erasedRuntime.createJobs(
-								processingTaskName,
-								items,
-								{ validateOnEnqueue: true }
-							)
+							const jobIds = await ctx.createJobs(processingTaskName, items, {
+								validateOnEnqueue: true
+							})
 							ctx.logger.info('Enqueued items for processing', {
 								jobCount: jobIds.length
 							})
@@ -384,6 +560,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					timeout,
+					progressSchema: q.progressSchema,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = await parseQueuePayload(q, cleanPayload)
 						await q.processFn(validatedPayload, ctx)
@@ -397,6 +575,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					payload,
 					operation: 'process',
 					runtime: erasedRuntime,
+					timeout,
+					progressSchema: q.progressSchema,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = q.inputSchema
 							? await parseQueuePayload(q, cleanPayload)
@@ -536,22 +716,39 @@ export async function startRunner(options: {
 	pollInterval: number
 	noHandleSignals: boolean
 	graphile?: GraphileRunnerOverrides | undefined
+	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
+	onPoolCreate?: ((poolId: string) => void) | undefined
 }): Promise<Runner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
+	const { onPoolCreate, graphile } = options
+	// An emitter nested in a preset's `extends` is not found here and gets replaced.
+	const events =
+		graphile?.events ??
+		graphile?.preset?.worker?.events ??
+		(new EventEmitter() as WorkerEvents)
+	const listener = ({ workerPool }: { workerPool: { id: string } }) =>
+		onPoolCreate?.(workerPool.id)
+	events.on('pool:create', listener)
 
-	return run(
-		compact({
-			...withDurableCompletion(options.graphile),
-			pgPool: options.pgPool,
-			schema: options.schema,
-			taskList: options.taskList,
-			parsedCronItems,
-			noHandleSignals: options.noHandleSignals,
-			concurrency: options.concurrency,
-			pollInterval: options.pollInterval
-		})
-	)
+	try {
+		return await run(
+			compact({
+				...withDurableCompletion(graphile),
+				events,
+				pgPool: options.pgPool,
+				schema: options.schema,
+				taskList: options.taskList,
+				parsedCronItems,
+				noHandleSignals: options.noHandleSignals,
+				concurrency: options.concurrency,
+				pollInterval: options.pollInterval
+			})
+		)
+	} finally {
+		// run() emits pool:create synchronously before it resolves.
+		events.off('pool:create', listener)
+	}
 }
 
 export async function runOnceTasks(options: {

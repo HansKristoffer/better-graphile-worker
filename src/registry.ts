@@ -6,6 +6,7 @@ import type {
 	QueueHandlers
 } from './queue.js'
 import { UnknownQueueError } from './errors.js'
+import { assertInteger } from './validation.js'
 
 /** Internal handler erasure; public APIs retain their registry-specific signatures. */
 export type NormalizedQueue = QueueContract & {
@@ -57,6 +58,13 @@ export function normalizeWorkerQueues<T extends readonly QueueContract[]>(
 			typeof value.processFn !== 'function'
 		)
 			throw new TypeError(`Queue "${queue.name}" requires a processFn`)
+		if (queue.timeout !== undefined)
+			assertInteger(
+				queue.timeout,
+				`Queue "${queue.name}" timeout`,
+				1,
+				2147483647
+			)
 		if (queue.cron === undefined && !queue.inputSchema)
 			throw new TypeError(
 				`Queue "${queue.name}" requires an inputSchema or cron schedule`

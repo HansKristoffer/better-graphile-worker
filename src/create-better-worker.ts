@@ -23,6 +23,7 @@ import {
 	mergeJobStats,
 	queryJobCounts,
 	queryRecentJobs,
+	queryJobProgress,
 	type ListedJob,
 	type ListJobsOptions,
 	type QueueDefinition,
@@ -39,17 +40,31 @@ import {
 	type GraphileRunnerOverrides
 } from './worker.js'
 import { jobLogger } from './observers.js'
+import {
+	migrateJobOutcomes,
+	queryJob,
+	resolveJobOutcomes,
+	type JobOutcomesOption,
+	type JobState
+} from './job-outcomes.js'
 import { createLifecycle } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
 import { assertUniqueQueueNames } from './define-queues.js'
+import {
+	ensureHeartbeatTable,
+	resolveCrashRecovery,
+	startHeartbeat,
+	type CrashRecoveryOptions
+} from './crash-recovery.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
 	PrepareJobFn,
 	PrepareJobsFn,
 	CronQueueName,
+	GetJobProgressFn,
 	JobsApi,
 	QueueName
 } from './types.js'
@@ -67,7 +82,11 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	hooks?: BetterWorkerHooks
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
+	/** Fail attempts that run longer than this many milliseconds; queues override it with `timeout`. */
+	defaultTimeout?: number
 	completedJobs?: CompletedJobsOption
+	/** Record final job states in PostgreSQL so `getJob` can read them after completion. */
+	jobOutcomes?: JobOutcomesOption
 	graphile?: GraphileRunnerOverrides | undefined
 	otel?: { api: OtelApi | null }
 	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
@@ -77,6 +96,12 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * covers every queue, so separate instances can give workloads their own concurrency.
 	 */
 	process?: readonly NoInfer<QueueName<TQueues>>[]
+	/**
+	 * Heartbeat this worker and release jobs (and lanes) held by workers that stopped
+	 * heartbeating, instead of waiting for Graphile's 4-hour stale-lock scan. On by
+	 * default; `false` turns it off.
+	 */
+	crashRecovery?: boolean | CrashRecoveryOptions | undefined
 }
 
 export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
@@ -114,6 +139,9 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	getCompletedJobsStats(): CompletedJobStats
 	getJobStats(): Promise<WorkerJobStatsRow[]>
 	listJobs(options?: ListJobsOptions): Promise<ListedJob[]>
+	getJob(id: string): Promise<JobState>
+	/** Read a job's `ctx.progress` value; null once the job no longer exists. */
+	readonly getJobProgress: GetJobProgressFn<TQueues>
 	retryJobs(ids: string[]): Promise<string[]>
 	failJobs(ids: string[], reason?: string): Promise<string[]>
 	getQueueDefinitions(): QueueDefinition[]
@@ -169,6 +197,10 @@ export function createBetterWorker<
 		1,
 		2147483647
 	)
+	if (options.defaultTimeout !== undefined)
+		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
+
+	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const hooks = options.hooks ?? {}
@@ -191,6 +223,16 @@ export function createBetterWorker<
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
+	const jobOutcomes = resolveJobOutcomes(options.jobOutcomes, schema, (error) =>
+		logger.error('job.outcome.prune_failed', { error: String(error) })
+	)
+	// Workers create the table on start too, so enabling the option cannot fail every job.
+	const ensureOutcomes = async () => {
+		if (!jobOutcomes) return
+		await client.migrate()
+		await migrateJobOutcomes(options.pgPool, schema)
+	}
+	let heartbeat: ReturnType<typeof startHeartbeat> | undefined
 	const runtime = {
 		hooks,
 		completedJobs,
@@ -199,14 +241,36 @@ export function createBetterWorker<
 		logger,
 		schema,
 		otel,
-		permanentFailure: options.permanentFailure
+		permanentFailure: options.permanentFailure,
+		defaultTimeout: options.defaultTimeout,
+		jobOutcomes,
+		heartbeatReady: () => heartbeat?.ready
+	}
+
+	async function prepareCrashRecovery() {
+		if (!crashRecovery) return undefined
+		try {
+			await ensureHeartbeatTable(options.pgPool, schema)
+			return crashRecovery
+		} catch (error) {
+			// The default must not break a locked-down role that upgraded without migrate().
+			const cannotCreate = (error as { code?: string }).code === '42501'
+			if (options.crashRecovery !== undefined || !cannotCreate) throw error
+			logger.warn('worker.crash_recovery.disabled', {
+				reason:
+					'The heartbeat table is missing and this role cannot create it; run migrate()'
+			})
+			return undefined
+		}
 	}
 
 	const lifecycle = createLifecycle({
 		start: async () => {
 			logger.info('Starting graphile-worker')
 			logRegisteredQueues(queues, logger)
-			return startRunner({
+			await ensureOutcomes()
+			const recovery = await prepareCrashRecovery()
+			const runner = await startRunner({
 				pgPool: options.pgPool,
 				schema,
 				taskList: buildTaskList(queues, runtime),
@@ -214,8 +278,29 @@ export function createBetterWorker<
 				concurrency: options.concurrency ?? DEFAULT_CONCURRENCY,
 				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
 				noHandleSignals: true,
-				graphile: options.graphile
+				graphile: options.graphile,
+				onPoolCreate:
+					recovery &&
+					((workerId) => {
+						heartbeat = startHeartbeat({
+							pgPool: options.pgPool,
+							schema,
+							workerId,
+							config: recovery,
+							logger
+						})
+					})
+			}).catch(async (error) => {
+				await heartbeat?.stop()
+				throw error
 			})
+			const beating = heartbeat
+			if (!beating) return runner
+			// Keep beating until every job has settled, including a graceful drain.
+			return {
+				promise: runner.promise.finally(() => beating.stop()),
+				stop: () => runner.stop().finally(() => beating.stop())
+			}
 		},
 		release: () => client.release(),
 		onError: (error) =>
@@ -234,20 +319,24 @@ export function createBetterWorker<
 		get promise() {
 			return lifecycle.promise
 		},
-		migrate: () => client.migrate(),
+		migrate: async () => {
+			await client.migrate()
+			await ensureOutcomes()
+		},
 		start: () => lifecycle.start(),
 		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
-			lifecycle.runOnce(() =>
-				runOnceTasks({
+			lifecycle.runOnce(async () => {
+				await ensureOutcomes()
+				await runOnceTasks({
 					pgPool: options.pgPool,
 					schema,
 					taskList: buildTaskList(queues, runtime),
 					noHandleSignals: true,
 					graphile: options.graphile
 				})
-			),
+			}),
 		triggerCron: (name, opts) => producer.triggerCron(name, opts),
 
 		getWorkerUtils() {
@@ -279,6 +368,15 @@ export function createBetterWorker<
 			const utils = client
 			return queryRecentJobs(utils, schema, listOptions)
 		},
+		getJob: (id) => queryJob(client, schema, id),
+		getJobProgress: ((queue: string, jobId: string) =>
+			queryJobProgress(
+				client,
+				schema,
+				options.queues,
+				queue,
+				jobId
+			)) as GetJobProgressFn<TQueues>,
 		retryJobs: (ids) => client.retryJobs(ids),
 		async failJobs(ids, reason) {
 			const utils = await client.getUtils()
@@ -286,7 +384,11 @@ export function createBetterWorker<
 			return jobs.map((job) => String(job.id))
 		},
 		getQueueDefinitions() {
-			return getQueueDefinitions(options.queues, options.defaultMaxAttempts)
+			return getQueueDefinitions(
+				options.queues,
+				options.defaultMaxAttempts,
+				options.defaultTimeout
+			)
 		}
 	}
 }
