@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.4.0...v2.5.0) (2026-10-20)
+
+
+### Features
+
+* add worker pools, second look on notify, json-compat payloads, Prisma enqueue and queue metrics ([1c0cd78](https://github.com/HansKristoffer/better-graphile-worker/commit/1c0cd78fa0e17200326795d760e5cb1471050bef))
+
 ## [2.4.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.3.0...v2.4.0) (2026-10-11)
 
 
