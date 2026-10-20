@@ -16,7 +16,8 @@ import { bindCreateJob, createJobsApi } from './create-job.js'
 import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import {
 	createCompletedJobsStore,
-	createNoopCompletedJobsStore
+	createNoopCompletedJobsStore,
+	type CompletedJobsStore
 } from './completed-jobs-store.js'
 import {
 	getQueueDefinitions,
@@ -49,7 +50,9 @@ import {
 import { createLifecycle } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
-import { createNoopSpan, getOtel, type OtelApi } from './otel.js'
+import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
+import { withQueueMetrics } from './metrics.js'
+import type { PayloadMode } from './create-job.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import {
 	maintainOnce,
@@ -87,7 +90,8 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	/** Record final job states in PostgreSQL so `getJob` can read them after completion. */
 	jobOutcomes?: JobOutcomesOption
 	graphile?: GraphileRunnerOverrides | undefined
-	otel?: { api: OtelApi | null }
+	/** `metrics: true` records queue metrics through the same API's meter. */
+	otel?: OtelOption
 	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
 	permanentFailure?: 'discard' | 'retain' | undefined
 	/**
@@ -101,16 +105,39 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * default; `false` turns it off.
 	 */
 	crashRecovery?: boolean | CrashRecoveryOptions | undefined
+	/**
+	 * Fetch once more this many milliseconds after each new-job notification. Workers that
+	 * share a database skip each other's locked lanes, so a first fetch can miss a job.
+	 */
+	secondLookOnNotify?: number | undefined
+	/**
+	 * `json-compat` passes wire inputs through `JSON.stringify` first, as producers before
+	 * version 2 did: undefined fields are dropped and dates become strings.
+	 */
+	payloadMode?: PayloadMode | undefined
 }
 
+/** How handlers are registered: inline `processFn`s or a contract handler registry. */
+export type QueueRegistration<TQueues extends readonly QueueContract[]> =
+	TQueues extends readonly RunnableQueue[]
+		? { queues: TQueues & NoInfer<InlineQueues<TQueues>>; handlers?: never }
+		: {
+				queues: TQueues & readonly HandlerFreeQueueContract[]
+				handlers: NoInfer<QueueHandlers<TQueues>>
+			}
+
 export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
-	BaseWorkerOptions<TQueues> &
-		(TQueues extends readonly RunnableQueue[]
-			? { queues: TQueues & NoInfer<InlineQueues<TQueues>>; handlers?: never }
-			: {
-					queues: TQueues & readonly HandlerFreeQueueContract[]
-					handlers: NoInfer<QueueHandlers<TQueues>>
-				})
+	BaseWorkerOptions<TQueues> & QueueRegistration<TQueues>
+
+/** Options each runner of a worker pool sets for itself. */
+export type WorkerRunnerOptions = Pick<
+	BaseWorkerOptions<readonly QueueContract[]>,
+	'concurrency' | 'pollInterval' | 'secondLookOnNotify' | 'graphile'
+>
+
+/** Worker options a pool shares across its runners. */
+export type SharedWorkerOptions<TQueues extends readonly QueueContract[]> =
+	Omit<BaseWorkerOptions<TQueues>, 'process' | keyof WorkerRunnerOptions>
 
 export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly schema: string
@@ -155,7 +182,9 @@ function createStartupLogger(hooks?: BetterWorkerHooks): JobLogger {
 	})
 }
 
-function resolveCompletedJobsStore(option: CompletedJobsOption | undefined) {
+export function resolveCompletedJobsStore(
+	option: CompletedJobsOption | undefined
+) {
 	if (option === false || option === undefined) {
 		return createNoopCompletedJobsStore()
 	}
@@ -183,6 +212,14 @@ function selectProcessed(
 export function createBetterWorker<
 	const TQueues extends readonly QueueContract[]
 >(options: BetterWorkerOptions<TQueues>): BetterWorker<TQueues> {
+	return createWorker(options, resolveCompletedJobsStore(options.completedJobs))
+}
+
+/** A worker pool's runners share one history, so any of them reports all its jobs. */
+export function createWorker<const TQueues extends readonly QueueContract[]>(
+	options: BetterWorkerOptions<TQueues>,
+	completedJobs: CompletedJobsStore
+): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
 	const queues = selectProcessed(
 		normalizeWorkerQueues(options.queues, options.handlers),
@@ -198,16 +235,22 @@ export function createBetterWorker<
 	)
 	if (options.defaultTimeout !== undefined)
 		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
+	if (options.secondLookOnNotify !== undefined)
+		assertInteger(
+			options.secondLookOnNotify,
+			'secondLookOnNotify',
+			0,
+			2147483647
+		)
 
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
-	const hooks = options.hooks ?? {}
+	const hooks = withQueueMetrics(options.hooks ?? {}, otel, options.otel)
 	const client = createWorkerClient({
 		pgPool: options.pgPool,
 		schema
 	})
-	const completedJobs = resolveCompletedJobsStore(options.completedJobs)
 	const producer = bindCreateJob<TQueues>({
 		enqueue: client.enqueue,
 		otel,
@@ -216,7 +259,8 @@ export function createBetterWorker<
 		...compact({
 			hooks,
 			validateOnEnqueue: options.validateOnEnqueue,
-			defaultMaxAttempts: options.defaultMaxAttempts
+			defaultMaxAttempts: options.defaultMaxAttempts,
+			payloadMode: options.payloadMode
 		})
 	})
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
@@ -285,6 +329,7 @@ export function createBetterWorker<
 				pollInterval: options.pollInterval ?? DEFAULT_POLL_INTERVAL,
 				noHandleSignals: true,
 				graphile: options.graphile,
+				secondLookOnNotify: options.secondLookOnNotify,
 				onPoolCreate: maintained
 					? (workerId) => {
 							maintenance = startMaintenance({

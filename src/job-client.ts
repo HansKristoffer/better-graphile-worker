@@ -3,10 +3,11 @@ import type { Pool } from 'pg'
 import type { WorkerUtils } from 'graphile-worker'
 import type { QueueContract } from './queue.js'
 import type { BetterWorkerHooks } from './hooks.js'
-import { bindCreateJob, createJobsApi } from './create-job.js'
+import { bindCreateJob, createJobsApi, type PayloadMode } from './create-job.js'
 import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import { assertUniqueQueueNames } from './define-queues.js'
-import { getOtel, type OtelApi } from './otel.js'
+import { getOtel, type OtelOption } from './otel.js'
+import { withQueueMetrics } from './metrics.js'
 import { queryJobProgress } from './admin.js'
 import { queryJob, type JobState } from './job-outcomes.js'
 import type {
@@ -25,7 +26,10 @@ export type JobClientOptions<TQueues extends readonly QueueContract[]> = {
 	hooks?: Pick<BetterWorkerHooks, 'onEnqueueFail' | 'shouldSkipEnqueue'>
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
-	otel?: { api: OtelApi | null }
+	/** `metrics: true` counts failed enqueues through the same API's meter. */
+	otel?: OtelOption
+	/** Match the workers' `payloadMode`. */
+	payloadMode?: PayloadMode
 }
 
 export type JobClient<TQueues extends readonly QueueContract[]> = {
@@ -56,16 +60,18 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		pgPool: options.pgPool,
 		schema
 	})
+	const otel = options.otel ? options.otel.api : getOtel()
 	const { createJob, createJobs, prepareJob, prepareJobs } =
 		bindCreateJob<TQueues>({
 			enqueue: client.enqueue,
-			otel: options.otel ? options.otel.api : getOtel(),
+			otel,
 			queues: options.queues,
 			schema,
+			hooks: withQueueMetrics(options.hooks ?? {}, otel, options.otel),
 			...compact({
-				hooks: options.hooks,
 				validateOnEnqueue: options.validateOnEnqueue,
-				defaultMaxAttempts: options.defaultMaxAttempts
+				defaultMaxAttempts: options.defaultMaxAttempts,
+				payloadMode: options.payloadMode
 			})
 		})
 

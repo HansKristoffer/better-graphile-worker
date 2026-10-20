@@ -45,6 +45,12 @@ const DEFAULT_IDEMPOTENCY_TTL = 30 * 86_400_000
 /** A Graphile task spec plus an idempotency key and its TTL in milliseconds. */
 type EnqueueSpec = TaskSpec &
 	Pick<IdempotentJobSpec, 'idempotencyKey' | 'idempotencyTtl'>
+/**
+ * `strict` rejects wire inputs JSON would change. `json-compat` stringifies them first, as
+ * producers before version 2 did, dropping undefined fields and turning dates into strings.
+ */
+export type PayloadMode = 'strict' | 'json-compat'
+
 export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	queues: T
 	enqueue: EnqueueAdapter
@@ -54,6 +60,12 @@ export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	otel?: OtelApi | null
 	/** Schema used by prepared SQL; defaults to `graphile_worker`. */
 	schema?: string
+	payloadMode?: PayloadMode
+}
+
+function toJsonCompat(data: unknown): unknown {
+	const text = JSON.stringify(data)
+	return text === undefined ? undefined : JSON.parse(text)
 }
 
 function skippedJob(queue: string): PreparedJob {
@@ -61,6 +73,7 @@ function skippedJob(queue: string): PreparedJob {
 		queue,
 		text: 'SELECT NULL::text AS id WHERE false',
 		values: [],
+		count: 0,
 		skipped: true
 	}
 }
@@ -206,6 +219,9 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	const schema = assertValidSchemaName(
 		options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	)
+	const payloadMode = options.payloadMode ?? 'strict'
+	if (payloadMode !== 'strict' && payloadMode !== 'json-compat')
+		throw new TypeError('payloadMode must be "strict" or "json-compat"')
 	const registry = new Map(options.queues.map((queue) => [queue.name, queue]))
 	for (const queue of registry.values()) {
 		if (!queue.inputSchema && queue.cron === undefined)
@@ -237,10 +253,11 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		jobOptions?: JobOptions,
 		index?: number
 	) {
-		assertJsonValue(data, true)
+		const wire = payloadMode === 'json-compat' ? toJsonCompat(data) : data
+		assertJsonValue(wire, true)
 		// Validate the wire input; transforms are applied again by the consumer.
 		const snapshot =
-			data === undefined ? undefined : JSON.parse(JSON.stringify(data))
+			wire === undefined ? undefined : JSON.parse(JSON.stringify(wire))
 		if (jobOptions?.validateOnEnqueue ?? options.validateOnEnqueue ?? true)
 			await parseQueuePayload(queue, snapshot, index)
 		return snapshot
@@ -458,6 +475,7 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 				const traced = injectTraceContext(payload, api)
 				return {
 					queue: task,
+					count: 1,
 					skipped: false,
 					...(spec.idempotencyKey === undefined
 						? addJobSql(schema, task, traced, spec)
@@ -493,6 +511,7 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 				}))
 				return {
 					queue: name,
+					count: specs.length,
 					skipped: false,
 					...(idempotent
 						? addIdempotentJobsSql(

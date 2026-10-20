@@ -500,3 +500,53 @@ integrationDescribe('step cache', () => {
 		expect(counts.send).toBe(2)
 	})
 })
+
+describe('payloadMode', () => {
+	const dated = defineQueue({
+		name: 'dated',
+		inputSchema: z.object({ at: z.string(), note: z.string().optional() })
+	})
+
+	test('strict rejects dates and undefined fields that JSON would change', async () => {
+		const { utils } = mockUtils()
+		const producer = bindCreateJob({
+			queues: [dated],
+			enqueue: utils,
+			otel: null
+		})
+		await expect(
+			producer.enqueueOne('dated', { at: new Date(0), note: undefined })
+		).rejects.toThrow('JSON')
+	})
+
+	test('json-compat stores what JSON.stringify would, on every enqueue path', async () => {
+		const { utils, added } = mockUtils()
+		const producer = bindCreateJob({
+			queues: [dated],
+			enqueue: utils,
+			otel: null,
+			payloadMode: 'json-compat'
+		})
+		const input = { at: new Date(0), note: undefined }
+		await producer.enqueueOne('dated', input)
+		await producer.enqueueMany('dated', [input])
+		const prepared = await producer.prepareOne('dated', input)
+
+		const wire = { at: '1970-01-01T00:00:00.000Z' }
+		expect(
+			added.map((job) => extractProducerLink(job.payload).cleanPayload)
+		).toEqual([wire, wire])
+		expect(prepared.values[1]).toBe(JSON.stringify({ __bgw: 2, payload: wire }))
+	})
+
+	test('rejects an unknown mode', () => {
+		const { utils } = mockUtils()
+		expect(() =>
+			bindCreateJob({
+				queues: [dated],
+				enqueue: utils,
+				payloadMode: 'loose' as never
+			})
+		).toThrow('payloadMode')
+	})
+})

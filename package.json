@@ -41,6 +41,10 @@
 		"./advanced": {
 			"types": "./dist/advanced.d.ts",
 			"import": "./dist/advanced.js"
+		},
+		"./prisma": {
+			"types": "./dist/prisma.d.ts",
+			"import": "./dist/prisma.js"
 		}
 	},
 	"types": "./dist/index.d.ts",

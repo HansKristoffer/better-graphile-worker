@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util'
 import { z } from 'zod'
 import type { QueueContract } from './queue.js'
 import type { BetterWorker } from './create-better-worker.js'
+import type { BetterWorkerPool } from './worker-pool.js'
 import type { JobOptions } from './job-options.js'
 import { assertInteger } from './validation.js'
 
@@ -26,7 +27,7 @@ function required(value: string | undefined, label: string): string {
 	return value
 }
 export function createCli<T extends readonly QueueContract[]>(
-	worker: BetterWorker<T>
+	worker: BetterWorker<T> | BetterWorkerPool<T>
 ): (argv?: string[]) => Promise<void> {
 	// Dynamic input always goes through the same registry and runtime validation as typed calls.
 	const enqueue = worker.createJob as (

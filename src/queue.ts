@@ -118,6 +118,8 @@ export type QueueContract<
 	readonly timeout?: number
 	/** Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`. */
 	readonly serial?: boolean | string
+	/** The `createBetterWorkerPool` runner that executes this queue's jobs. */
+	readonly runner?: string
 	readonly cron?: CronSchedule
 	readonly cronOptions?: Readonly<QueueCronOptions>
 	/** Synchronous, pure: derive a lane, key, priority or flags from each job's wire input. */
@@ -265,45 +267,63 @@ export type InlineQueues<T extends readonly QueueContract[]> = {
 	[K in keyof T]: InlineQueueDefinition<T[K]>
 }
 
+/** A defined queue's literal `runner`, so a worker pool can require a runner for it. */
+export type QueueRunner<R extends string> = [R] extends [never]
+	? unknown
+	: { readonly runner: R }
+type WithRunner<R extends string> = { readonly runner?: R }
+
 /** Define a queue with inferred inline handlers, or a shared handler-free contract. */
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
 	P extends z.ZodType | undefined = undefined,
-	O extends z.ZodType | undefined = undefined
->(config: RegularQueue<S, N, P, O>): RegularQueue<S, N, P, O>
+	O extends z.ZodType | undefined = undefined,
+	const R extends string = never
+>(
+	config: RegularQueue<S, N, P, O> & WithRunner<R>
+): RegularQueue<S, N, P, O> & QueueRunner<R>
 export function defineQueue<
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
->(config: CronQueue<N, P>): CronQueue<N, P>
+	P extends z.ZodType | undefined = undefined,
+	const R extends string = never
+>(config: CronQueue<N, P> & WithRunner<R>): CronQueue<N, P> & QueueRunner<R>
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
 	P extends z.ZodType | undefined = undefined,
-	O extends z.ZodType | undefined = undefined
->(config: CronInitQueue<S, N, P, O>): CronInitQueue<S, N, P, O>
+	O extends z.ZodType | undefined = undefined,
+	const R extends string = never
+>(
+	config: CronInitQueue<S, N, P, O> & WithRunner<R>
+): CronInitQueue<S, N, P, O> & QueueRunner<R>
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
 	P extends z.ZodType | undefined = undefined,
-	O extends z.ZodType | undefined = undefined
+	O extends z.ZodType | undefined = undefined,
+	const R extends string = never
 >(
-	config: HandlerFreeQueueContract<RegularQueueContract<S, N, P, O>>
-): RegularQueueContract<S, N, P, O>
+	config: HandlerFreeQueueContract<RegularQueueContract<S, N, P, O>> &
+		WithRunner<R>
+): RegularQueueContract<S, N, P, O> & QueueRunner<R>
 export function defineQueue<
 	const N extends string,
-	P extends z.ZodType | undefined = undefined
+	P extends z.ZodType | undefined = undefined,
+	const R extends string = never
 >(
-	config: HandlerFreeQueueContract<CronQueueContract<N, P>>
-): CronQueueContract<N, P>
+	config: HandlerFreeQueueContract<CronQueueContract<N, P>> & WithRunner<R>
+): CronQueueContract<N, P> & QueueRunner<R>
 export function defineQueue<
 	S extends z.ZodType,
 	const N extends string,
 	P extends z.ZodType | undefined = undefined,
-	O extends z.ZodType | undefined = undefined
+	O extends z.ZodType | undefined = undefined,
+	const R extends string = never
 >(
-	config: HandlerFreeQueueContract<CronInitQueueContract<S, N, P, O>>
-): CronInitQueueContract<S, N, P, O>
+	config: HandlerFreeQueueContract<CronInitQueueContract<S, N, P, O>> &
+		WithRunner<R>
+): CronInitQueueContract<S, N, P, O> & QueueRunner<R>
 export function defineQueue(config: QueueContract): QueueContract {
 	return config
 }

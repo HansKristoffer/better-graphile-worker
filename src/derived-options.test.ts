@@ -271,6 +271,7 @@ describe('prepareJob', () => {
 			queue: 'plain',
 			text: 'SELECT NULL::text AS id WHERE false',
 			values: [],
+			count: 0,
 			skipped: true
 		})
 	})

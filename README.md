@@ -178,16 +178,17 @@ await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}`
 `prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction; Graphile 0.17.3 can return fewer jobs if a worker claims an existing key during enqueue. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
 ```ts
+import { enqueueInTransaction } from 'better-graphile-worker/prisma'
+
 const job = await worker.prepareJob('advanceRun', { shopId, runId })
 await prisma.$transaction(async (tx) => {
   await tx.run.update({ where: { id: runId, status: 'sealed' }, data: { status: 'approved' } })
-  if (!job.skipped) {
-    const rows = await tx.$queryRawUnsafe<{ id: string | null }[]>(job.text, ...job.values)
-    if (rows.length !== 1 || !rows[0]?.id) throw new Error('Job enqueue lost a key race')
-  }
+  const [jobId] = await enqueueInTransaction(tx, job)
 })
 // node-postgres: await client.query(job.text, job.values) between BEGIN and COMMIT
 ```
+
+`enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws when Graphile returned fewer jobs than `job.count`, which rolls the transaction back. It works with any client that has Prisma's `$queryRawUnsafe`; the package does not depend on Prisma.
 
 Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
@@ -202,6 +203,29 @@ const exportsWorker = createBetterWorker({ pgPool, queues, process: ['exportRun'
 const apiWorker = createBetterWorker({ pgPool, queues, process: ['advanceRun'], concurrency: 8 })
 await Promise.all([exportsWorker.start(), apiWorker.start()])
 ```
+
+### Worker pools
+
+A worker pool runs one worker per runner, so a burst of background jobs cannot take the slots a latency-sensitive queue needs. Each queue names its `runner`; the pool requires options for every runner its queues name, and every queue in it must name one.
+
+```ts
+const sendReply = defineQueue({ name: 'sendReply', runner: 'turn', inputSchema: z.object({ id: z.string() }), processFn })
+const nightlyDigest = defineQueue({ name: 'nightlyDigest', runner: 'background', cron: '0 3 * * *', processFn })
+const queues = defineQueues([sendReply, nightlyDigest])
+
+const runners = {
+  turn: { concurrency: 10, pollInterval: 100, secondLookOnNotify: 10 },
+  background: { concurrency: 4, pollInterval: 1000 }
+}
+const pgPool = new Pool({ connectionString, max: pgPoolSize(runners) + 4 }) // + producer headroom
+const workers = createBetterWorkerPool({ pgPool, queues, runners, completedJobs: { maxPerQueue: 50 } })
+await workers.start()
+await workers.jobs.sendReply({ id })
+```
+
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify` and `graphile`; every other option is shared. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+
+Every worker on a database wakes on each new job, and Graphile's fetch locks every available serial lane, not only its own queues' lanes. A worker that is fetching for another queue can hide a lane's job from the worker that should take it, which then waits for its next poll. `secondLookOnNotify: milliseconds` fetches once more that long after each new-job notification. It costs one extra fetch per insert; set it on runners where poll latency matters. It works on `createBetterWorker` too.
 
 Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold; a `timeout` below 4 hours enforces this.
 
@@ -252,7 +276,7 @@ JavaScript cannot kill a function. A handler that ignores its signal keeps runni
 
 Producer inputs use `z.input`; consumers receive `z.output`. Both use async parsing, including async refinements and transforms. Validation runs before enqueue by default and again on the consumer because other producers can write jobs. Cron-init validates each returned input once during enqueue; it never enqueues transformed outputs.
 
-Wire inputs must contain plain JSON values: strings, finite numbers, booleans, null, arrays and plain objects. Dates, bigints, functions, class instances, cycles and nested undefined values are rejected. Encode dates as strings at the producer; a schema can transform those strings into Dates in the handler. Root `undefined` is supported for optional/defaulted inputs and restored before parsing. `validateOnEnqueue: false` skips schema checks, but still enforces the JSON wire format.
+Wire inputs must contain plain JSON values: strings, finite numbers, booleans, null, arrays and plain objects. Dates, bigints, functions, class instances, cycles and nested undefined values are rejected. Encode dates as strings at the producer; a schema can transform those strings into Dates in the handler. Root `undefined` is supported for optional/defaulted inputs and restored before parsing. `validateOnEnqueue: false` skips schema checks, but still enforces the JSON wire format. `payloadMode: 'json-compat'` on a worker, pool or job client passes inputs through `JSON.stringify` first, as producers before version 2 did: undefined fields are dropped, dates become ISO strings and `NaN` becomes `null`. Producer types are unchanged, so validation runs against the converted value.
 
 All new jobs, including scheduled cron, use a version-2 envelope with payload, trace metadata, optional checkpoints and progress in separate fields. Business fields named `__trace`, `traceparent`, `__bgw`, `steps` or `progress` survive inside the payload. Only this format is accepted. Raw Graphile producers must supply the current envelope; prefer instance enqueue methods.
 
@@ -417,7 +441,7 @@ Concurrent `start()` calls share startup; stop during startup waits and shuts do
 
 Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
 
-Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
 
 ## Administration, CLI and testing
 
