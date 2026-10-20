@@ -4,6 +4,7 @@ import * as client from 'better-graphile-worker/client'
 import * as advanced from 'better-graphile-worker/advanced'
 import { createTestHarness } from 'better-graphile-worker/testing'
 import { createCli } from 'better-graphile-worker/cli'
+import { enqueueInTransaction } from 'better-graphile-worker/prisma'
 import pg from 'pg'
 import { z } from 'zod'
 
@@ -13,6 +14,8 @@ for (const name of ['createQueue', 'setOtelApi', 'bindCreateJob', 'createJobsApi
 assert.equal(advanced.getOtel(), null)
 assert.equal(typeof createTestHarness, 'function')
 assert.equal(typeof createCli, 'function')
+assert.equal(typeof enqueueInTransaction, 'function')
+assert.equal(typeof root.createBetterWorkerPool, 'function')
 if (process.env.DATABASE_URL) {
 	const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
 	pool.on('error', () => {})

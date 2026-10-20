@@ -3,6 +3,8 @@ import { Pool } from 'pg'
 import * as otel from '@opentelemetry/api'
 import {
 	createBetterWorker,
+	createBetterWorkerPool,
+	pgPoolSize,
 	defineQueue,
 	defineQueues,
 	isRegularQueue,
@@ -19,6 +21,7 @@ import {
 import { createJobClient } from 'better-graphile-worker/client'
 import { createTestHarness } from 'better-graphile-worker/testing'
 import { createCli } from 'better-graphile-worker/cli'
+import { enqueueInTransaction } from 'better-graphile-worker/prisma'
 
 const pool = new Pool()
 const contracts = defineQueues([
@@ -815,3 +818,48 @@ export type WaitedOutput = Assert<
 		{ upserted: number }
 	>
 >
+
+// Worker pools: queues name a runner, and the pool requires options for each runner.
+const turnQueue = defineQueue({
+	name: 'turnReply',
+	runner: 'turn',
+	inputSchema: z.object({ id: z.string() })
+})
+const batchQueue = defineQueue({
+	name: 'nightly',
+	runner: 'batch',
+	cron: '0 3 * * *'
+})
+const pooled = defineQueues([turnQueue, batchQueue])
+const runners = {
+	turn: { concurrency: 10, pollInterval: 100, secondLookOnNotify: 10 },
+	batch: { concurrency: 2 }
+}
+const workerPool = createBetterWorkerPool({
+	pgPool: new Pool({ max: pgPoolSize(runners) }),
+	queues: pooled,
+	handlers: { turnReply: async ({ id }) => void id, nightly: async () => {} },
+	runners,
+	payloadMode: 'json-compat',
+	otel: { api: otel, metrics: true }
+})
+void workerPool.jobs.turnReply({ id: 'a' })
+void workerPool.runners.batch.getCompletedJobs()
+createCli(workerPool)
+createBetterWorkerPool({
+	pgPool: pool,
+	queues: pooled,
+	handlers: { turnReply: async () => {}, nightly: async () => {} },
+	// @ts-expect-error Every runner a queue names needs options
+	runners: { turn: {} }
+})
+export const transactional = async (tx: PrismaTransactionLike) =>
+	enqueueInTransaction(
+		tx,
+		await workerPool.prepareJob('turnReply', { id: 'a' })
+	)
+// Prisma's own signature, so its transaction client fits enqueueInTransaction.
+type PrismaTransactionLike = {
+	// biome-ignore lint/suspicious/noExplicitAny: mirrors Prisma's $queryRawUnsafe
+	$queryRawUnsafe<T = unknown>(query: string, ...values: any[]): Promise<T>
+}

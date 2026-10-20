@@ -9,6 +9,7 @@ import {
 	type CronItem,
 	type CronMatcher,
 	type JobHelpers,
+	type WorkerEventMap,
 	type WorkerEvents
 } from 'graphile-worker'
 import { EventEmitter } from 'node:events'
@@ -867,6 +868,25 @@ function withDurableCompletion(graphile: GraphileRunnerOverrides | undefined) {
 	}
 }
 
+/**
+ * Graphile's fetch locks every available lane with `FOR UPDATE SKIP LOCKED`, and every
+ * worker on the database wakes on each insert. One that locked a lane for its own fetch
+ * hides the lane's job from the others until its next poll; fetching once more just after
+ * the notification finds it.
+ */
+function secondLookListener(delayMs: number | undefined) {
+	if (delayMs === undefined) return undefined
+	return ({
+		workerPool,
+		message
+	}: WorkerEventMap['pool:listen:notification']) => {
+		if (message.channel !== 'jobs:insert') return
+		setTimeout(() => {
+			if (workerPool._active && !workerPool._shuttingDown) workerPool.nudge(1)
+		}, delayMs).unref()
+	}
+}
+
 export async function startRunner(options: {
 	pgPool: Pool
 	schema: string
@@ -878,6 +898,7 @@ export async function startRunner(options: {
 	graphile?: GraphileRunnerOverrides | undefined
 	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
 	onPoolCreate?: ((poolId: string) => void) | undefined
+	secondLookOnNotify?: number | undefined
 }): Promise<Runner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
@@ -890,9 +911,11 @@ export async function startRunner(options: {
 	const listener = ({ workerPool }: { workerPool: { id: string } }) =>
 		onPoolCreate?.(workerPool.id)
 	events.on('pool:create', listener)
+	const secondLook = secondLookListener(options.secondLookOnNotify)
+	if (secondLook) events.on('pool:listen:notification', secondLook)
 
 	try {
-		return await run(
+		const runner = await run(
 			compact({
 				...withDurableCompletion(graphile),
 				events,
@@ -905,6 +928,15 @@ export async function startRunner(options: {
 				pollInterval: options.pollInterval
 			})
 		)
+		if (secondLook)
+			void runner.promise
+				.finally(() => events.off('pool:listen:notification', secondLook))
+				// The lifecycle reports runner failures; this chain only detaches.
+				.catch(() => {})
+		return runner
+	} catch (error) {
+		if (secondLook) events.off('pool:listen:notification', secondLook)
+		throw error
 	} finally {
 		// run() emits pool:create synchronously before it resolves.
 		events.off('pool:create', listener)

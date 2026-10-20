@@ -14,6 +14,7 @@ export {
 	getQueueType,
 	hasInputSchema,
 	type QueueContract,
+	type QueueRunner,
 	type QueueCronOptions,
 	type DerivedJobOptions,
 	type ContinueOptions,
@@ -57,8 +58,17 @@ export {
 	DEFAULT_POLL_INTERVAL,
 	type BetterWorker,
 	type BetterWorkerOptions,
-	type CompletedJobsOption
+	type CompletedJobsOption,
+	type WorkerRunnerOptions
 } from './create-better-worker.js'
+export {
+	createBetterWorkerPool,
+	pgPoolSize,
+	type BetterWorkerPool,
+	type BetterWorkerPoolOptions,
+	type RunnerName
+} from './worker-pool.js'
+export type { PayloadMode } from './create-job.js'
 export {
 	createJobClient,
 	type JobClient,

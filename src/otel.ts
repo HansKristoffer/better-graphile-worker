@@ -72,7 +72,27 @@ export type OtelApi = {
 			}
 		): OtelContext
 	}
+	/** Read only with `otel: { metrics: true }`. */
+	metrics?: {
+		getMeter(name: string): OtelMeter
+	}
 }
+
+type MetricAttributes = Record<string, string>
+type InstrumentOptions = { description?: string; unit?: string }
+export type OtelMeter = {
+	createCounter(
+		name: string,
+		options?: InstrumentOptions
+	): { add(value: number, attributes?: MetricAttributes): void }
+	createHistogram(
+		name: string,
+		options?: InstrumentOptions
+	): { record(value: number, attributes?: MetricAttributes): void }
+}
+
+/** `api: null` disables tracing; `metrics: true` adds queue metrics from the same API. */
+export type OtelOption = { api: OtelApi | null; metrics?: boolean | undefined }
 
 let cached: OtelApi | null | undefined
 

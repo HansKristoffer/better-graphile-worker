@@ -111,6 +111,8 @@ export type PreparedJob = {
 	/** Returns one `id` row per created job. */
 	readonly text: string
 	readonly values: (string | number | boolean | null)[]
+	/** How many `id` rows the statement must return: one per job, 0 when skipped. */
+	readonly count: number
 	/** True when `shouldSkipEnqueue` applied; the statement then inserts nothing. */
 	readonly skipped: boolean
 }

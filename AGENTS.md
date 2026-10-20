@@ -20,6 +20,7 @@ Prefer the smallest model that makes the correct behavior unsurprising. Do not k
 - **you** means the agent reading this file. **we / maintainer** means the person you are working with. **user** means a developer using this package in their app.
 - **queue** means one `defineQueue` definition. It maps to one Graphile _task identifier_, not to a Graphile _job queue_.
 - **lane** means a Graphile job queue (`queueName`): jobs in one lane run one at a time. `serial` and `deriveJobOptions().queueName` select it.
+- **runner** means one worker of a `createBetterWorkerPool`, with its own concurrency, executing the queues whose `runner` names it.
 - **kind** is regular (`inputSchema`), cron (`cron`, no schema) or cron-init (`cron` + `inputSchema` + `initFn`, which fans out through a generated `{name}_cron-init` task).
 - **contract** means a definition without handlers, shared with producers. Handlers are then supplied as a registry to the worker.
 - **wire input** means the producer's `z.input` value as stored in the jobs table. **payload** means the parsed `z.output` handed to `processFn`.
@@ -40,7 +41,7 @@ Prefer the smallest model that makes the correct behavior unsurprising. Do not k
 A change usually works on the path you tested and is missing elsewhere. Before calling a change done, walk this list and say which entries applied:
 
 - **Entry points.** Enqueue behavior is reachable through `createJob`, `createJobs`, `jobs.*`, `ctx.createJob(s)`, `prepareJob(s)`, cron-init fan-out, the job client and the CLI. Fixing one is not fixing the feature.
-- **Subpath exports.** `.`, `/client`, `/testing`, `/advanced` and `/cli` are separate entry points in [`package.json`](package.json). New public API needs an export in the right one.
+- **Subpath exports.** `.`, `/client`, `/testing`, `/advanced`, `/cli` and `/prisma` are separate entry points in [`package.json`](package.json). New public API needs an export in the right one.
 - **Test harness.** `createTestHarness` shares parsing, child-enqueue validation and step replay with production. Route new behavior through the shared code instead of reimplementing it in the harness.
 - **Registration styles.** Inline handlers and contract + handler registry are both supported. Check types and runtime for both.
 - **Reverse states.** If you added a way in, add the way out and the way to see it: retry for fail, admin visibility for retention.
@@ -87,9 +88,9 @@ All source is flat in `src/`, with a colocated `*.test.ts` per module.
 
 - **Defining:** `queue.ts` (`defineQueue`), `define-queues.ts`, `registry.ts`, `types.ts`, `job-options.ts`.
 - **Enqueuing:** `create-job.ts`, `enqueue-sql.ts`, `job-client.ts`, `client.ts`.
-- **Running:** `create-better-worker.ts`, `worker.ts`, `lifecycle.ts`, `steps.ts`, `payload.ts`, `private-jobs.ts`.
-- **Observing:** `hooks.ts`, `observers.ts`, `otel.ts`, `default-logger.ts`, `completed-jobs-store.ts`, `admin.ts`.
-- **Entry points:** `index.ts`, `advanced.ts`, `testing.ts`, `cli.ts`, `job-client.ts`.
+- **Running:** `create-better-worker.ts`, `worker-pool.ts`, `worker.ts`, `lifecycle.ts`, `steps.ts`, `payload.ts`, `private-jobs.ts`.
+- **Observing:** `hooks.ts`, `observers.ts`, `otel.ts`, `metrics.ts`, `default-logger.ts`, `completed-jobs-store.ts`, `admin.ts`.
+- **Entry points:** `index.ts`, `advanced.ts`, `testing.ts`, `cli.ts`, `job-client.ts`, `prisma.ts`.
 - **Guards:** `validation.ts` (JSON wire values, integers), `schema-name.ts`, `errors.ts`.
 - `scripts/` holds build and package verification. `tests/consumers/` holds the packed-consumer fixtures.
 
