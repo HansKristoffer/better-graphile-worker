@@ -77,10 +77,15 @@ export function createBetterWorkerPool<
 	const workers = Object.fromEntries(
 		[...assigned].map(([name, queues]) => [
 			name,
-			createWorker(
-				{ ...shared, ...runnerOptions[name], process: queues } as never,
+			// The registration union stays generic here; each runner gets the caller's options.
+			createWorker<TQueues>(
+				{
+					...shared,
+					...runnerOptions[name],
+					process: queues
+				} as never,
 				completedJobs
-			) as BetterWorker<TQueues>
+			)
 		])
 	)
 	const all = Object.values(workers)

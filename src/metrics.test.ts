@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import type { Pool } from 'pg'
+import * as otel from '@opentelemetry/api'
 import { z } from 'zod'
 import { createJobClient } from './job-client.js'
 import { defineQueue } from './queue.js'
 import type { JobFinishedEvent } from './hooks.js'
-import type { OtelApi, OtelMeter } from './otel.js'
+import type { OtelMeter } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
 
 function fakeMeter() {
@@ -17,8 +18,7 @@ function fakeMeter() {
 			record: (value, attributes) => recorded.push({ name, value, attributes })
 		})
 	}
-	const api = { metrics: { getMeter: () => meter } } as unknown as OtelApi
-	return { api, recorded }
+	return { api: { metrics: { getMeter: () => meter } }, recorded }
 }
 
 const finished: JobFinishedEvent = {
@@ -38,8 +38,7 @@ describe('queue metrics', () => {
 		const seen: JobFinishedEvent[] = []
 		const hooks = withQueueMetrics(
 			{ onJobFinished: (event) => void seen.push(event) },
-			api,
-			{ api, metrics: true }
+			api
 		)
 		await hooks.onJobFinished?.(finished)
 		expect(recorded).toEqual([
@@ -62,47 +61,43 @@ describe('queue metrics', () => {
 		expect(seen).toEqual([finished])
 	})
 
-	test('metrics are opt-in and a failing meter never reaches the job', async () => {
-		const { api, recorded } = fakeMeter()
-		const hooks = {}
-		expect(withQueueMetrics(hooks, api, { api })).toBe(hooks)
-		expect(withQueueMetrics(hooks, null, { api: null, metrics: true })).toBe(
-			hooks
-		)
-
-		const broken = {
+	test('a failing meter still runs the hook and never throws', async () => {
+		const fail = () => {
+			throw new Error('exporter')
+		}
+		const api = {
 			metrics: {
 				getMeter: () => ({
-					createCounter: () => ({
-						add: () => {
-							throw new Error('exporter')
-						}
-					}),
-					createHistogram: () => ({
-						record: () => {
-							throw new Error('exporter')
-						}
-					})
+					createCounter: () => ({ add: fail }),
+					createHistogram: () => ({ record: fail })
 				})
 			}
-		} as unknown as OtelApi
-		await withQueueMetrics({}, broken, {
-			api: broken,
-			metrics: true
-		}).onJobFinished?.(finished)
-		expect(recorded).toEqual([])
+		}
+		const seen: JobFinishedEvent[] = []
+		const hooks = withQueueMetrics(
+			{ onJobFinished: (event) => void seen.push(event) },
+			api
+		)
+		await hooks.onJobFinished?.(finished)
+		expect(seen).toEqual([finished])
 	})
 
-	test('a job client counts failed enqueues', async () => {
+	test('a job client counts failed enqueues only with metrics: true', async () => {
 		const { api, recorded } = fakeMeter()
-		const client = createJobClient({
-			pgPool: {} as Pool,
-			queues: [
-				defineQueue({ name: 'sync', inputSchema: z.object({ id: z.string() }) })
-			],
-			otel: { api, metrics: true }
+		const sync = defineQueue({
+			name: 'sync',
+			inputSchema: z.object({ id: z.string() })
 		})
-		await expect(client.createJob('sync', { id: 1 } as never)).rejects.toThrow()
+		const enqueueInvalid = (metrics: boolean) =>
+			createJobClient({
+				pgPool: {} as Pool,
+				queues: [sync],
+				otel: { api: { ...otel, ...api }, metrics }
+			}).createJob('sync', { id: 1 } as never)
+
+		await expect(enqueueInvalid(false)).rejects.toThrow()
+		expect(recorded).toEqual([])
+		await expect(enqueueInvalid(true)).rejects.toThrow()
 		expect(recorded).toEqual([
 			{
 				name: 'graphile_job_enqueue_fail_total',

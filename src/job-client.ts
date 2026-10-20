@@ -60,14 +60,16 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		pgPool: options.pgPool,
 		schema
 	})
-	const otel = options.otel ? options.otel.api : getOtel()
 	const { createJob, createJobs, prepareJob, prepareJobs } =
 		bindCreateJob<TQueues>({
 			enqueue: client.enqueue,
-			otel,
+			otel: options.otel ? options.otel.api : getOtel(),
 			queues: options.queues,
 			schema,
-			hooks: withQueueMetrics(options.hooks ?? {}, otel, options.otel),
+			hooks: withQueueMetrics(
+				options.hooks ?? {},
+				options.otel?.metrics ? options.otel.api : null
+			),
 			...compact({
 				validateOnEnqueue: options.validateOnEnqueue,
 				defaultMaxAttempts: options.defaultMaxAttempts,

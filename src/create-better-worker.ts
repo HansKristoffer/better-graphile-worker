@@ -246,7 +246,10 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
-	const hooks = withQueueMetrics(options.hooks ?? {}, otel, options.otel)
+	const hooks = withQueueMetrics(
+		options.hooks ?? {},
+		options.otel?.metrics ? options.otel.api : null
+	)
 	const client = createWorkerClient({
 		pgPool: options.pgPool,
 		schema

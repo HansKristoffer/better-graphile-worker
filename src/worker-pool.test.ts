@@ -5,8 +5,10 @@ import { z } from 'zod'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
 import { createBetterWorkerPool, pgPoolSize } from './worker-pool.js'
-import { secondLookListener } from './worker.js'
-import type { OtelApi, OtelMeter } from './otel.js'
+import { createBetterWorker } from './create-better-worker.js'
+import type { OtelMeter } from './otel.js'
+import type { WorkerEvents } from 'graphile-worker'
+import { EventEmitter } from 'node:events'
 
 const quiet = { debug() {}, info() {}, warn() {}, error() {} }
 const reply = defineQueue({
@@ -75,31 +77,6 @@ describe('createBetterWorkerPool', () => {
 	})
 })
 
-describe('secondLookOnNotify', () => {
-	test('nudges the pool once after a new-job notification, unless it is shutting down', async () => {
-		const listener = secondLookListener(0)
-		expect(secondLookListener(undefined)).toBeUndefined()
-		const nudges: number[] = []
-		const workerPool = {
-			_active: true,
-			_shuttingDown: false,
-			nudge: (n: number) => nudges.push(n)
-		}
-		const notify = (channel: string) =>
-			listener?.({ workerPool, message: { channel } } as never)
-
-		notify('jobs:insert')
-		notify('worker:migrate')
-		await new Promise((resolve) => setTimeout(resolve, 0))
-		expect(nudges).toEqual([1])
-
-		notify('jobs:insert')
-		workerPool._shuttingDown = true
-		await new Promise((resolve) => setTimeout(resolve, 0))
-		expect(nudges).toEqual([1])
-	})
-})
-
 const suite = describe.skipIf(!process.env.DATABASE_URL)
 const schema = `bgw_pool_${process.pid}`
 
@@ -123,20 +100,17 @@ suite('worker pool on PostgreSQL', () => {
 			}),
 			createHistogram: () => ({ record() {} })
 		}
-		const api = {
-			...otel,
-			metrics: { getMeter: () => meter }
-		} as unknown as OtelApi
-		const record =
-			(queue: string) =>
-			(_: unknown, ctx: { helpers: { job: { locked_by: string | null } } }) => {
-				lockedBy.set(queue, ctx.helpers.job.locked_by)
-			}
+		const api = { ...otel, metrics: { getMeter: () => meter } }
 		const workers = createBetterWorkerPool({
 			pgPool: pool,
 			schema,
 			queues: contracts,
-			handlers: { reply: record('reply'), digest: record('digest') },
+			handlers: {
+				reply: (_, ctx) =>
+					void lockedBy.set('reply', ctx.helpers.job.locked_by),
+				digest: (_, ctx) =>
+					void lockedBy.set('digest', ctx.helpers.job.locked_by)
+			},
 			completedJobs: { maxPerQueue: 10 },
 			otel: { api, metrics: true },
 			hooks: {
@@ -173,5 +147,45 @@ suite('worker pool on PostgreSQL', () => {
 		expect(
 			counted.filter((entry) => entry.name === 'graphile_job_total')
 		).toHaveLength(2)
+	})
+
+	test('secondLookOnNotify fetches once more after a new-job notification', async () => {
+		const events: WorkerEvents = new EventEmitter()
+		const nudges: number[] = []
+		let secondNudge!: () => void
+		const nudged = new Promise<void>((resolve) => {
+			secondNudge = resolve
+		})
+		const listening = new Promise((resolve) =>
+			events.once('pool:listen:success', resolve)
+		)
+		events.on('pool:create', ({ workerPool }) => {
+			const nudge = workerPool.nudge.bind(workerPool)
+			workerPool.nudge = (count) => {
+				nudges.push(count)
+				if (nudges.length === 2) secondNudge()
+				nudge(count)
+			}
+		})
+		const worker = createBetterWorker({
+			pgPool: pool,
+			schema,
+			queues: [reply],
+			handlers: { reply: () => {} },
+			pollInterval: 60_000,
+			secondLookOnNotify: 10,
+			graphile: { events },
+			hooks: { createLogger: () => quiet }
+		})
+		await worker.start()
+		try {
+			await listening
+			await worker.createJob('reply', { id: 'notified' })
+			await nudged
+		} finally {
+			await worker.stop()
+		}
+		// Graphile's own nudge for the insert, then the second look.
+		expect(nudges).toEqual([1, 1])
 	})
 })

@@ -1,11 +1,13 @@
 import type { BetterWorkerHooks, JobFinishedEvent } from './hooks.js'
-import type { OtelApi, OtelOption } from './otel.js'
+import type { OtelApi } from './otel.js'
+
+type MetricsApi = Pick<OtelApi, 'metrics'>
 
 /**
  * Queue metrics recorded through the instance's OTel meter. Recording runs before the
  * caller's hook and never throws, so a failing exporter cannot change a job's outcome.
  */
-function createQueueMetrics(api: OtelApi) {
+function createQueueMetrics(api: MetricsApi) {
 	const meter = api.metrics?.getMeter('graphile-worker')
 	if (!meter) return undefined
 	return {
@@ -34,12 +36,12 @@ function record(fn: () => void) {
 	}
 }
 
+/** `api` is the instance's OTel API when `otel.metrics` is on, otherwise null. */
 export function withQueueMetrics(
 	hooks: BetterWorkerHooks,
-	api: OtelApi | null,
-	option: OtelOption | undefined
+	api: MetricsApi | null
 ): BetterWorkerHooks {
-	if (!option?.metrics || !api) return hooks
+	if (!api) return hooks
 	let metrics: ReturnType<typeof createQueueMetrics>
 	try {
 		metrics = createQueueMetrics(api)

@@ -874,7 +874,7 @@ function withDurableCompletion(graphile: GraphileRunnerOverrides | undefined) {
  * hides the lane's job from the others until its next poll; fetching once more just after
  * the notification finds it.
  */
-export function secondLookListener(delayMs: number | undefined) {
+function secondLookListener(delayMs: number | undefined) {
 	if (delayMs === undefined) return undefined
 	return ({
 		workerPool,
@@ -931,6 +931,7 @@ export async function startRunner(options: {
 		if (secondLook)
 			void runner.promise
 				.finally(() => events.off('pool:listen:notification', secondLook))
+				// The lifecycle reports runner failures; this chain only detaches.
 				.catch(() => {})
 		return runner
 	} catch (error) {
