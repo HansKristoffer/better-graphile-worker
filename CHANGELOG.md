@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.5.0...v2.6.0) (2026-10-21)
+
+
+### Features
+
+* typed transactional enqueue, runner prefetch and exported queue metric definitions ([#24](https://github.com/HansKristoffer/better-graphile-worker/issues/24)) ([9217c7d](https://github.com/HansKristoffer/better-graphile-worker/commit/9217c7ddf0ea718611adfabde3b12f32048c2ffb))
+
 ## [2.5.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.4.0...v2.5.0) (2026-10-20)
 
 
