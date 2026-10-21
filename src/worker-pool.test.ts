@@ -6,8 +6,9 @@ import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
 import { createBetterWorkerPool, pgPoolSize } from './worker-pool.js'
 import { createBetterWorker } from './create-better-worker.js'
+import { WorkerStoppedError } from './errors.js'
 import type { OtelMeter } from './otel.js'
-import type { WorkerEvents } from 'graphile-worker'
+import type { WorkerEvents, WorkerPool } from 'graphile-worker'
 import { EventEmitter } from 'node:events'
 
 const quiet = { debug() {}, info() {}, warn() {}, error() {} }
@@ -251,5 +252,37 @@ suite('worker pool on PostgreSQL', () => {
 		} finally {
 			await workers.stop()
 		}
+	})
+
+	test('a runner that stops on its own stops the pool, which rejects and can start again', async () => {
+		const turn: WorkerEvents = new EventEmitter()
+		// A WorkerPool is thenable, so it is handed out boxed rather than awaited.
+		const created = new Promise<{ workerPool: WorkerPool }>((resolve) =>
+			turn.once('pool:create', resolve)
+		)
+		const workers = createBetterWorkerPool({
+			pgPool: pool,
+			schema,
+			queues: contracts,
+			handlers,
+			runners: { turn: { graphile: { events: turn } }, background: {} },
+			hooks: { createLogger: () => quiet }
+		})
+		await workers.start()
+		const { workerPool } = await created
+		// What Graphile does by itself when it cannot complete jobs or return its local queue.
+		void workerPool.gracefulShutdown('Connection terminated unexpectedly')
+		const error = await workers.promise.catch((caught: unknown) => caught)
+		expect(error).toBeInstanceOf(WorkerStoppedError)
+		expect(error).toMatchObject({
+			runner: 'turn',
+			cause: { message: 'Connection terminated unexpectedly' }
+		})
+		// The pool stopped the healthy runner; that stop was requested.
+		await workers.runners.background.promise
+
+		await workers.start()
+		await workers.stop()
+		await workers.promise
 	})
 })

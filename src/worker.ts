@@ -45,7 +45,8 @@ import {
 	NonRetriableError,
 	RetryAtError,
 	StepPersistenceError,
-	UnknownQueueError
+	UnknownQueueError,
+	WorkerStoppedError
 } from './errors.js'
 import {
 	extractCronMeta,
@@ -912,6 +913,8 @@ export async function startRunner(options: {
 	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
 	onPoolCreate?: ((poolId: string) => void) | undefined
 	secondLookOnNotify?: number | undefined
+	/** Names the pool runner in a `WorkerStoppedError`. */
+	runnerName?: string | undefined
 }): Promise<Runner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
@@ -926,6 +929,27 @@ export async function startRunner(options: {
 	events.on('pool:create', listener)
 	const secondLook = secondLookListener(options.secondLookOnNotify)
 	if (secondLook) events.on('pool:listen:notification', secondLook)
+	// Graphile shuts its pool down on errors it cannot recover from (a failed job
+	// completion, a local queue that cannot return its jobs) and then resolves the
+	// runner's promise as if it had been asked to stop.
+	let cause: Error | undefined
+	const onFatalError = ({ error }: WorkerEventMap['pool:fatalError']) => {
+		cause ??= error instanceof Error ? error : new Error(String(error))
+	}
+	const onShutdown = ({
+		message
+	}: WorkerEventMap['pool:gracefulShutdown' | 'pool:forcefulShutdown']) => {
+		cause ??= new Error(message)
+	}
+	const detach = () => {
+		if (secondLook) events.off('pool:listen:notification', secondLook)
+		events.off('pool:fatalError', onFatalError)
+		events.off('pool:gracefulShutdown', onShutdown)
+		events.off('pool:forcefulShutdown', onShutdown)
+	}
+	events.on('pool:fatalError', onFatalError)
+	events.on('pool:gracefulShutdown', onShutdown)
+	events.on('pool:forcefulShutdown', onShutdown)
 
 	try {
 		const runner = await run(
@@ -946,14 +970,24 @@ export async function startRunner(options: {
 				pollInterval: options.pollInterval
 			})
 		)
-		if (secondLook)
-			void runner.promise
-				.finally(() => events.off('pool:listen:notification', secondLook))
-				// The lifecycle reports runner failures; this chain only detaches.
-				.catch(() => {})
-		return runner
+		let requested = false
+		return {
+			...runner,
+			stop: (reason) => {
+				requested = true
+				return runner.stop(reason)
+			},
+			kill: (reason) => {
+				requested = true
+				return runner.kill(reason)
+			},
+			promise: runner.promise.finally(detach).then(() => {
+				if (!requested)
+					throw new WorkerStoppedError(options.runnerName, { cause })
+			})
+		}
 	} catch (error) {
-		if (secondLook) events.off('pool:listen:notification', secondLook)
+		detach()
 		throw error
 	} finally {
 		// run() emits pool:create synchronously before it resolves.

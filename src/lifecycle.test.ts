@@ -129,6 +129,39 @@ test('natural runner failure cleans up signals and preserves the startup error',
 	await expect(failed.start()).rejects.toBe(error)
 })
 
+test('a runner that ends on its own is forgotten: start() runs a new one, stop() only releases', async () => {
+	const runs: {
+		stopped: number
+		completion: ReturnType<typeof deferred<void>>
+	}[] = []
+	let releases = 0
+	const lifecycle = createLifecycle({
+		start: async () => {
+			const run = { stopped: 0, completion: deferred<void>() }
+			runs.push(run)
+			return {
+				promise: run.completion.promise,
+				async stop() {
+					run.stopped++
+					run.completion.resolve()
+				}
+			}
+		},
+		release: async () => {
+			releases++
+		},
+		onError: () => {}
+	})
+	await lifecycle.start()
+	const died = new Error('runner died')
+	runs[0]!.completion.reject(died)
+	await expect(lifecycle.waitUntilStopped()).rejects.toBe(died)
+	await lifecycle.start()
+	expect(runs).toHaveLength(2)
+	await lifecycle.stop()
+	expect(runs.map((run) => run.stopped)).toEqual([0, 1])
+	expect(releases).toBe(1)
+})
 test('signals during startup wait for the runner and shut it down', async () => {
 	const completed = deferred<void>()
 	let stopped = false

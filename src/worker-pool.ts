@@ -84,7 +84,8 @@ export function createBetterWorkerPool<
 					...runnerOptions[name],
 					process: queues
 				} as never,
-				completedJobs
+				completedJobs,
+				name
 			)
 		])
 	)
@@ -103,24 +104,35 @@ export function createBetterWorkerPool<
 	} = primary
 	const each = (run: (worker: BetterWorker<TQueues>) => Promise<void>) =>
 		Promise.all(all.map(run)).then(() => {})
+	/** Waits for every runner, then rejects with the first failure. */
+	const settled = async (
+		run: (worker: BetterWorker<TQueues>) => Promise<void>
+	) => {
+		const results = await Promise.allSettled(all.map(run))
+		const failed = results.find((result) => result.status === 'rejected')
+		if (failed) throw failed.reason
+	}
+	const stopAll = () => Promise.allSettled(all.map((worker) => worker.stop()))
 
 	return {
 		...delegated,
 		runners: workers as BetterWorkerPool<TQueues>['runners'],
 		get promise() {
-			return each((worker) => worker.promise)
+			return settled((worker) => worker.promise)
 		},
 		async start() {
 			try {
 				await each((worker) => worker.start())
 			} catch (error) {
 				// A partly started pool would leave some queues without a runner.
-				await Promise.allSettled(all.map((worker) => worker.stop()))
+				await stopAll()
 				throw error
 			}
+			// Likewise a runner that stops on its own: the pool stops the rest and rejects.
+			for (const worker of all) void worker.promise.catch(stopAll)
 		},
 		stop: (stopOptions) => each((worker) => worker.stop(stopOptions)),
-		waitUntilStopped: () => each((worker) => worker.waitUntilStopped()),
+		waitUntilStopped: () => settled((worker) => worker.waitUntilStopped()),
 		runOnce: () => each((worker) => worker.runOnce())
 	}
 }

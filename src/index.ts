@@ -114,6 +114,7 @@ export {
 	InvalidSchemaNameError,
 	StepPersistenceError,
 	ShutdownTimeoutError,
+	WorkerStoppedError,
 	JobTimeoutError,
 	StepSerializationError,
 	ChildJobFailedError,

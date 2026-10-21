@@ -239,7 +239,8 @@ export function createBetterWorker<
 /** A worker pool's runners share one history, so any of them reports all its jobs. */
 export function createWorker<const TQueues extends readonly QueueContract[]>(
 	options: BetterWorkerOptions<TQueues>,
-	completedJobs: CompletedJobsStore
+	completedJobs: CompletedJobsStore,
+	runnerName?: string
 ): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
 	const queues = selectProcessed(
@@ -358,6 +359,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				graphile: options.graphile,
 				secondLookOnNotify: options.secondLookOnNotify,
 				prefetch: options.prefetch,
+				runnerName,
 				onPoolCreate: maintained
 					? (workerId) => {
 							maintenance = startMaintenance({
