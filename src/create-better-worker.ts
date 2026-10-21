@@ -52,7 +52,7 @@ import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
-import type { PayloadMode } from './create-job.js'
+import type { JobKeyMode, PayloadMode } from './create-job.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import {
 	maintainOnce,
@@ -63,6 +63,7 @@ import {
 import type {
 	CreateJobFn,
 	CreateJobsFn,
+	EnqueueInTransactionFn,
 	PrepareJobFn,
 	PrepareJobsFn,
 	CronQueueName,
@@ -111,10 +112,21 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 */
 	secondLookOnNotify?: number | undefined
 	/**
+	 * Fetch and lock up to `concurrency + prefetch` jobs at once, so the next job is ready
+	 * when a slot frees (Graphile's `localQueue.size`). Off by default; `1` is a common start.
+	 * Locked jobs wait locally, so another worker cannot take them meanwhile.
+	 */
+	prefetch?: number | undefined
+	/**
 	 * `json-compat` passes wire inputs through `JSON.stringify` first, as producers before
 	 * version 2 did: undefined fields are dropped and dates become strings.
 	 */
 	payloadMode?: PayloadMode | undefined
+	/**
+	 * `jobKeyMode` for `enqueueInTransaction` jobs that set a `jobKey` but no mode; other
+	 * enqueue paths keep Graphile's `replace`. Defaults to `replace`.
+	 */
+	transactionalJobKeyMode?: JobKeyMode | undefined
 }
 
 /** How handlers are registered: inline `processFn`s or a contract handler registry. */
@@ -132,12 +144,19 @@ export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
 /** Options each runner of a worker pool sets for itself. */
 export type WorkerRunnerOptions = Pick<
 	BaseWorkerOptions<readonly QueueContract[]>,
-	'concurrency' | 'pollInterval' | 'secondLookOnNotify' | 'graphile'
+	| 'concurrency'
+	| 'pollInterval'
+	| 'secondLookOnNotify'
+	| 'graphile'
+	| 'prefetch'
 >
 
-/** Worker options a pool shares across its runners. */
+/** Worker options a pool shares across its runners; `prefetch` is a default runners override. */
 export type SharedWorkerOptions<TQueues extends readonly QueueContract[]> =
-	Omit<BaseWorkerOptions<TQueues>, 'process' | keyof WorkerRunnerOptions>
+	Omit<
+		BaseWorkerOptions<TQueues>,
+		'process' | Exclude<keyof WorkerRunnerOptions, 'prefetch'>
+	>
 
 export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly schema: string
@@ -147,6 +166,8 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	/** Build enqueue SQL to execute inside your own transaction. */
 	readonly prepareJob: PrepareJobFn<TQueues>
 	readonly prepareJobs: PrepareJobsFn<TQueues>
+	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
+	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
 	readonly promise: Promise<void>
 	migrate(): Promise<void>
@@ -235,6 +256,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 	)
 	if (options.defaultTimeout !== undefined)
 		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
+	if (options.prefetch !== undefined)
+		assertInteger(options.prefetch, 'prefetch', 0)
 	if (options.secondLookOnNotify !== undefined)
 		assertInteger(
 			options.secondLookOnNotify,
@@ -263,7 +286,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			hooks,
 			validateOnEnqueue: options.validateOnEnqueue,
 			defaultMaxAttempts: options.defaultMaxAttempts,
-			payloadMode: options.payloadMode
+			payloadMode: options.payloadMode,
+			transactionalJobKeyMode: options.transactionalJobKeyMode
 		})
 	})
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
@@ -333,6 +357,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				noHandleSignals: true,
 				graphile: options.graphile,
 				secondLookOnNotify: options.secondLookOnNotify,
+				prefetch: options.prefetch,
 				onPoolCreate: maintained
 					? (workerId) => {
 							maintenance = startMaintenance({
@@ -366,6 +391,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		createJobs,
 		prepareJob,
 		prepareJobs,
+		enqueueInTransaction: producer.enqueueInTransaction,
 		jobs,
 		get promise() {
 			return lifecycle.promise

@@ -856,12 +856,23 @@ export type GraphileRunnerOverrides = Omit<
  * and runOnce() can resolve before the job row is updated. Batching (even with
  * no delay) is flushed during shutdown. Caller presets still take precedence.
  */
-function withDurableCompletion(graphile: GraphileRunnerOverrides | undefined) {
+function withDurableCompletion(
+	graphile: GraphileRunnerOverrides | undefined,
+	localQueueSize?: number
+) {
 	return {
 		...graphile,
 		preset: {
 			extends: [
-				{ worker: { completeJobBatchDelay: 0, failJobBatchDelay: 0 } },
+				{
+					worker: {
+						completeJobBatchDelay: 0,
+						failJobBatchDelay: 0,
+						...(localQueueSize === undefined
+							? {}
+							: { localQueue: { size: localQueueSize } })
+					}
+				},
 				...(graphile?.preset ? [graphile.preset] : [])
 			]
 		}
@@ -896,6 +907,8 @@ export async function startRunner(options: {
 	pollInterval: number
 	noHandleSignals: boolean
 	graphile?: GraphileRunnerOverrides | undefined
+	/** Fetch and lock up to `concurrency + prefetch` jobs at once (Graphile's local queue). */
+	prefetch?: number | undefined
 	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
 	onPoolCreate?: ((poolId: string) => void) | undefined
 	secondLookOnNotify?: number | undefined
@@ -917,7 +930,12 @@ export async function startRunner(options: {
 	try {
 		const runner = await run(
 			compact({
-				...withDurableCompletion(graphile),
+				...withDurableCompletion(
+					graphile,
+					options.prefetch === undefined
+						? undefined
+						: options.concurrency + options.prefetch
+				),
 				events,
 				pgPool: options.pgPool,
 				schema: options.schema,

@@ -190,6 +190,18 @@ await prisma.$transaction(async (tx) => {
 
 `enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws when Graphile returned fewer jobs than `job.count`, which rolls the transaction back. It works with any client that has Prisma's `$queryRawUnsafe`; the package does not depend on Prisma.
 
+For one job, `worker.enqueueInTransaction(tx, job)` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
+
+```ts
+const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJobKeyMode: 'unsafe_dedupe' })
+
+type HandoffJob = JobRequest<typeof queues> & { jobKey: string }
+await prisma.$transaction(async (tx) => {
+  await tx.run.update({ where: { id: runId }, data: { status: 'approved' } })
+  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId }, jobKey: `advance:${runId}` })
+})
+```
+
 Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
 `ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. If the handler catches it and throws anyway, the run still counts as continued and the worker logs `job.error_after_ending`. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt (see `RetryAtError` for choosing its time). Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.
@@ -223,9 +235,13 @@ await workers.start()
 await workers.jobs.sendReply({ id })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify` and `graphile`; every other option is shared. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+
+Each started runner holds two connections for as long as it runs: Graphile's LISTEN client, which Graphile opens per worker and cannot share between runners, and the connection maintenance heartbeats on. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `2 × runners` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs two more. Through PgBouncer, LISTEN needs a session-mode connection.
 
 Every worker on a database wakes on each new job, and Graphile's fetch locks every available serial lane, not only its own queues' lanes. A worker that is fetching for another queue can hide a lane's job from the worker that should take it, which then waits for its next poll. `secondLookOnNotify: milliseconds` fetches once more that long after each new-job notification. It costs one extra fetch per insert; set it on runners where poll latency matters. It works on `createBetterWorker` too.
+
+`prefetch: n` fetches and locks up to `concurrency + n` jobs at once (Graphile's `localQueue.size`), so the next job is already local when a slot frees; `1` follows Graphile's `concurrency + 1` advice. Prefetched jobs stay locked to this runner until it takes them, so another worker cannot run them meanwhile. A `localQueue` in your `graphile.preset` takes precedence.
 
 Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold; a `timeout` below 4 hours enforces this.
 
@@ -441,7 +457,7 @@ Concurrent `start()` calls share startup; stop during startup waits and shuts do
 
 Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
 
-Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
 
 ## Administration, CLI and testing
 
