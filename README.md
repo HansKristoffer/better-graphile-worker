@@ -190,6 +190,18 @@ await prisma.$transaction(async (tx) => {
 
 `enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws when Graphile returned fewer jobs than `job.count`, which rolls the transaction back. It works with any client that has Prisma's `$queryRawUnsafe`; the package does not depend on Prisma.
 
+For one job, `worker.enqueueInTransaction(tx, job)` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
+
+```ts
+const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJobKeyMode: 'unsafe_dedupe' })
+
+type HandoffJob = JobRequest<typeof queues> & { jobKey: string }
+await prisma.$transaction(async (tx) => {
+  await tx.run.update({ where: { id: runId }, data: { status: 'approved' } })
+  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId }, jobKey: `advance:${runId}` })
+})
+```
+
 Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
 `ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. If the handler catches it and throws anyway, the run still counts as continued and the worker logs `job.error_after_ending`. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt (see `RetryAtError` for choosing its time). Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.

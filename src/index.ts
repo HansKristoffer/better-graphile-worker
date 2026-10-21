@@ -42,6 +42,8 @@ export type {
 	PreparedJob,
 	PrepareJobFn,
 	PrepareJobsFn,
+	JobRequest,
+	EnqueueInTransactionFn,
 	CreateJobForQueueFn,
 	CreateJobsForQueueFn,
 	JobsApi,
@@ -68,7 +70,7 @@ export {
 	type BetterWorkerPoolOptions,
 	type RunnerName
 } from './worker-pool.js'
-export type { PayloadMode } from './create-job.js'
+export type { JobKeyMode, PayloadMode } from './create-job.js'
 export {
 	createJobClient,
 	type JobClient,

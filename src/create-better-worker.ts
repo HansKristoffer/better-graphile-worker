@@ -52,7 +52,7 @@ import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
-import type { PayloadMode } from './create-job.js'
+import type { JobKeyMode, PayloadMode } from './create-job.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import {
 	maintainOnce,
@@ -63,6 +63,7 @@ import {
 import type {
 	CreateJobFn,
 	CreateJobsFn,
+	EnqueueInTransactionFn,
 	PrepareJobFn,
 	PrepareJobsFn,
 	CronQueueName,
@@ -115,6 +116,11 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * version 2 did: undefined fields are dropped and dates become strings.
 	 */
 	payloadMode?: PayloadMode | undefined
+	/**
+	 * `jobKeyMode` for `enqueueInTransaction` jobs that set a `jobKey` but no mode; other
+	 * enqueue paths keep Graphile's `replace`. Defaults to `replace`.
+	 */
+	transactionalJobKeyMode?: JobKeyMode | undefined
 }
 
 /** How handlers are registered: inline `processFn`s or a contract handler registry. */
@@ -147,6 +153,8 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	/** Build enqueue SQL to execute inside your own transaction. */
 	readonly prepareJob: PrepareJobFn<TQueues>
 	readonly prepareJobs: PrepareJobsFn<TQueues>
+	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
+	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
 	readonly promise: Promise<void>
 	migrate(): Promise<void>
@@ -263,7 +271,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			hooks,
 			validateOnEnqueue: options.validateOnEnqueue,
 			defaultMaxAttempts: options.defaultMaxAttempts,
-			payloadMode: options.payloadMode
+			payloadMode: options.payloadMode,
+			transactionalJobKeyMode: options.transactionalJobKeyMode
 		})
 	})
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
@@ -366,6 +375,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		createJobs,
 		prepareJob,
 		prepareJobs,
+		enqueueInTransaction: producer.enqueueInTransaction,
 		jobs,
 		get promise() {
 			return lifecycle.promise

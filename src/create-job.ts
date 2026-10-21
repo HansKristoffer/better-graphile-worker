@@ -27,6 +27,7 @@ import { assertInteger, assertJsonValue, parseDuration } from './validation.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
+	EnqueueInTransactionFn,
 	JobsApi,
 	PreparedJob,
 	PrepareJobFn,
@@ -39,6 +40,7 @@ import {
 	type IdempotentJobSpec
 } from './enqueue-sql.js'
 import { assertValidSchemaName } from './schema-name.js'
+import { enqueueInTransaction, type PrismaRawClient } from './prisma.js'
 
 export const DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS = 4
 const DEFAULT_IDEMPOTENCY_TTL = 30 * 86_400_000
@@ -61,7 +63,16 @@ export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	/** Schema used by prepared SQL; defaults to `graphile_worker`. */
 	schema?: string
 	payloadMode?: PayloadMode
+	/** Mode for `enqueueInTransaction` jobs with a `jobKey` but no mode of their own. */
+	transactionalJobKeyMode?: JobKeyMode | undefined
 }
+
+export type JobKeyMode = NonNullable<JobOptions['jobKeyMode']>
+const JOB_KEY_MODES: readonly JobKeyMode[] = [
+	'replace',
+	'preserve_run_at',
+	'unsafe_dedupe'
+]
 
 function toJsonCompat(data: unknown): unknown {
 	const text = JSON.stringify(data)
@@ -116,9 +127,7 @@ function deriveOptions(
 			)
 	if (
 		derived.jobKeyMode !== undefined &&
-		!['replace', 'preserve_run_at', 'unsafe_dedupe'].includes(
-			derived.jobKeyMode
-		)
+		!JOB_KEY_MODES.includes(derived.jobKeyMode)
 	)
 		throw new TypeError(
 			`deriveJobOptions for "${queue.name}" returned an invalid jobKeyMode`
@@ -220,6 +229,14 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	)
 	const payloadMode = options.payloadMode ?? 'strict'
+	const { transactionalJobKeyMode } = options
+	if (
+		transactionalJobKeyMode !== undefined &&
+		!JOB_KEY_MODES.includes(transactionalJobKeyMode)
+	)
+		throw new TypeError(
+			'transactionalJobKeyMode must be "replace", "preserve_run_at" or "unsafe_dedupe"'
+		)
 	if (payloadMode !== 'strict' && payloadMode !== 'json-compat')
 		throw new TypeError('payloadMode must be "strict" or "json-compat"')
 	const registry = new Map(options.queues.map((queue) => [queue.name, queue]))
@@ -303,7 +320,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		name: string,
 		data: unknown,
 		jobOptions: JobOptions | undefined,
-		cron: boolean
+		cron: boolean,
+		defaultJobKeyMode?: JobKeyMode
 	) {
 		const queue = find(name)
 		if (cron && queue.cron === undefined)
@@ -320,6 +338,9 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			noInput,
 			noInput ? undefined : deriveOptions(queue, payload)
 		)
+		// The default only fills a mode no call, derived or cron option chose.
+		if (defaultJobKeyMode && spec.jobKey !== undefined)
+			spec.jobKeyMode ??= defaultJobKeyMode
 		return { task, payload, spec }
 	}
 	async function resolveMany(
@@ -460,7 +481,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	async function prepareOne(
 		name: string,
 		data?: unknown,
-		jobOptions?: JobOptions
+		jobOptions?: JobOptions,
+		defaultJobKeyMode?: JobKeyMode
 	): Promise<PreparedJob> {
 		return observed(name, async () => {
 			if (hooks.shouldSkipEnqueue?.()) return skippedJob(name)
@@ -468,7 +490,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 				name,
 				data,
 				jobOptions,
-				false
+				false,
+				defaultJobKeyMode
 			)
 			return producerSpan(`prepareJob: ${task}`, async (span) => {
 				span.setAttributes({ 'job.queue': task, 'job.batch': false })
@@ -523,6 +546,20 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			})
 		})
 	}
+	async function enqueueOneInTransaction(
+		tx: PrismaRawClient,
+		job: { task: string; payload?: unknown } & JobOptions
+	): Promise<string | null> {
+		const { task, payload, ...jobOptions } = job
+		const prepared = await prepareOne(
+			task,
+			payload,
+			jobOptions,
+			transactionalJobKeyMode
+		)
+		const [id] = await enqueueInTransaction(tx, prepared)
+		return id ?? null
+	}
 	// All erased calls pass through this registry/validation boundary.
 	const createJob = enqueueOne as CreateJobFn<T>
 	const createJobs = enqueueMany as CreateJobsFn<T>
@@ -531,6 +568,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		createJobs,
 		prepareJob: prepareOne as PrepareJobFn<T>,
 		prepareJobs: prepareMany as PrepareJobsFn<T>,
+		enqueueInTransaction:
+			enqueueOneInTransaction as unknown as EnqueueInTransactionFn<T>,
 		enqueueOne,
 		enqueueMany,
 		prepareOne,
