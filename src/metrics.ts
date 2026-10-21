@@ -3,28 +3,77 @@ import type { OtelApi } from './otel.js'
 
 type MetricsApi = Pick<OtelApi, 'metrics'>
 
+/** The meter `otel: { metrics: true }` records on. */
+export const QUEUE_METRICS_METER = 'graphile-worker'
+
+/**
+ * The queue metrics this library records, for an app's metric catalog. `attributes` lists
+ * each attribute key, with its values when the set is closed.
+ */
+export const queueMetricDefinitions = [
+	{
+		name: 'graphile_job_total',
+		kind: 'counter',
+		description: 'Graphile Worker jobs finished by queue and status',
+		attributes: { queue: 'string', status: ['success', 'failed'] }
+	},
+	{
+		name: 'graphile_job_duration_ms',
+		kind: 'histogram',
+		unit: 'ms',
+		description: 'Graphile Worker job duration by queue and status',
+		attributes: { queue: 'string', status: ['success', 'failed'] }
+	},
+	{
+		name: 'graphile_job_permanently_failed_total',
+		kind: 'counter',
+		description: 'Graphile Worker jobs that exhausted max attempts',
+		attributes: { queue: 'string' }
+	},
+	{
+		name: 'graphile_job_enqueue_fail_total',
+		kind: 'counter',
+		description: 'Failed createJob / prepareJob enqueue attempts',
+		attributes: { queue: 'string' }
+	}
+] as const satisfies readonly QueueMetricDefinition[]
+
+export type QueueMetricDefinition = {
+	readonly name: string
+	readonly kind: 'counter' | 'histogram'
+	readonly unit?: 'ms'
+	readonly description: string
+	readonly attributes: Readonly<Record<string, 'string' | readonly string[]>>
+}
+
+const [totalMetric, durationMetric, permanentMetric, enqueueFailMetric] =
+	queueMetricDefinitions
+
 /**
  * Queue metrics recorded through the instance's OTel meter. Recording runs before the
  * caller's hook and never throws, so a failing exporter cannot change a job's outcome.
  */
 function createQueueMetrics(api: MetricsApi) {
-	const meter = api.metrics?.getMeter('graphile-worker')
+	const meter = api.metrics?.getMeter(QUEUE_METRICS_METER)
 	if (!meter) return undefined
+	const options = (metric: QueueMetricDefinition) =>
+		metric.unit === undefined
+			? { description: metric.description }
+			: { description: metric.description, unit: metric.unit }
 	return {
-		jobs: meter.createCounter('graphile_job_total', {
-			description: 'Graphile Worker jobs finished by queue and status'
-		}),
-		duration: meter.createHistogram('graphile_job_duration_ms', {
-			description: 'Graphile Worker job duration by queue and status',
-			unit: 'ms'
-		}),
-		permanentlyFailed: meter.createCounter(
-			'graphile_job_permanently_failed_total',
-			{ description: 'Graphile Worker jobs that exhausted max attempts' }
+		jobs: meter.createCounter(totalMetric.name, options(totalMetric)),
+		duration: meter.createHistogram(
+			durationMetric.name,
+			options(durationMetric)
 		),
-		enqueueFailed: meter.createCounter('graphile_job_enqueue_fail_total', {
-			description: 'Failed createJob / prepareJob enqueue attempts'
-		})
+		permanentlyFailed: meter.createCounter(
+			permanentMetric.name,
+			options(permanentMetric)
+		),
+		enqueueFailed: meter.createCounter(
+			enqueueFailMetric.name,
+			options(enqueueFailMetric)
+		)
 	}
 }
 

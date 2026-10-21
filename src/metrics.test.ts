@@ -6,7 +6,11 @@ import { createJobClient } from './job-client.js'
 import { defineQueue } from './queue.js'
 import type { JobFinishedEvent } from './hooks.js'
 import type { OtelMeter } from './otel.js'
-import { withQueueMetrics } from './metrics.js'
+import {
+	QUEUE_METRICS_METER,
+	queueMetricDefinitions,
+	withQueueMetrics
+} from './metrics.js'
 
 function fakeMeter() {
 	const recorded: { name: string; value: number; attributes?: unknown }[] = []
@@ -33,6 +37,36 @@ const finished: JobFinishedEvent = {
 }
 
 describe('queue metrics', () => {
+	test('the exported definitions are the instruments the meter creates', () => {
+		const created: unknown[] = []
+		let meterName: string | undefined
+		const meter: OtelMeter = {
+			createCounter: (name, options) => {
+				created.push({ name, kind: 'counter', ...options })
+				return { add() {} }
+			},
+			createHistogram: (name, options) => {
+				created.push({ name, kind: 'histogram', ...options })
+				return { record() {} }
+			}
+		}
+		withQueueMetrics(
+			{},
+			{
+				metrics: {
+					getMeter: (name) => {
+						meterName = name
+						return meter
+					}
+				}
+			}
+		)
+		expect(meterName).toBe(QUEUE_METRICS_METER)
+		expect(created).toEqual(
+			queueMetricDefinitions.map(({ attributes: _, ...metric }) => metric)
+		)
+	})
+
 	test('a finished job records its count, duration and permanent failure, then runs the hook', async () => {
 		const { api, recorded } = fakeMeter()
 		const seen: JobFinishedEvent[] = []

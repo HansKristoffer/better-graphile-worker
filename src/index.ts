@@ -120,5 +120,10 @@ export {
 	WaitTimeoutError
 } from './errors.js'
 export type { OtelApi } from './otel.js'
+export {
+	QUEUE_METRICS_METER,
+	queueMetricDefinitions,
+	type QueueMetricDefinition
+} from './metrics.js'
 export type { JsonValue, JsonCompatible } from './validation.js'
 export type { PayloadEnvelope } from './payload.js'
