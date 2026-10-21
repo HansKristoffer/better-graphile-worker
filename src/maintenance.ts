@@ -49,11 +49,14 @@ export function heartbeatTableSql(schema: string): string {
 /**
  * Release jobs held by workers whose heartbeat is older than staleAfter. SKIP LOCKED
  * lets every live worker sweep without two of them releasing the same worker.
+ * `sweeperId` is never released: a worker running this is alive, and a stall between
+ * its own heartbeat and this sweep must not make it release its own jobs.
  */
 export async function sweepDeadWorkers(
 	client: PoolClient,
 	schema: string,
-	staleAfter: number
+	staleAfter: number,
+	sweeperId?: string
 ) {
 	const table = `${quoteSchemaName(schema)}.${HEARTBEATS_TABLE}`
 	try {
@@ -62,9 +65,10 @@ export async function sweepDeadWorkers(
 			`DELETE FROM ${table} WHERE worker_id IN (
 	SELECT worker_id FROM ${table}
 	WHERE last_seen_at < now() - $1::float8 * interval '1 millisecond'
+		AND worker_id IS DISTINCT FROM $2
 	FOR UPDATE SKIP LOCKED
 ) RETURNING worker_id`,
-			[staleAfter]
+			[staleAfter, sweeperId ?? null]
 		)
 		const workerIds = dead.rows.map((row) => row.worker_id)
 		const jobIds = workerIds.length
@@ -95,7 +99,7 @@ type MaintenanceOptions = {
  * once, and a failing step does not stop the others.
  */
 async function sweep(
-	options: MaintenanceOptions,
+	options: MaintenanceOptions & { workerId?: string },
 	withConnection: <T>(work: (client: PoolClient) => Promise<T>) => Promise<T>
 ) {
 	const { schema, logger, recovery, outcomeRetention } = options
@@ -112,7 +116,12 @@ async function sweep(
 
 	if (recovery)
 		await attempt('worker.crash_recovery.sweep_failed', async (client) => {
-			const swept = await sweepDeadWorkers(client, schema, recovery.staleAfter)
+			const swept = await sweepDeadWorkers(
+				client,
+				schema,
+				recovery.staleAfter,
+				options.workerId
+			)
 			// Stopped workers leave their row behind; only released jobs are news.
 			if (swept.jobIds.length)
 				logger.warn('worker.crash_recovery.released', {

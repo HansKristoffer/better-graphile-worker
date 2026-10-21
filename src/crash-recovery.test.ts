@@ -80,10 +80,10 @@ suite('crash recovery in PostgreSQL', () => {
 			[id, workerId]
 		)
 	}
-	const sweep = async () => {
+	const sweep = async (sweeperId?: string) => {
 		const client = await pool.connect()
 		try {
-			return await sweepDeadWorkers(client, schema, 60_000)
+			return await sweepDeadWorkers(client, schema, 60_000, sweeperId)
 		} finally {
 			client.release()
 		}
@@ -148,6 +148,25 @@ suite('crash recovery in PostgreSQL', () => {
 			`SELECT worker_id FROM ${q}.bgw_worker_heartbeats`
 		)
 		expect(rows.rows).toEqual([{ worker_id: 'pool-alive' }])
+	})
+
+	test('a worker stalled between its heartbeat and its sweep keeps its own jobs', async () => {
+		const own = await worker.createJob('sync', 'own')
+		const dead = await worker.createJob('sync', 'dead', {
+			queueName: 'other-lane'
+		})
+		await lockAs(own!, 'pool-self')
+		await lockAs(dead!, 'pool-dead')
+		await beatAs('pool-self', '1 hour')
+		await beatAs('pool-dead', '1 hour')
+
+		const swept = await sweep('pool-self')
+
+		expect(swept).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
+		expect(await job(own!)).toMatchObject({
+			locked_by: 'pool-self',
+			queue_locked_by: 'pool-self'
+		})
 	})
 
 	test('a job that keeps killing its worker fails permanently', async () => {
