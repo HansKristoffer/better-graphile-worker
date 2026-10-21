@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.1](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.0...v2.6.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **crash-recovery:** a worker never releases its own jobs in its sweep ([#26](https://github.com/HansKristoffer/better-graphile-worker/issues/26)) ([ab19ed0](https://github.com/HansKristoffer/better-graphile-worker/commit/ab19ed0367e875d438e08e94b16690ac38523085))
+
 ## [2.6.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.5.0...v2.6.0) (2026-10-21)
 
 
