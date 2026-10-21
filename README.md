@@ -235,7 +235,7 @@ await workers.start()
 await workers.jobs.sendReply({ id })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. Likewise, if one runner stops on its own, the pool stops the others and `promise` rejects with that runner's `WorkerStoppedError`. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
 
 Each started runner holds two connections for as long as it runs: Graphile's LISTEN client, which Graphile opens per worker and cannot share between runners, and the connection maintenance heartbeats on. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `2 × runners` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs two more. Through PgBouncer, LISTEN needs a session-mode connection.
 
@@ -454,6 +454,16 @@ const job = await producer.getJobProgress('importOrders', jobId)
 Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
 
 `stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`.
+
+Graphile can stop a worker by itself, for example when it cannot record job completions during a database outage. `promise` and `waitUntilStopped()` then reject with `WorkerStoppedError`, whose `cause` carries Graphile's reason, instead of resolving as they do after `stop()`. Nothing restarts the worker, and a process that still answers health checks looks fine to its platform, so watch `promise`. Exit and let the platform restart the process, or call `start()` again:
+
+```ts
+await workers.start()
+workers.promise.catch((error) => {
+	logger.error('worker stopped', { error })
+	process.exit(1)
+})
+```
 
 Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
 

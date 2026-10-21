@@ -42,7 +42,10 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 				// Track failures even when callers only use start()/stop().
 				const owner = runner
 				const finished = () => {
-					if (runner === owner) cleanupSignals()
+					if (runner !== owner) return
+					cleanupSignals()
+					// A runner that ended on its own is gone: start() runs a new one, stop() only releases.
+					if (!stopping) runner = undefined
 				}
 				void completion.then(finished, (error) => {
 					finished()

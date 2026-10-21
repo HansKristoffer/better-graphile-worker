@@ -81,6 +81,28 @@ export class ShutdownTimeoutError extends Error {
 }
 
 /**
+ * The worker's runner stopped although `stop()` was never called, for example after
+ * Graphile shut its pool down on a database error. Its queues no longer run in this
+ * process; `cause` carries Graphile's reason when it gave one.
+ */
+export class WorkerStoppedError extends Error {
+	constructor(
+		readonly runner: string | undefined,
+		options?: ErrorOptions
+	) {
+		const subject = runner === undefined ? 'Worker' : `Runner "${runner}"`
+		const cause = options?.cause
+		super(
+			`${subject} stopped without stop() being called${
+				cause instanceof Error ? `: ${cause.message}` : ''
+			}`,
+			options
+		)
+		this.name = 'WorkerStoppedError'
+	}
+}
+
+/**
  * An attempt ran longer than its queue's `timeout`. It follows the normal retry
  * rules; it is also the `ctx.signal.reason` handed to the timed-out handler.
  */
