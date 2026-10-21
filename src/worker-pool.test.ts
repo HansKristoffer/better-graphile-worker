@@ -47,6 +47,33 @@ describe('createBetterWorkerPool', () => {
 		expectTypeOf(reply.runner).toEqualTypeOf<'turn'>()
 	})
 
+	test('a typed runner record and a pool prefetch need no cast', () => {
+		const lanes: Record<
+			'turn' | 'background',
+			{ concurrency: number; pollInterval: number }
+		> = {
+			turn: { concurrency: 10, pollInterval: 100 },
+			background: { concurrency: 4, pollInterval: 1000 }
+		}
+		const workers = createBetterWorkerPool({
+			pgPool: new Pool(),
+			queues: contracts,
+			handlers,
+			runners: lanes,
+			prefetch: 1
+		})
+		expectTypeOf(workers.enqueueInTransaction).toBeFunction()
+		expect(() =>
+			createBetterWorkerPool({
+				pgPool: new Pool(),
+				queues: contracts,
+				handlers,
+				runners: lanes,
+				prefetch: -1
+			})
+		).toThrow('prefetch')
+	})
+
 	test('rejects queues without a configured runner and runners without queues', () => {
 		const create = (runners: Record<string, object>, queues = contracts) =>
 			createBetterWorkerPool({
@@ -187,5 +214,42 @@ suite('worker pool on PostgreSQL', () => {
 		}
 		// Graphile's own nudge for the insert, then the second look.
 		expect(nudges).toEqual([1, 1])
+	})
+
+	test("prefetch sizes each runner's local queue; a runner overrides the pool", async () => {
+		const localQueueSize = (events: WorkerEvents) =>
+			new Promise<number | undefined>((resolve) =>
+				events.once('localQueue:init', ({ ctx }) =>
+					resolve(ctx.resolvedPreset.worker.localQueue?.size)
+				)
+			)
+		const turn: WorkerEvents = new EventEmitter()
+		const background: WorkerEvents = new EventEmitter()
+		const sizes = Promise.all([
+			localQueueSize(turn),
+			localQueueSize(background)
+		])
+		const workers = createBetterWorkerPool({
+			pgPool: pool,
+			schema,
+			queues: contracts,
+			handlers,
+			prefetch: 1,
+			runners: {
+				turn: { concurrency: 3, graphile: { events: turn } },
+				background: {
+					concurrency: 2,
+					prefetch: 0,
+					graphile: { events: background }
+				}
+			},
+			hooks: { createLogger: () => quiet }
+		})
+		await workers.start()
+		try {
+			expect(await sizes).toEqual([4, 2])
+		} finally {
+			await workers.stop()
+		}
 	})
 })

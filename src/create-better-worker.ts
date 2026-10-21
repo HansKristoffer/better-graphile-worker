@@ -112,6 +112,12 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 */
 	secondLookOnNotify?: number | undefined
 	/**
+	 * Fetch and lock up to `concurrency + prefetch` jobs at once, so the next job is ready
+	 * when a slot frees (Graphile's `localQueue.size`). Off by default; `1` is a common start.
+	 * Locked jobs wait locally, so another worker cannot take them meanwhile.
+	 */
+	prefetch?: number | undefined
+	/**
 	 * `json-compat` passes wire inputs through `JSON.stringify` first, as producers before
 	 * version 2 did: undefined fields are dropped and dates become strings.
 	 */
@@ -138,12 +144,19 @@ export type BetterWorkerOptions<TQueues extends readonly QueueContract[]> =
 /** Options each runner of a worker pool sets for itself. */
 export type WorkerRunnerOptions = Pick<
 	BaseWorkerOptions<readonly QueueContract[]>,
-	'concurrency' | 'pollInterval' | 'secondLookOnNotify' | 'graphile'
+	| 'concurrency'
+	| 'pollInterval'
+	| 'secondLookOnNotify'
+	| 'graphile'
+	| 'prefetch'
 >
 
-/** Worker options a pool shares across its runners. */
+/** Worker options a pool shares across its runners; `prefetch` is a default runners override. */
 export type SharedWorkerOptions<TQueues extends readonly QueueContract[]> =
-	Omit<BaseWorkerOptions<TQueues>, 'process' | keyof WorkerRunnerOptions>
+	Omit<
+		BaseWorkerOptions<TQueues>,
+		'process' | Exclude<keyof WorkerRunnerOptions, 'prefetch'>
+	>
 
 export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly schema: string
@@ -243,6 +256,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 	)
 	if (options.defaultTimeout !== undefined)
 		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
+	if (options.prefetch !== undefined)
+		assertInteger(options.prefetch, 'prefetch', 0)
 	if (options.secondLookOnNotify !== undefined)
 		assertInteger(
 			options.secondLookOnNotify,
@@ -342,6 +357,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				noHandleSignals: true,
 				graphile: options.graphile,
 				secondLookOnNotify: options.secondLookOnNotify,
+				prefetch: options.prefetch,
 				onPoolCreate: maintained
 					? (workerId) => {
 							maintenance = startMaintenance({

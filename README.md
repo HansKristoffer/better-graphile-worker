@@ -235,9 +235,11 @@ await workers.start()
 await workers.jobs.sendReply({ id })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify` and `graphile`; every other option is shared. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
 
 Every worker on a database wakes on each new job, and Graphile's fetch locks every available serial lane, not only its own queues' lanes. A worker that is fetching for another queue can hide a lane's job from the worker that should take it, which then waits for its next poll. `secondLookOnNotify: milliseconds` fetches once more that long after each new-job notification. It costs one extra fetch per insert; set it on runners where poll latency matters. It works on `createBetterWorker` too.
+
+`prefetch: n` fetches and locks up to `concurrency + n` jobs at once (Graphile's `localQueue.size`), so the next job is already local when a slot frees; `1` follows Graphile's `concurrency + 1` advice. Prefetched jobs stay locked to this runner until it takes them, so another worker cannot run them meanwhile. A `localQueue` in your `graphile.preset` takes precedence.
 
 Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold; a `timeout` below 4 hours enforces this.
 
