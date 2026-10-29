@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.2](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.1...v2.6.2) (2026-10-21)
+
+
+### Bug Fixes
+
+* **worker:** reject promise when Graphile stops a runner on its own ([#29](https://github.com/HansKristoffer/better-graphile-worker/issues/29)) ([7488e76](https://github.com/HansKristoffer/better-graphile-worker/commit/7488e761a8d0c3cc47c0fb03a3f14c59e343d005))
+
 ## [2.6.1](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.0...v2.6.1) (2026-10-21)
 
 
