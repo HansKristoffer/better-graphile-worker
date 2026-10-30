@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.7.0...v2.8.0) (2026-10-30)
+
+
+### Features
+
+* idle pool runners, required transactional enqueues, shutdown probe and CLI migrate ([#33](https://github.com/HansKristoffer/better-graphile-worker/issues/33)) ([a47b3b8](https://github.com/HansKristoffer/better-graphile-worker/commit/a47b3b82a9791bb2f6f7c934eaa81c2412b3884c))
+* **worker:** onRunnerStopped hook for a runner Graphile stops on its own ([#34](https://github.com/HansKristoffer/better-graphile-worker/issues/34)) ([b426c13](https://github.com/HansKristoffer/better-graphile-worker/commit/b426c13e5759b2bcff592b28d462ab3f651b171f))
+
 ## [2.7.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.2...v2.7.0) (2026-10-30)
 
 
