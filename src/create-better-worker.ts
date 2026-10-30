@@ -361,7 +361,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				logRegisteredQueues(queues, logger)
 			}
 			const maintained = await prepareTables()
-			const runner = await startRunner({
+			return startRunner({
 				pgPool: options.pgPool,
 				schema,
 				taskList: buildTaskList(queues, runtime),
@@ -373,25 +373,14 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				secondLookOnNotify: options.secondLookOnNotify,
 				prefetch: options.prefetch,
 				runnerName,
-				onPoolCreate: maintained
-					? (workerId) => {
-							maintenance = startMaintenance({
+				maintain: maintained
+					? (workerId) =>
+							(maintenance = startMaintenance({
 								...maintenanceOptions,
 								workerId
-							})
-						}
+							}))
 					: undefined
-			}).catch(async (error) => {
-				await maintenance?.stop()
-				throw error
 			})
-			const running = maintenance
-			if (!running) return runner
-			// Keep beating until every job has settled, including a graceful drain.
-			return {
-				promise: runner.promise.finally(() => running.stop()),
-				stop: () => runner.stop().finally(() => running.stop())
-			}
 		},
 		release: () => client.release(),
 		onError: (error) =>

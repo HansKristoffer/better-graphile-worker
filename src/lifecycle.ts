@@ -22,12 +22,15 @@ export function resolveRestart(option: boolean | RestartOptions | undefined) {
 export type RestartAttempt = { attempt: number; delay: number }
 
 type ManagedRunner = { promise: Promise<void>; stop(): Promise<void> }
-/** From start() until stop(): the runners it restarts and the backoff stop() cuts short. */
-type Run = {
-	stopped: boolean
-	wake(): void
-	restarting?: Promise<void> | undefined
+type RestartPolicy = {
+	delay: number
+	maxDelay: number
+	onStopped(error: unknown, next: RestartAttempt): void
+	onRestartFailed(error: unknown, next: RestartAttempt): void
+	onRestarted(attempt: number): void
 }
+/** From start() until stop(): the current runner, if any, and the wait stop() cuts short. */
+type Run<R> = { stopped: boolean; runner: R | undefined; wake(): void }
 
 /** Serializes transitions while retaining shutdown ownership after caller timeouts. */
 export function createLifecycle<R extends ManagedRunner>(options: {
@@ -36,18 +39,9 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 	onError(error: unknown): void
 	handleSignals?: boolean | undefined
 	/** Start a new runner when one fails without stop(); without it, `promise` rejects. */
-	restart?:
-		| {
-				delay: number
-				maxDelay: number
-				onStopped(error: unknown, next: RestartAttempt): void
-				onRestartFailed(error: unknown, next: RestartAttempt): void
-				onRestarted(attempt: number): void
-		  }
-		| undefined
+	restart?: RestartPolicy | undefined
 }) {
-	let runner: R | undefined
-	let run: Run | undefined
+	let run: Run<R> | undefined
 	let starting: Promise<void> | undefined
 	let stopping: Promise<void> | undefined
 	let once: Promise<void> | undefined
@@ -57,7 +51,7 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 		removeSignals?.()
 		removeSignals = undefined
 	}
-	function wait(current: Run, ms: number) {
+	function wait(current: Run<R>, ms: number) {
 		return new Promise<void>((resolve) => {
 			// Not unref'd: while it waits, this timer is all that keeps a worker process alive.
 			const timer = setTimeout(resolve, ms)
@@ -68,7 +62,7 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 		})
 	}
 	/** Settles when the run ends: after stop(), or when a runner ends and is not restarted. */
-	async function supervise(current: Run, first: R): Promise<void> {
+	async function supervise(current: Run<R>, first: R): Promise<void> {
 		let active = first
 		let attempt = 0
 		for (;;) {
@@ -82,44 +76,53 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 				if (!current.stopped) {
 					// A runner that ended on its own is gone: start() runs a new one, stop() only releases.
 					cleanupSignals()
-					runner = undefined
 					run = undefined
 				}
 				return active.promise
 			}
-			runner = undefined
+			current.runner = undefined
 			// A runner that outlived the longest wait was healthy, so backoff starts over.
 			if (Date.now() - startedAt >= restart.maxDelay) attempt = 0
-			let error = failure.error
-			let report = restart.onStopped
-			for (;;) {
-				attempt++
-				const delay = Math.min(
-					restart.maxDelay,
-					restart.delay * 2 ** Math.min(attempt - 1, 30)
-				)
-				report(error, { attempt, delay })
-				await wait(current, delay)
-				if (current.stopped) return
-				const next = options.start(true).then(
-					(started) => {
-						runner = started
-						return { started }
-					},
-					(startError: unknown) => ({ startError })
-				)
-				current.restarting = next.then(() => {})
-				const result = await next
-				current.restarting = undefined
-				if ('started' in result) {
-					active = result.started
-					restart.onRestarted(attempt)
-					break
-				}
-				if (current.stopped) return
-				error = result.startError
-				report = restart.onRestartFailed
+			const next = await relaunch(current, restart, failure.error, attempt)
+			if (!next) return
+			active = next.runner
+			attempt = next.attempt
+		}
+	}
+	/** Starts a runner with backoff until one starts or stop() ends the run. */
+	async function relaunch(
+		current: Run<R>,
+		restart: RestartPolicy,
+		cause: unknown,
+		attempt: number
+	) {
+		let error = cause
+		let report = restart.onStopped
+		for (;;) {
+			attempt++
+			const delay = Math.min(
+				restart.maxDelay,
+				restart.delay * 2 ** Math.min(attempt - 1, 30)
+			)
+			report(error, { attempt, delay })
+			await wait(current, delay)
+			if (current.stopped) return undefined
+			const result = await options.start(true).then(
+				(runner) => ({ runner }),
+				(startError: unknown) => ({ startError })
+			)
+			if (current.stopped) {
+				// stop() found no runner to stop while this one was starting.
+				if ('runner' in result) await result.runner.stop()
+				return undefined
 			}
+			if ('runner' in result) {
+				current.runner = result.runner
+				restart.onRestarted(attempt)
+				return { runner: result.runner, attempt }
+			}
+			error = result.startError
+			report = restart.onRestartFailed
 		}
 	}
 	function start(): Promise<void> {
@@ -140,8 +143,8 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 						process.off('SIGTERM', onSignal)
 					}
 				}
-				runner = await options.start(false)
-				const current: Run = { stopped: false, wake() {} }
+				const runner = await options.start(false)
+				const current: Run<R> = { stopped: false, runner, wake() {} }
 				run = current
 				completion = supervise(current, runner)
 				// Track failures even when callers only use start()/stop().
@@ -173,12 +176,11 @@ export function createLifecycle<R extends ManagedRunner>(options: {
 					if (current) {
 						current.stopped = true
 						current.wake()
-						// A restart in flight finishes first, so its runner is stopped too.
-						await current.restarting
+						await current.runner?.stop()
+						// The run ends once a runner that was still starting has been stopped too.
+						await completion.catch(() => {})
+						run = undefined
 					}
-					if (runner) await runner.stop()
-					runner = undefined
-					run = undefined
 					await options.release()
 				} finally {
 					cleanupSignals()

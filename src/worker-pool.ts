@@ -102,10 +102,8 @@ export function createBetterWorkerPool<
 		buildCronItems: _buildCronItems,
 		...delegated
 	} = primary
-	const each = (run: (worker: BetterWorker<TQueues>) => Promise<void>) =>
-		Promise.all(all.map(run)).then(() => {})
-	/** Waits for every runner, then rejects with the first failure. */
-	const settled = async (
+	/** Waits for every runner, then rejects with the first failure, so none is left mid-transition. */
+	const each = async (
 		run: (worker: BetterWorker<TQueues>) => Promise<void>
 	) => {
 		const results = await Promise.allSettled(all.map(run))
@@ -118,7 +116,7 @@ export function createBetterWorkerPool<
 		...delegated,
 		runners: workers as BetterWorkerPool<TQueues>['runners'],
 		get promise() {
-			return settled((worker) => worker.promise)
+			return each((worker) => worker.promise)
 		},
 		async start() {
 			try {
@@ -132,7 +130,7 @@ export function createBetterWorkerPool<
 			for (const worker of all) void worker.promise.catch(stopAll)
 		},
 		stop: (stopOptions) => each((worker) => worker.stop(stopOptions)),
-		waitUntilStopped: () => settled((worker) => worker.waitUntilStopped()),
+		waitUntilStopped: () => each((worker) => worker.waitUntilStopped()),
 		runOnce: () => each((worker) => worker.runOnce())
 	}
 }

@@ -899,6 +899,9 @@ function secondLookListener(delayMs: number | undefined) {
 	}
 }
 
+/** One Graphile worker pool and its maintenance; `stop()` can be called more than once. */
+export type BetterRunner = { promise: Promise<void>; stop(): Promise<void> }
+
 export async function startRunner(options: {
 	pgPool: Pool
 	schema: string
@@ -910,23 +913,31 @@ export async function startRunner(options: {
 	graphile?: GraphileRunnerOverrides | undefined
 	/** Fetch and lock up to `concurrency + prefetch` jobs at once (Graphile's local queue). */
 	prefetch?: number | undefined
-	/** Receives the pool id Graphile stores in locked_by, before any job is claimed. */
-	onPoolCreate?: ((poolId: string) => void) | undefined
+	/**
+	 * Starts maintenance for the pool id Graphile stores in locked_by, before any job is
+	 * claimed. It is stopped once the pool has finished, including a graceful drain.
+	 */
+	maintain?: ((poolId: string) => { stop(): Promise<void> }) | undefined
 	secondLookOnNotify?: number | undefined
 	/** Names the pool runner in a `WorkerStoppedError`. */
 	runnerName?: string | undefined
-}): Promise<Runner> {
+}): Promise<BetterRunner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
-	const { onPoolCreate, graphile } = options
+	const { maintain, graphile } = options
 	// An emitter nested in a preset's `extends` is not found here and gets replaced.
 	const events =
 		graphile?.events ??
 		graphile?.preset?.worker?.events ??
 		(new EventEmitter() as WorkerEvents)
-	const listener = ({ workerPool }: { workerPool: { id: string } }) =>
-		onPoolCreate?.(workerPool.id)
-	events.on('pool:create', listener)
+	let maintenance: { stop(): Promise<void> } | undefined
+	const stopMaintenance = async () => {
+		await maintenance?.stop()
+	}
+	const onCreate = ({ workerPool }: WorkerEventMap['pool:create']) => {
+		maintenance = maintain?.(workerPool.id)
+	}
+	events.on('pool:create', onCreate)
 	const secondLook = secondLookListener(options.secondLookOnNotify)
 	if (secondLook) events.on('pool:listen:notification', secondLook)
 	// Graphile shuts its pool down on errors it cannot recover from (a failed job
@@ -951,8 +962,9 @@ export async function startRunner(options: {
 	events.on('pool:gracefulShutdown', onShutdown)
 	events.on('pool:forcefulShutdown', onShutdown)
 
+	let runner: Runner
 	try {
-		const runner = await run(
+		runner = await run(
 			compact({
 				...withDurableCompletion(
 					graphile,
@@ -970,28 +982,37 @@ export async function startRunner(options: {
 				pollInterval: options.pollInterval
 			})
 		)
-		let requested = false
-		return {
-			...runner,
-			stop: (reason) => {
-				requested = true
-				return runner.stop(reason)
-			},
-			kill: (reason) => {
-				requested = true
-				return runner.kill(reason)
-			},
-			promise: runner.promise.finally(detach).then(() => {
-				if (!requested)
-					throw new WorkerStoppedError(options.runnerName, { cause })
-			})
-		}
 	} catch (error) {
 		detach()
+		await stopMaintenance()
 		throw error
 	} finally {
 		// run() emits pool:create synchronously before it resolves.
-		events.off('pool:create', listener)
+		events.off('pool:create', onCreate)
+	}
+	let requested = false
+	const promise = runner.promise
+		.finally(detach)
+		.finally(stopMaintenance)
+		.then(() => {
+			if (!requested)
+				throw new WorkerStoppedError(options.runnerName, { cause })
+		})
+	const ended = promise.then(
+		() => {},
+		() => {}
+	)
+	return {
+		promise,
+		stop() {
+			requested = true
+			// Graphile rejects a second stop, including one that races its own shutdown;
+			// either way the runner is ending, so wait for that.
+			return runner.stop().then(
+				() => ended,
+				() => ended
+			)
+		}
 	}
 }
 

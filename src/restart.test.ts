@@ -200,6 +200,34 @@ suite('restart after Graphile stops a runner on its own', () => {
 		}
 	})
 
+	test('stop() while Graphile is still tearing down a runner it stopped itself resolves', async () => {
+		const events: WorkerEvents = new EventEmitter()
+		const created = new Promise<{ workerPool: WorkerPool }>((resolve) =>
+			events.once('pool:create', resolve)
+		)
+		const worker = createBetterWorker({
+			pgPool: direct,
+			schema,
+			queues: [
+				defineQueue({
+					name: 'idle',
+					inputSchema: z.object({}),
+					processFn: async () => {}
+				})
+			],
+			graphile: { events },
+			hooks: { createLogger: () => recordLogs().logger }
+		})
+		await worker.migrate()
+		await worker.start()
+		const { workerPool } = await created
+		void workerPool.gracefulShutdown('Connection terminated unexpectedly')
+		// Graphile's runner has now marked itself stopped and is releasing its resources.
+		await workerPool.promise
+		await worker.stop()
+		await worker.promise
+	})
+
 	test('in a pool, only the runner that stopped is restarted', async () => {
 		const turnEvents: WorkerEvents = new EventEmitter()
 		const backgroundEvents: WorkerEvents = new EventEmitter()
