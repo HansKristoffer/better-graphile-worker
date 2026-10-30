@@ -73,10 +73,27 @@ export type EnqueueFailEvent = {
 	error: unknown
 }
 
+/**
+ * Graphile stopped a runner although `stop()` was never called, and the worker is about
+ * to start a new one. Not reported with `restart: false`, where `promise` rejects instead.
+ */
+export type RunnerStoppedEvent = {
+	/** The pool runner's name; undefined for a single worker. */
+	runner: string | undefined
+	/** Usually a `WorkerStoppedError`, whose `cause` is Graphile's reason. */
+	error: unknown
+	/** Counts from 1; the restart this stop leads to. */
+	restartAttempt: number
+	/** The wait before that restart, in milliseconds. */
+	restartInMs: number
+}
+
 export type BetterWorkerHooks = {
 	createLogger?: (options: CreateLoggerOptions) => JobLogger
 	onJobFinished?: (event: JobFinishedEvent) => void | Promise<void>
 	onPermanentFailure?: (event: PermanentFailureEvent) => void | Promise<void>
 	onEnqueueFail?: (event: EnqueueFailEvent) => void | Promise<void>
+	/** Once per stop Graphile made on its own, before the first restart try. */
+	onRunnerStopped?: (event: RunnerStoppedEvent) => void | Promise<void>
 	shouldSkipEnqueue?: () => boolean
 }

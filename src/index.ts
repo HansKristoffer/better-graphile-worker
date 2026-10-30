@@ -99,6 +99,7 @@ export type {
 	JobFinishedEvent,
 	PermanentFailureEvent,
 	EnqueueFailEvent,
+	RunnerStoppedEvent,
 	LogAttributes,
 	SpanEventAttributes
 } from './hooks.js'
