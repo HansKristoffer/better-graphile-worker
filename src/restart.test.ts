@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import net, { type AddressInfo } from 'node:net'
 import type { WorkerEvents, WorkerPool } from 'graphile-worker'
@@ -7,7 +7,8 @@ import { z } from 'zod'
 import { createBetterWorker } from './create-better-worker.js'
 import { defineQueue } from './queue.js'
 import { createBetterWorkerPool } from './worker-pool.js'
-import type { LogAttributes } from './hooks.js'
+import { WorkerStoppedError } from './errors.js'
+import type { LogAttributes, RunnerStoppedEvent } from './hooks.js'
 
 /** A TCP proxy in front of PostgreSQL that can drop every connection and refuse new ones. */
 async function databaseProxy(target: URL) {
@@ -104,12 +105,16 @@ suite('restart after Graphile stops a runner on its own', () => {
 			}
 		})
 		const logs = recordLogs()
+		const stops: RunnerStoppedEvent[] = []
 		const worker = createBetterWorker({
 			pgPool,
 			schema,
 			queues: [slow],
 			restart: { delay: 10, maxDelay: 40 },
-			hooks: { createLogger: () => logs.logger }
+			hooks: {
+				createLogger: () => logs.logger,
+				onRunnerStopped: (event) => void stops.push(event)
+			}
 		})
 		let settled = false
 		try {
@@ -141,6 +146,15 @@ suite('restart after Graphile stops a runner on its own', () => {
 			const [restarted] = await logs.logged('worker.runner.restarted')
 			expect(Number(restarted?.restart_attempt)).toBeGreaterThanOrEqual(3)
 			expect(settled).toBe(false)
+			// One event for the stop; the failed restart tries do not report again.
+			expect(stops).toHaveLength(1)
+			expect(stops[0]).toMatchObject({
+				runner: undefined,
+				restartAttempt: 1,
+				restartInMs: 10
+			})
+			expect(stops[0]?.error).toBeInstanceOf(WorkerStoppedError)
+			expect(stops[0]?.error).toMatchObject({ cause: expect.any(Error) })
 
 			const second = jobStarted('second')
 			await worker.createJob('slow', { id: 'second' })
@@ -245,6 +259,7 @@ suite('restart after Graphile stops a runner on its own', () => {
 		const runs = (queue: string) =>
 			new Promise<string | null>((resolve) => ran.set(queue, resolve))
 		const logs = recordLogs()
+		const stops: RunnerStoppedEvent[] = []
 		const workers = createBetterWorkerPool({
 			pgPool: direct,
 			schema,
@@ -269,7 +284,10 @@ suite('restart after Graphile stops a runner on its own', () => {
 				turn: { graphile: { events: turnEvents } },
 				background: { graphile: { events: backgroundEvents } }
 			},
-			hooks: { createLogger: () => logs.logger }
+			hooks: {
+				createLogger: () => logs.logger,
+				onRunnerStopped: (event) => void stops.push(event)
+			}
 		})
 		let settled = false
 		try {
@@ -293,9 +311,101 @@ suite('restart after Graphile stops a runner on its own', () => {
 			expect(poolIds.turn).toHaveLength(2)
 			expect(poolIds.background).toHaveLength(1)
 			expect(settled).toBe(false)
+			expect(stops.map((event) => event.runner)).toEqual(['turn'])
 		} finally {
 			await workers.stop()
 		}
 		await workers.promise
+	})
+
+	/** A started worker on its own events, so a test can make Graphile stop it. */
+	async function stoppable(options: {
+		restart: false | { delay: number }
+		onRunnerStopped: (event: RunnerStoppedEvent) => void | Promise<void>
+	}) {
+		const events: WorkerEvents = new EventEmitter()
+		const created = () =>
+			new Promise<{ workerPool: WorkerPool }>((resolve) =>
+				events.once('pool:create', resolve)
+			)
+		const ran = new Map<string, (lockedBy: string | null) => void>()
+		const logs = recordLogs()
+		const worker = createBetterWorker({
+			pgPool: direct,
+			schema,
+			queues: [
+				defineQueue({
+					name: 'echo',
+					inputSchema: z.object({ id: z.string() }),
+					processFn: async ({ id }, ctx) =>
+						ran.get(id)?.(ctx.helpers.job.locked_by)
+				})
+			],
+			restart: options.restart,
+			graphile: { events },
+			hooks: {
+				createLogger: () => logs.logger,
+				onRunnerStopped: options.onRunnerStopped
+			}
+		})
+		await worker.migrate()
+		const first = created()
+		await worker.start()
+		return {
+			worker,
+			logs,
+			/** Graphile shuts the current runner's pool down by itself. */
+			async stopByGraphile() {
+				const { workerPool } = await first
+				void workerPool.gracefulShutdown('Connection terminated unexpectedly')
+			},
+			runs(id: string) {
+				return new Promise<string | null>((resolve) => ran.set(id, resolve))
+			}
+		}
+	}
+
+	for (const [kind, onRunnerStopped] of [
+		[
+			'throws',
+			() => {
+				throw new Error('hook failed')
+			}
+		],
+		['rejects', () => Promise.reject(new Error('hook failed'))]
+	] as const)
+		test(`a hook that ${kind} is reported and the runner still restarts`, async () => {
+			const reported = spyOn(console, 'error').mockImplementation(() => {})
+			const { worker, logs, stopByGraphile, runs } = await stoppable({
+				restart: { delay: 0 },
+				onRunnerStopped
+			})
+			try {
+				await stopByGraphile()
+				await logs.logged('worker.runner.restarted')
+				const ran = runs('after')
+				await worker.createJob('echo', { id: 'after' })
+				expect(await ran).toBeString()
+				expect(reported).toHaveBeenCalledWith(
+					'better-graphile-worker observer failed',
+					expect.objectContaining({ message: 'hook failed' })
+				)
+			} finally {
+				await worker.stop()
+				reported.mockRestore()
+			}
+		})
+
+	test('with restart: false the hook is not called and promise rejects', async () => {
+		const stops: RunnerStoppedEvent[] = []
+		const { worker, stopByGraphile } = await stoppable({
+			restart: false,
+			onRunnerStopped: (event) => void stops.push(event)
+		})
+		await stopByGraphile()
+		const error = await worker.promise.catch((caught: unknown) => caught)
+		expect(error).toBeInstanceOf(WorkerStoppedError)
+		expect(stops).toEqual([])
+		await worker.stop()
 	})
 })

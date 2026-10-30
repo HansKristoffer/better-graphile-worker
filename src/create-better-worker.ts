@@ -40,7 +40,7 @@ import {
 	startRunner,
 	type GraphileRunnerOverrides
 } from './worker.js'
-import { jobLogger } from './observers.js'
+import { jobLogger, observe } from './observers.js'
 import {
 	queryJob,
 	resolveOutcomeRetention,
@@ -388,13 +388,21 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		handleSignals: options.handleSignals,
 		restart: restart && {
 			...restart,
-			onStopped: (error, next) =>
+			onStopped: (error, next) => {
 				logger.error('worker.runner.stopped', {
 					runner: runnerName,
 					error: String(error),
 					restart_attempt: next.attempt,
 					restart_in_ms: next.delay
-				}),
+				})
+				// Not awaited: the restart's backoff must not wait on app code.
+				void observe(hooks.onRunnerStopped, {
+					runner: runnerName,
+					error,
+					restartAttempt: next.attempt,
+					restartInMs: next.delay
+				})
+			},
 			onRestartFailed: (error, next) =>
 				logger.warn('worker.runner.restart_failed', {
 					runner: runnerName,

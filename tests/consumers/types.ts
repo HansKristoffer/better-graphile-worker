@@ -863,3 +863,18 @@ type PrismaTransactionLike = {
 	// biome-ignore lint/suspicious/noExplicitAny: mirrors Prisma's $queryRawUnsafe
 	$queryRawUnsafe<T = unknown>(query: string, ...values: any[]): Promise<T>
 }
+
+// A runner Graphile stops by itself is reported through a typed hook.
+createBetterWorker({
+	pgPool: pool,
+	queues: [defineQueue({ name: 'hooked', inputSchema: z.string() })],
+	handlers: { hooked: async () => {} },
+	hooks: {
+		onRunnerStopped: (event: publicApi.RunnerStoppedEvent) => {
+			const runner: string | undefined = event.runner
+			const attempt: number = event.restartAttempt
+			const wait: number = event.restartInMs
+			void [runner, attempt, wait, event.error]
+		}
+	}
+})
