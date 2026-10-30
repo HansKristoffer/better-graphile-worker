@@ -254,7 +254,7 @@ suite('worker pool on PostgreSQL', () => {
 		}
 	})
 
-	test('a runner that stops on its own stops the pool, which rejects and can start again', async () => {
+	test('without restarts, a runner that stops on its own stops the pool, which rejects and can start again', async () => {
 		const turn: WorkerEvents = new EventEmitter()
 		// A WorkerPool is thenable, so it is handed out boxed rather than awaited.
 		const created = new Promise<{ workerPool: WorkerPool }>((resolve) =>
@@ -266,6 +266,7 @@ suite('worker pool on PostgreSQL', () => {
 			queues: contracts,
 			handlers,
 			runners: { turn: { graphile: { events: turn } }, background: {} },
+			restart: false,
 			hooks: { createLogger: () => quiet }
 		})
 		await workers.start()

@@ -235,7 +235,7 @@ await workers.start()
 await workers.jobs.sendReply({ id })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. Likewise, if one runner stops on its own, the pool stops the others and `promise` rejects with that runner's `WorkerStoppedError`. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
 
 Each started runner holds two connections for as long as it runs: Graphile's LISTEN client, which Graphile opens per worker and cannot share between runners, and the connection maintenance heartbeats on. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `2 × runners` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs two more. Through PgBouncer, LISTEN needs a session-mode connection.
 
@@ -455,7 +455,28 @@ Concurrent `start()` calls share startup; stop during startup waits and shuts do
 
 `stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`.
 
-Graphile can stop a worker by itself, for example when it cannot record job completions during a database outage. `promise` and `waitUntilStopped()` then reject with `WorkerStoppedError`, whose `cause` carries Graphile's reason, instead of resolving as they do after `stop()`. Nothing restarts the worker, and a process that still answers health checks looks fine to its platform, so watch `promise`. Exit and let the platform restart the process, or call `start()` again:
+Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
+
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+
+### When Graphile stops a worker
+
+Graphile can stop a worker by itself, for example when it cannot record a job's completion during a database outage. The worker then starts a new runner, and keeps trying while the database is unreachable:
+
+```ts
+createBetterWorker({
+	// ...
+	restart: { delay: 1_000, maxDelay: 30_000 } // the defaults; `false` turns it off
+})
+```
+
+It logs `worker.runner.stopped` as an error, with Graphile's reason in `error`, and tries again after `delay` milliseconds. Each failed try logs `worker.runner.restart_failed` and doubles the wait, up to `maxDelay`; success logs `worker.runner.restarted`. All three carry `runner` (in a pool), `restart_attempt` and, before a try, `restart_in_ms`. Alert on the error if a restart should reach a person.
+
+- `promise` and `waitUntilStopped()` stay pending through restarts. They settle only when `stop()` finishes, and `stop()` also cancels a restart that is waiting.
+- Only restarts retry. If the database is unreachable when you first call `start()`, it rejects.
+- The job whose completion could not be recorded stays locked by the stopped runner, and so may jobs it had prefetched. With crash recovery, they are released once that runner's heartbeat is `staleAfter` old (5 minutes by default) and run again as a failed attempt. Without it, Graphile's 4-hour scan releases them. Make their external effects idempotent.
+
+With `restart: false`, `promise` and `waitUntilStopped()` reject with `WorkerStoppedError` instead, whose `cause` carries Graphile's reason. A pool then stops its other runners too, and nothing starts them again. Watch `promise`, and exit or call `start()` again:
 
 ```ts
 await workers.start()
@@ -464,10 +485,6 @@ workers.promise.catch((error) => {
 	process.exit(1)
 })
 ```
-
-Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail` and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
-
-Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
 
 ## Administration, CLI and testing
 

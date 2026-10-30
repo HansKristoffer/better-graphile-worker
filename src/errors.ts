@@ -82,8 +82,9 @@ export class ShutdownTimeoutError extends Error {
 
 /**
  * The worker's runner stopped although `stop()` was never called, for example after
- * Graphile shut its pool down on a database error. Its queues no longer run in this
- * process; `cause` carries Graphile's reason when it gave one.
+ * Graphile shut its pool down on a database error; `cause` carries Graphile's reason when
+ * it gave one. The worker logs it and starts a new runner; with `restart: false`,
+ * `promise` rejects with it and the queues no longer run in this process.
  */
 export class WorkerStoppedError extends Error {
 	constructor(

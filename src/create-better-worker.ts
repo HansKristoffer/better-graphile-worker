@@ -47,7 +47,11 @@ import {
 	type JobOutcomesOption,
 	type JobState
 } from './job-outcomes.js'
-import { createLifecycle } from './lifecycle.js'
+import {
+	createLifecycle,
+	resolveRestart,
+	type RestartOptions
+} from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
@@ -106,6 +110,12 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * default; `false` turns it off.
 	 */
 	crashRecovery?: boolean | CrashRecoveryOptions | undefined
+	/**
+	 * Start a new runner when Graphile stops one on its own, for example after losing the
+	 * database, and keep trying while it is unreachable. On by default; `false` makes
+	 * `promise` reject with `WorkerStoppedError` instead.
+	 */
+	restart?: boolean | RestartOptions | undefined
 	/**
 	 * Fetch once more this many milliseconds after each new-job notification. Workers that
 	 * share a database skip each other's locked lanes, so a first fetch can miss a job.
@@ -268,6 +278,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		)
 
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
+	const restart = resolveRestart(options.restart)
 
 	const schema = options.schema ?? DEFAULT_GRAPHILE_WORKER_SCHEMA
 	const hooks = withQueueMetrics(
@@ -344,11 +355,13 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 	}
 
 	const lifecycle = createLifecycle({
-		start: async () => {
-			logger.info('Starting graphile-worker')
-			logRegisteredQueues(queues, logger)
+		start: async (restarting) => {
+			if (!restarting) {
+				logger.info('Starting graphile-worker')
+				logRegisteredQueues(queues, logger)
+			}
 			const maintained = await prepareTables()
-			const runner = await startRunner({
+			return startRunner({
 				pgPool: options.pgPool,
 				schema,
 				taskList: buildTaskList(queues, runtime),
@@ -360,30 +373,41 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				secondLookOnNotify: options.secondLookOnNotify,
 				prefetch: options.prefetch,
 				runnerName,
-				onPoolCreate: maintained
-					? (workerId) => {
-							maintenance = startMaintenance({
+				maintain: maintained
+					? (workerId) =>
+							(maintenance = startMaintenance({
 								...maintenanceOptions,
 								workerId
-							})
-						}
+							}))
 					: undefined
-			}).catch(async (error) => {
-				await maintenance?.stop()
-				throw error
 			})
-			const running = maintenance
-			if (!running) return runner
-			// Keep beating until every job has settled, including a graceful drain.
-			return {
-				promise: runner.promise.finally(() => running.stop()),
-				stop: () => runner.stop().finally(() => running.stop())
-			}
 		},
 		release: () => client.release(),
 		onError: (error) =>
 			logger.error('worker.lifecycle.failed', { error: String(error) }),
-		handleSignals: options.handleSignals
+		handleSignals: options.handleSignals,
+		restart: restart && {
+			...restart,
+			onStopped: (error, next) =>
+				logger.error('worker.runner.stopped', {
+					runner: runnerName,
+					error: String(error),
+					restart_attempt: next.attempt,
+					restart_in_ms: next.delay
+				}),
+			onRestartFailed: (error, next) =>
+				logger.warn('worker.runner.restart_failed', {
+					runner: runnerName,
+					error: String(error),
+					restart_attempt: next.attempt,
+					restart_in_ms: next.delay
+				}),
+			onRestarted: (attempt) =>
+				logger.info('worker.runner.restarted', {
+					runner: runnerName,
+					restart_attempt: attempt
+				})
+		}
 	})
 
 	return {

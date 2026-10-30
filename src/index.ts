@@ -104,6 +104,7 @@ export type {
 export type { JobOutcomesOption, JobState } from './job-outcomes.js'
 export type { GraphileRunnerOverrides } from './worker.js'
 export type { CrashRecoveryOptions } from './maintenance.js'
+export type { RestartOptions } from './lifecycle.js'
 export {
 	NonRetriableError,
 	RetryAtError,
