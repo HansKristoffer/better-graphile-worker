@@ -3,8 +3,18 @@ import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
 import { createJobClient } from './job-client.js'
 import { defineQueue } from './queue.js'
-import { enqueueInTransaction, type PrismaRawClient } from './prisma.js'
-import type { JobRequest, PreparedJob } from './types.js'
+import {
+	enqueueInTransaction,
+	type PrismaRawClient,
+	type RawQueryClient
+} from './prisma.js'
+import { EnqueueCountError, EnqueueSkippedError } from './errors.js'
+import type {
+	EnqueueInTransactionFn,
+	JobRequest,
+	PrepareJobFn,
+	PreparedJob
+} from './types.js'
 
 const prepared = (count: number): PreparedJob => ({
 	queue: 'q',
@@ -36,13 +46,42 @@ describe('enqueueInTransaction', () => {
 		).toEqual([])
 	})
 
-	test('throws, rolling the transaction back, when a job is missing', async () => {
-		await expect(
-			enqueueInTransaction(rows('1', null), prepared(2))
-		).rejects.toThrow('1 of 2 jobs')
-		await expect(enqueueInTransaction(rows('1'), prepared(2))).rejects.toThrow(
-			'1 of 2 jobs'
-		)
+	test('throws EnqueueCountError, rolling the transaction back, when a job is missing', async () => {
+		for (const tx of [rows('1', null), rows('1')]) {
+			const error = await enqueueInTransaction(tx, prepared(2)).catch(
+				(caught: unknown) => caught
+			)
+			expect(error).toBeInstanceOf(EnqueueCountError)
+			expect(error).toMatchObject({ queue: 'q', expected: 2, actual: 1 })
+			expect(String(error)).toContain('1 of 2 jobs')
+		}
+	})
+
+	test('required throws EnqueueSkippedError for a skipped statement', async () => {
+		const skipped = { ...prepared(0), skipped: true }
+		const error = await enqueueInTransaction(rows(), skipped, {
+			required: true
+		}).catch((caught: unknown) => caught)
+		expect(error).toBeInstanceOf(EnqueueSkippedError)
+		expect(error).toMatchObject({ queue: 'q' })
+		// An empty batch was not skipped, so it has nothing to require.
+		expect(
+			await enqueueInTransaction(rows(), prepared(0), { required: true })
+		).toEqual([])
+	})
+
+	test('accepts a client without a type parameter and checks its rows', async () => {
+		const answering = (result: unknown): RawQueryClient => ({
+			$queryRawUnsafe: (_query: string, ..._values: unknown[]) =>
+				Promise.resolve(result)
+		})
+		expect(
+			await enqueueInTransaction(answering([{ id: '1' }]), prepared(1))
+		).toEqual(['1'])
+		for (const result of [undefined, { id: '1' }, [{ id: 1 }], [null]])
+			await expect(
+				enqueueInTransaction(answering(result), prepared(1))
+			).rejects.toThrow(TypeError)
 	})
 })
 
@@ -90,6 +129,67 @@ describe('enqueueInTransaction on a producer', () => {
 			})
 			// @ts-expect-error the task must name a queue
 			void client.enqueueInTransaction(tx, { task: 'missing' })
+		})
+	})
+
+	test('required makes a skipped job throw', async () => {
+		const { tx, calls } = recording()
+		const client = producer()
+		expect(
+			await client.enqueueInTransaction(
+				tx,
+				{ task: 'charge', payload: { id: 'a' } },
+				{ required: true }
+			)
+		).toBe('7')
+
+		const skipping = createJobClient({
+			pgPool: new Pool(),
+			queues,
+			hooks: { shouldSkipEnqueue: () => true }
+		})
+		expect(
+			await skipping.enqueueInTransaction(tx, { task: 'nightly' })
+		).toBeNull()
+		await expect(
+			skipping.enqueueInTransaction(tx, { task: 'nightly' }, { required: true })
+		).rejects.toBeInstanceOf(EnqueueSkippedError)
+		expect(calls).toHaveLength(1)
+	})
+
+	test('2.7.0-style test doubles still fit the function types', () => {
+		const prepare: PrepareJobFn<typeof queues> = async (...args) =>
+			producer().prepareJob(...args)
+		const enqueue: EnqueueInTransactionFn<typeof queues> = async (
+			_tx: PrismaRawClient,
+			_job
+		) => null
+		expect([typeof prepare, typeof enqueue]).toEqual(['function', 'function'])
+	})
+
+	test('prepareJob takes a request object, so a union of jobs prepares without casts', async () => {
+		const client = producer()
+		const jobs: JobRequest<typeof queues>[] = [
+			{ task: 'charge', payload: { id: 'a' }, priority: 3 },
+			{ task: 'nightly' }
+		]
+		const statements = await Promise.all(
+			jobs.map((job) => client.prepareJob(job))
+		)
+		expect(statements.map((job) => job.queue)).toEqual(['charge', 'nightly'])
+		expect(statements[0]).toEqual(
+			await client.prepareJob('charge', { id: 'a' }, { priority: 3 })
+		)
+		await expect(
+			client.prepareJob({ task: 'charge', payload: { id: 1 } } as never)
+		).rejects.toThrow('Invalid payload')
+		await expect(client.prepareJob({} as never)).rejects.toThrow(TypeError)
+		// Type checks only; never called.
+		void (() => {
+			// @ts-expect-error the payload must match the task's input
+			void client.prepareJob({ task: 'charge', payload: { id: 1 } })
+			// @ts-expect-error a schema queue needs its payload
+			void client.prepareJob({ task: 'charge' })
 		})
 	})
 
@@ -176,6 +276,29 @@ suite('enqueueInTransaction on PostgreSQL', () => {
 			await connection.query('COMMIT')
 			expect(ids).toHaveLength(2)
 			expect(await count()).toBe(2)
+		} finally {
+			connection.release()
+		}
+	})
+
+	test('a request-object job commits through a required enqueue', async () => {
+		const job = await client.prepareJob({
+			task: 'charge',
+			payload: { id: 'request' },
+			jobKey: 'charge:request'
+		})
+		const connection = await pool.connect()
+		try {
+			await connection.query('BEGIN')
+			const [id] = await enqueueInTransaction(asPrisma(connection), job, {
+				required: true
+			})
+			await connection.query('COMMIT')
+			const { rows } = await pool.query(
+				`SELECT key FROM "${schema}".jobs WHERE id = $1`,
+				[id]
+			)
+			expect(rows).toEqual([{ key: 'charge:request' }])
 		} finally {
 			connection.release()
 		}

@@ -41,6 +41,7 @@ export type {
 	CreateJobsFn,
 	PreparedJob,
 	PrepareJobFn,
+	PrepareJobRequestFn,
 	PrepareJobsFn,
 	JobRequest,
 	EnqueueInTransactionFn,
@@ -52,7 +53,15 @@ export type {
 	QueueProgress,
 	GetJobProgressFn
 } from './types.js'
-export type { Duration, StopOptions } from './job-options.js'
+export type {
+	DatabaseProbeOptions,
+	Duration,
+	StopOptions
+} from './job-options.js'
+export type {
+	EnqueueInTransactionOptions,
+	RawQueryClient
+} from './prisma.js'
 export {
 	createBetterWorker,
 	DEFAULT_GRAPHILE_WORKER_SCHEMA,
@@ -117,6 +126,9 @@ export {
 	StepPersistenceError,
 	ShutdownTimeoutError,
 	WorkerStoppedError,
+	DatabaseUnreachableError,
+	EnqueueCountError,
+	EnqueueSkippedError,
 	JobTimeoutError,
 	StepSerializationError,
 	ChildJobFailedError,

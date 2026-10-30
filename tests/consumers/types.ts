@@ -21,7 +21,10 @@ import {
 import { createJobClient } from 'better-graphile-worker/client'
 import { createTestHarness } from 'better-graphile-worker/testing'
 import { createCli } from 'better-graphile-worker/cli'
-import { enqueueInTransaction } from 'better-graphile-worker/prisma'
+import {
+	enqueueInTransaction,
+	type RawQueryClient
+} from 'better-graphile-worker/prisma'
 
 const pool = new Pool()
 const contracts = defineQueues([
@@ -878,3 +881,90 @@ createBetterWorker({
 		}
 	}
 })
+
+// A transaction seam without a type parameter fits as well as Prisma's own signature.
+type PlainTransaction = {
+	readonly $queryRawUnsafe: (
+		query: string,
+		...values: unknown[]
+	) => PromiseLike<unknown>
+}
+export const plainTransactional = async (
+	tx: PlainTransaction,
+	prismaTx: PrismaTransactionLike
+) => {
+	const raw: RawQueryClient[] = [tx, prismaTx]
+	void raw
+	const prepared = await workerPool.prepareJob({
+		task: 'turnReply',
+		payload: { id: 'a' }
+	})
+	const ids: string[] = await enqueueInTransaction(tx, prepared, {
+		required: true
+	})
+	const id: string | null = await workerPool.enqueueInTransaction(
+		tx,
+		{ task: 'turnReply', payload: { id: 'a' } },
+		{ required: true }
+	)
+	return [ids, id]
+}
+// A union of requests prepares without a branch per queue.
+export const preparedUnion = (job: publicApi.JobRequest<typeof pooled>) =>
+	workerPool.prepareJob(job)
+// @ts-expect-error A request payload must match its task
+workerPool.prepareJob({ task: 'turnReply', payload: { id: 1 } })
+export const errors = [
+	publicApi.EnqueueCountError,
+	publicApi.EnqueueSkippedError,
+	publicApi.DatabaseUnreachableError
+]
+void workerPool.stop({ probeDatabase: { interval: 1000, timeout: 2000 } })
+createCli(workerPool, { migrate: true })
+
+// A pool's runners may outnumber its queues; a defaultRunner takes queues without one.
+const looseQueue = defineQueue({
+	name: 'loose',
+	inputSchema: z.string(),
+	processFn: async () => {}
+})
+const fixedRunners = {
+	turn: { concurrency: 10 },
+	batch: { concurrency: 2 },
+	background: { concurrency: 4 }
+}
+const partial = createBetterWorkerPool({
+	pgPool: pool,
+	queues: [looseQueue],
+	runners: fixedRunners,
+	defaultRunner: 'background'
+})
+void partial.runners.background
+// @ts-expect-error Runners without queues are not started, so the pool has none for them
+void partial.runners.turn
+createBetterWorkerPool({
+	pgPool: pool,
+	queues: [],
+	runners: fixedRunners
+})
+pgPoolSize(fixedRunners, { queues: [looseQueue], defaultRunner: 'background' })
+createBetterWorkerPool({
+	pgPool: pool,
+	queues: [looseQueue],
+	// @ts-expect-error The defaultRunner needs options
+	runners: { turn: {} },
+	defaultRunner: 'background'
+})
+createBetterWorkerPool({
+	pgPool: pool,
+	// @ts-expect-error Without a defaultRunner, every queue names its runner
+	queues: [looseQueue],
+	runners: fixedRunners
+})
+// Test doubles written against 2.7.0 still fit.
+export const prepareDouble: publicApi.PrepareJobFn<typeof pooled> = async (
+	...args
+) => workerPool.prepareJob(...args)
+export const enqueueDouble: publicApi.EnqueueInTransactionFn<
+	typeof pooled
+> = async (_tx: PrismaTransactionLike, _job) => null

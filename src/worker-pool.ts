@@ -7,91 +7,142 @@ import {
 	type WorkerRunnerOptions
 } from './create-better-worker.js'
 import type { QueueContract } from './queue.js'
+import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
 import { DEFAULT_CONCURRENCY } from './worker.js'
 
-/** The runner names a queue registry uses, from each queue's `runner`. */
-export type RunnerName<TQueues extends readonly QueueContract[]> = Exclude<
-	TQueues[number]['runner'],
-	undefined
->
-
-export type BetterWorkerPoolOptions<TQueues extends readonly QueueContract[]> =
-	SharedWorkerOptions<TQueues> &
-		QueueRegistration<TQueues> & {
-			/** Every queue names its runner, so none is left without one. */
-			queues: TQueues & readonly { readonly runner: string }[]
-			runners: { readonly [K in RunnerName<TQueues>]: WorkerRunnerOptions }
-		}
+type RunnerOf<Q, TDefault extends string> = Q extends {
+	readonly runner: infer R extends string
+}
+	? R
+	: [TDefault] extends [never]
+		? Exclude<Q extends { readonly runner?: infer R } ? R : never, undefined>
+		: TDefault
 
 /**
- * One worker per runner, each executing only its runner's queues. Enqueueing, admin and
- * history cover every queue; lifecycle methods apply to all runners.
+ * The runner names a queue registry uses, from each queue's `runner`; with a default
+ * runner, queues without one use it.
  */
-export type BetterWorkerPool<TQueues extends readonly QueueContract[]> = Omit<
-	BetterWorker<TQueues>,
-	'buildTaskList' | 'buildCronItems'
-> & {
-	readonly runners: {
-		readonly [K in RunnerName<TQueues>]: BetterWorker<TQueues>
+export type RunnerName<
+	TQueues extends readonly QueueContract[],
+	TDefault extends string = never
+> = TQueues[number] extends infer Q ? RunnerOf<Q, TDefault> : never
+
+export type BetterWorkerPoolOptions<
+	TQueues extends readonly QueueContract[],
+	TDefault extends string = never
+> = SharedWorkerOptions<TQueues> &
+	QueueRegistration<TQueues> & {
+		/** Without a `defaultRunner`, every queue names its runner, so none is left without one. */
+		queues: TQueues &
+			([NoInfer<TDefault>] extends [never]
+				? readonly { readonly runner: string }[]
+				: unknown)
+		/**
+		 * Options for every runner the queues use, and optionally for others: a runner
+		 * no queue uses stays idle and is never started.
+		 */
+		runners: {
+			readonly [K in NoInfer<
+				RunnerName<TQueues, TDefault> | TDefault
+			>]: WorkerRunnerOptions
+		} & { readonly [runner: string]: WorkerRunnerOptions }
+		/** The runner for queues that name none. */
+		defaultRunner?: TDefault
 	}
+
+/**
+ * One worker per runner that has queues, each executing only its runner's queues.
+ * Enqueueing, admin and history cover every queue; lifecycle methods apply to all runners.
+ */
+export type BetterWorkerPool<
+	TQueues extends readonly QueueContract[],
+	TDefault extends string = never
+> = Omit<BetterWorker<TQueues>, 'buildTaskList' | 'buildCronItems'> & {
+	readonly runners: {
+		readonly [K in RunnerName<TQueues, TDefault>]: BetterWorker<TQueues>
+	}
+}
+
+type RunnerAssignment = {
+	queues: readonly { readonly name: string; readonly runner?: string }[]
+	defaultRunner?: string | undefined
+}
+
+/** Each runner's queues, for runners that have any. */
+function assignQueues(
+	runners: Readonly<Record<string, WorkerRunnerOptions>>,
+	{ queues, defaultRunner }: RunnerAssignment
+): Map<string, string[]> {
+	if (defaultRunner !== undefined && !Object.hasOwn(runners, defaultRunner))
+		throw new TypeError(
+			`defaultRunner "${defaultRunner}" is not one of the runners`
+		)
+	const assigned = new Map<string, string[]>()
+	for (const queue of queues) {
+		const runner = queue.runner ?? defaultRunner
+		if (runner === undefined)
+			throw new TypeError(
+				`Queue "${queue.name}" needs a runner, or the pool a defaultRunner`
+			)
+		if (!Object.hasOwn(runners, runner))
+			throw new TypeError(
+				`Queue "${queue.name}" uses unknown runner "${runner}"`
+			)
+		assigned.set(runner, [...(assigned.get(runner) ?? []), queue.name])
+	}
+	return assigned
 }
 
 /**
  * The `pgPool` size a set of runners needs: each runner's concurrency plus its LISTEN and
- * maintenance connections. Add headroom for producers that share the pool.
+ * maintenance connections. Pass the queues (and `defaultRunner`) to count only runners
+ * that have queues, as the pool starts them. Add headroom for producers that share the pool.
  */
 export function pgPoolSize(
-	runners: Readonly<Record<string, WorkerRunnerOptions>>
+	runners: Readonly<Record<string, WorkerRunnerOptions>>,
+	registry?: RunnerAssignment
 ): number {
-	return Object.values(runners).reduce(
-		(total, runner) => total + (runner.concurrency ?? DEFAULT_CONCURRENCY) + 2,
+	const started = registry
+		? [...assignQueues(runners, registry).keys()].map((name) => runners[name])
+		: Object.values(runners)
+	return started.reduce(
+		(total, runner) => total + (runner?.concurrency ?? DEFAULT_CONCURRENCY) + 2,
 		0
 	)
 }
 
 export function createBetterWorkerPool<
-	const TQueues extends readonly QueueContract[]
->(options: BetterWorkerPoolOptions<TQueues>): BetterWorkerPool<TQueues> {
-	const { runners, ...shared } = options
+	const TQueues extends readonly QueueContract[],
+	const TDefault extends string = never
+>(
+	options: BetterWorkerPoolOptions<TQueues, TDefault>
+): BetterWorkerPool<TQueues, TDefault> {
+	const { runners, defaultRunner, ...shared } = options
 	const runnerOptions = runners as Readonly<Record<string, WorkerRunnerOptions>>
-	const assigned = new Map<string, string[]>(
-		Object.keys(runnerOptions).map((name) => [name, []])
-	)
-	if (!assigned.size)
-		throw new TypeError('runners must list at least one runner')
-	for (const queue of options.queues) {
-		const list =
-			queue.runner === undefined ? undefined : assigned.get(queue.runner)
-		if (!list)
-			throw new TypeError(
-				queue.runner === undefined
-					? `Queue "${queue.name}" needs a runner`
-					: `Queue "${queue.name}" uses unknown runner "${queue.runner}"`
-			)
-		list.push(queue.name)
-	}
-	for (const [name, queues] of assigned)
-		if (!queues.length) throw new TypeError(`Runner "${name}" has no queues`)
+	const assigned = assignQueues(runnerOptions, {
+		queues: options.queues,
+		defaultRunner
+	})
 
 	const completedJobs = resolveCompletedJobsStore(options.completedJobs)
+	// The registration union stays generic here; each runner gets the caller's options.
+	const create = (runner?: string, queues?: string[]) =>
+		createWorker<TQueues>(
+			{
+				...shared,
+				...(runner === undefined ? {} : runnerOptions[runner]),
+				process: queues
+			} as never,
+			completedJobs,
+			runner
+		)
 	const workers = Object.fromEntries(
-		[...assigned].map(([name, queues]) => [
-			name,
-			// The registration union stays generic here; each runner gets the caller's options.
-			createWorker<TQueues>(
-				{
-					...shared,
-					...runnerOptions[name],
-					process: queues
-				} as never,
-				completedJobs,
-				name
-			)
-		])
+		[...assigned].map(([name, queues]) => [name, create(name, queues)])
 	)
 	const all = Object.values(workers)
 	// Every runner enqueues to and reads every queue, so the first answers for the pool.
-	const [primary] = all as [BetterWorker<TQueues>]
+	// Without queues no runner starts, and an unstarted worker answers instead.
+	const primary = all[0] ?? create()
 	const {
 		promise: _promise,
 		start: _start,
@@ -111,14 +162,45 @@ export function createBetterWorkerPool<
 		if (failed) throw failed.reason
 	}
 	const stopAll = () => Promise.allSettled(all.map((worker) => worker.stop()))
+	/**
+	 * A pool without runners idles from start() until stop(), as a running pool would,
+	 * including stopping on SIGINT/SIGTERM with `handleSignals`.
+	 */
+	let idle: { promise: Promise<void>; stop(): void } | undefined
+	const idleOr = (operation: () => Promise<void>) =>
+		idle ? idle.promise : operation()
+	function startIdle() {
+		let resolve = () => {}
+		const promise = new Promise<void>((done) => {
+			resolve = done
+		})
+		const onSignal = () => idle?.stop()
+		if (options.handleSignals) {
+			process.on('SIGINT', onSignal)
+			process.on('SIGTERM', onSignal)
+		}
+		idle = {
+			promise,
+			stop() {
+				process.off('SIGINT', onSignal)
+				process.off('SIGTERM', onSignal)
+				idle = undefined
+				void primary.stop().finally(resolve)
+			}
+		}
+	}
 
 	return {
 		...delegated,
-		runners: workers as BetterWorkerPool<TQueues>['runners'],
+		runners: workers as BetterWorkerPool<TQueues, TDefault>['runners'],
 		get promise() {
-			return each((worker) => worker.promise)
+			return idleOr(() => each((worker) => worker.promise))
 		},
 		async start() {
+			if (!all.length) {
+				if (!idle) startIdle()
+				return
+			}
 			try {
 				await each((worker) => worker.start())
 			} catch (error) {
@@ -129,8 +211,18 @@ export function createBetterWorkerPool<
 			// Likewise a runner that stopped and is not restarted: the pool stops the rest and rejects.
 			for (const worker of all) void worker.promise.catch(stopAll)
 		},
-		stop: (stopOptions) => each((worker) => worker.stop(stopOptions)),
-		waitUntilStopped: () => each((worker) => worker.waitUntilStopped()),
+		stop(stopOptions) {
+			const { probeDatabase, ...runnerStop } = stopOptions ?? {}
+			const probe = resolveDatabaseProbe(probeDatabase)
+			const waiting = idle?.promise
+			idle?.stop()
+			const stopping = all.length
+				? each((worker) => worker.stop(runnerStop))
+				: (waiting ?? primary.stop())
+			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
+		},
+		waitUntilStopped: () =>
+			idleOr(() => each((worker) => worker.waitUntilStopped())),
 		runOnce: () => each((worker) => worker.runOnce())
 	}
 }

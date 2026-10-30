@@ -16,6 +16,7 @@ assert.equal(typeof createTestHarness, 'function')
 assert.equal(typeof createCli, 'function')
 assert.equal(typeof enqueueInTransaction, 'function')
 assert.equal(typeof root.createBetterWorkerPool, 'function')
+for (const name of ['EnqueueCountError', 'EnqueueSkippedError', 'DatabaseUnreachableError']) assert.equal(typeof root[name], 'function')
 if (process.env.DATABASE_URL) {
 	const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL })
 	pool.on('error', () => {})

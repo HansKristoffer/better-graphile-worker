@@ -177,6 +177,8 @@ await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}`
 
 `prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction; Graphile 0.17.3 can return fewer jobs if a worker claims an existing key during enqueue. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
+`prepareJob` also takes one job as an object, `prepareJob({ task, payload, ...options })`, the same `JobRequest` that `enqueueInTransaction` takes below. A union of jobs across queues then prepares without a branch per queue.
+
 ```ts
 import { enqueueInTransaction } from 'better-graphile-worker/prisma'
 
@@ -188,9 +190,11 @@ await prisma.$transaction(async (tx) => {
 // node-postgres: await client.query(job.text, job.values) between BEGIN and COMMIT
 ```
 
-`enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws when Graphile returned fewer jobs than `job.count`, which rolls the transaction back. It works with any client that has Prisma's `$queryRawUnsafe`; the package does not depend on Prisma.
+`enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws `EnqueueCountError` (with `queue`, `expected` and `actual`) when Graphile returned fewer jobs than `job.count`, which rolls the transaction back; retry the transaction. It works with any client whose `$queryRawUnsafe(query, ...values)` resolves to the rows, generic like Prisma's or not, such as your own transaction seam (`RawQueryClient`); the rows are checked at runtime. The package does not depend on Prisma.
 
-For one job, `worker.enqueueInTransaction(tx, job)` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
+Pass `{ required: true }` when the transaction must not commit without its jobs: a statement skipped by `shouldSkipEnqueue()` then throws `EnqueueSkippedError` instead of returning no ids. Immediate enqueues that lose a job to the same race throw `EnqueueCountError` too.
+
+For one job, `worker.enqueueInTransaction(tx, job, { required })` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
 
 ```ts
 const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJobKeyMode: 'unsafe_dedupe' })
@@ -198,7 +202,7 @@ const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJ
 type HandoffJob = JobRequest<typeof queues> & { jobKey: string }
 await prisma.$transaction(async (tx) => {
   await tx.run.update({ where: { id: runId }, data: { status: 'approved' } })
-  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId }, jobKey: `advance:${runId}` })
+  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId }, jobKey: `advance:${runId}` }, { required: true })
 })
 ```
 
@@ -218,7 +222,7 @@ await Promise.all([exportsWorker.start(), apiWorker.start()])
 
 ### Worker pools
 
-A worker pool runs one worker per runner, so a burst of background jobs cannot take the slots a latency-sensitive queue needs. Each queue names its `runner`; the pool requires options for every runner its queues name, and every queue in it must name one.
+A worker pool runs one worker per runner, so a burst of background jobs cannot take the slots a latency-sensitive queue needs. Each queue names its `runner`, or goes to the pool's `defaultRunner`; the pool requires options for every runner its queues use. Without a `defaultRunner`, every queue must name one.
 
 ```ts
 const sendReply = defineQueue({ name: 'sendReply', runner: 'turn', inputSchema: z.object({ id: z.string() }), processFn })
@@ -235,7 +239,16 @@ await workers.start()
 await workers.jobs.sendReply({ id })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections. The CLI accepts a pool.
+`runners` may also list runners no queue uses. Such a runner stays idle: it is never started and holds no connections, and `workers.runners` has no entry for it. So one fixed runner map fits every registry a process may load, such as a test registry with a few queues or an API process with none. A pool over an empty registry enqueues nothing, and its `start()` idles until `stop()`. A queue that names a runner missing from `runners` is still an error.
+
+```ts
+const runners = { interactive: { concurrency: 6 }, background: { concurrency: 4 } }
+// Counts only the runners that have queues, + producer headroom.
+const pgPool = new Pool({ connectionString, max: pgPoolSize(runners, { queues, defaultRunner: 'background' }) + 4 })
+const workers = createBetterWorkerPool({ pgPool, queues, runners, defaultRunner: 'background' })
+```
+
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections; `pgPoolSize(runners, { queues, defaultRunner })` counts only the runners that have queues. The CLI accepts a pool.
 
 Each started runner holds two connections for as long as it runs: Graphile's LISTEN client, which Graphile opens per worker and cannot share between runners, and the connection maintenance heartbeats on. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `2 × runners` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs two more. Through PgBouncer, LISTEN needs a session-mode connection.
 
@@ -455,6 +468,18 @@ Concurrent `start()` calls share startup; stop during startup waits and shuts do
 
 `stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`.
 
+When the database goes away, Graphile's stop waits forever on queries that will never return. `stop({ probeDatabase: true })` waits only while the database answers: it opens a fresh connection outside the pool every second and runs `SELECT 1`, and rejects with `DatabaseUnreachableError` once a probe gets no answer within 2 seconds. Tune both with `probeDatabase: { interval, timeout }` in milliseconds. A server that answers with an error, such as too many connections, counts as reachable, so a busy database never cuts a shutdown short. A fast stop finishes before the first probe. Shutdown continues in the background, as after a timeout. The pool is still yours: after `DatabaseUnreachableError`, its checked-out clients may never be released, so don't wait for `pgPool.end()`:
+
+```ts
+try {
+  await workers.stop({ probeDatabase: true })
+  await pgPool.end()
+} catch (error) {
+  if (!(error instanceof DatabaseUnreachableError)) throw error
+  void pgPool.end() // the database is gone; exit without waiting
+}
+```
+
 Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail`, [`onRunnerStopped`](#when-graphile-stops-a-worker) and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
 
 Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
@@ -554,6 +579,8 @@ await createCli(worker)(process.argv.slice(2))
 ```
 
 Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `get-job <id>`, `retry <id>`, `fail <id>`, `run-once`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
+
+Help, `list-queues` and `schema` only read the registry and never connect, so they work without a database. `createCli(worker, { migrate: true })` runs `worker.migrate()` before every other command, and only then.
 
 ### Testing
 
