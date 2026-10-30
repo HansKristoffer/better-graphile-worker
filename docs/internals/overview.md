@@ -71,6 +71,10 @@ Children report because the wait marks their envelope `waited`. A job that nobod
 
 Graphile shuts its worker pool down on errors it cannot recover from, such as a failed `completeJobs`, and its runner then resolves as if `stop()` had been called. Nothing in Graphile starts it again. Exiting is a poor default: the worker often shares its process with an API, and a platform that gives up after a few failed restarts turns a short database outage into a dead service. So the lifecycle ([`src/lifecycle.ts`](../../src/lifecycle.ts)) starts a new runner with backoff. `promise` stays pending, so an app awaiting it neither crashes nor wakes up with no worker. This is the one loop the library runs on top of Graphile. It replaces the whole runner rather than repairing it: the new pool has a new id, so crash recovery treats the old one like any dead worker and releases what it still held. The first `start()` does not retry, so a wrong URL or a missing migration still fails at boot.
 
+## Shutdown probes the database from outside the pool
+
+On a server that died without closing its sockets, Graphile's stop awaits queries that never return. `stop({ probeDatabase })` ([`src/shutdown.ts`](../../src/shutdown.ts)) races it against probes on a fresh connection, because the pool may be held by exactly those queries. Only silence counts as unreachable. A server that answers with an error, such as too many connections, still answers the runners' connections, and giving up then would let the caller exit with jobs mid-run, locked until crash recovery releases them. The probe is opt-in for the same reason: on a reachable database a fresh connection can take longer than the timeout, behind PgBouncer's queue or a slow TLS handshake, and a false alarm cuts a healthy drain short.
+
 ## Observers cannot change outcomes
 
 Hooks, loggers and tracing run around the job, never in its decision path ([`src/observers.ts`](../../src/observers.ts)). Their failures are reported separately and never change acknowledgement or replace the job's error. `shouldSkipEnqueue` is the exception: it is a behavioral decision, so its errors propagate.

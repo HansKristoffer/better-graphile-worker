@@ -81,6 +81,49 @@ export class ShutdownTimeoutError extends Error {
 }
 
 /**
+ * `stop({ probeDatabase })` gave up waiting: the database stopped answering, so the
+ * runners' queries can never finish. Shutdown continues in the background; end the pool
+ * without awaiting it, since its checked-out clients may never be released.
+ */
+export class DatabaseUnreachableError extends Error {
+	constructor(options?: ErrorOptions) {
+		super(
+			'Worker shutdown stopped waiting: the database is unreachable; shutdown is still in progress',
+			options
+		)
+		this.name = 'DatabaseUnreachableError'
+	}
+}
+
+/**
+ * Graphile created fewer jobs than the enqueue asked for, typically because a worker
+ * claimed an existing `jobKey` at the same moment. In a transaction, throwing rolls it
+ * back; retry the transaction.
+ */
+export class EnqueueCountError extends Error {
+	constructor(
+		readonly queue: string,
+		readonly expected: number,
+		readonly actual: number
+	) {
+		super(
+			`Enqueue of "${queue}" returned ${actual} of ${expected} jobs, likely a jobKey race; retry the transaction`
+		)
+		this.name = 'EnqueueCountError'
+	}
+}
+
+/** A `required` enqueue was skipped because `shouldSkipEnqueue()` returned true. */
+export class EnqueueSkippedError extends Error {
+	constructor(readonly queue: string) {
+		super(
+			`Required enqueue of "${queue}" was skipped because shouldSkipEnqueue() returned true`
+		)
+		this.name = 'EnqueueSkippedError'
+	}
+}
+
+/**
  * The worker's runner stopped although `stop()` was never called, for example after
  * Graphile shut its pool down on a database error; `cause` carries Graphile's reason when
  * it gave one. The worker logs it and starts a new runner; with `restart: false`,

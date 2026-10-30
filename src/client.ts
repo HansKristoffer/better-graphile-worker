@@ -15,6 +15,7 @@ import {
 	idempotencyTablesSql,
 	type IdempotentJobSpec
 } from './enqueue-sql.js'
+import { EnqueueCountError } from './errors.js'
 import { HEARTBEATS_TABLE, heartbeatTableSql } from './maintenance.js'
 import { JOB_OUTCOMES_TABLE, outcomeTablesSql } from './job-outcomes.js'
 import { WAIT_GROUPS_TABLE, WAITS_TABLE, waitTablesSql } from './waits.js'
@@ -103,7 +104,7 @@ export function createWorkerClient(options: {
 		async addJob(identifier, payload, spec = {}) {
 			const { text, values } = addJobSql(schema, identifier, payload, spec, '*')
 			const job = (await options.pgPool.query<DbJob>(text, values)).rows[0]
-			if (!job?.id) throw new Error('Graphile add_job returned no job')
+			if (!job?.id) throw new EnqueueCountError(identifier, 1, 0)
 			return { ...job, task_identifier: identifier }
 		},
 		async addJobs(specs, jobKeyPreserveRunAt = false) {
@@ -116,7 +117,11 @@ export function createWorkerClient(options: {
 			)
 			const result = await options.pgPool.query<DbJob>(text, values)
 			if (result.rows.length !== specs.length)
-				throw new Error('Graphile add_jobs returned fewer jobs than requested')
+				throw new EnqueueCountError(
+					specs[0]!.identifier,
+					specs.length,
+					result.rows.length
+				)
 			return result.rows.map((job, index) => ({
 				...job,
 				task_identifier: specs[index]!.identifier
@@ -127,7 +132,11 @@ export function createWorkerClient(options: {
 			const { text, values } = addIdempotentJobsSql(schema, specs)
 			const result = await options.pgPool.query<EnqueuedJob>(text, values)
 			if (result.rows.length !== specs.length)
-				throw new Error('Idempotent enqueue returned fewer jobs than requested')
+				throw new EnqueueCountError(
+					specs[0]!.identifier,
+					specs.length,
+					result.rows.length
+				)
 			return result.rows
 		}
 	}

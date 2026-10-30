@@ -53,6 +53,7 @@ import {
 	type RestartOptions
 } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
+import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
@@ -69,6 +70,7 @@ import type {
 	CreateJobsFn,
 	EnqueueInTransactionFn,
 	PrepareJobFn,
+	PrepareJobRequestFn,
 	PrepareJobsFn,
 	CronQueueName,
 	GetJobProgressFn,
@@ -173,8 +175,11 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
 	readonly createJobs: CreateJobsFn<TQueues>
-	/** Build enqueue SQL to execute inside your own transaction. */
-	readonly prepareJob: PrepareJobFn<TQueues>
+	/**
+	 * Build enqueue SQL to execute inside your own transaction, from a queue name and
+	 * arguments or one `JobRequest` object.
+	 */
+	readonly prepareJob: PrepareJobRequestFn<TQueues> & PrepareJobFn<TQueues>
 	readonly prepareJobs: PrepareJobsFn<TQueues>
 	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
 	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>
@@ -424,7 +429,11 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		},
 		migrate: () => client.migrate(),
 		start: () => lifecycle.start(),
-		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
+		stop(stopOptions) {
+			const probe = resolveDatabaseProbe(stopOptions?.probeDatabase)
+			const stopping = lifecycle.stop(stopOptions?.timeout)
+			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
+		},
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
 			lifecycle.runOnce(async () => {

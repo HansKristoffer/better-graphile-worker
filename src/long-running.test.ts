@@ -7,9 +7,10 @@ import { defineQueues } from './define-queues.js'
 import { createBetterWorker } from './create-better-worker.js'
 import { createJobClient } from './job-client.js'
 import { continueJob } from './private-jobs.js'
-import { StepPersistenceError } from './errors.js'
+import { EnqueueCountError, StepPersistenceError } from './errors.js'
 import { createWorkerClient } from './client.js'
-import { addJobsSql } from './enqueue-sql.js'
+import { addJobSql, addJobsSql } from './enqueue-sql.js'
+import { enqueueInTransaction } from './prisma.js'
 import type { JobFinishedEvent } from './hooks.js'
 
 const enabled = Boolean(process.env.DATABASE_URL)
@@ -247,9 +248,31 @@ suite('long-running, per-tenant workloads', () => {
 		expect(await jobs('keyed')).toHaveLength(0)
 	})
 
-	test('immediate enqueue rejects Graphile results lost to a concurrent claim', async () => {
+	test('immediate and transactional enqueue reject Graphile results lost to a concurrent claim', async () => {
 		const adapter = createWorkerClient({ pgPool: pool, schema })
-		for (const batch of [false, true]) {
+		/** An app's own transaction seam: a `$queryRawUnsafe` without a type parameter. */
+		type Tx = {
+			$queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>
+		}
+		const inTransaction = async <R>(run: (tx: Tx) => Promise<R>) => {
+			const connection = await pool.connect()
+			try {
+				await connection.query('BEGIN')
+				const result = await run({
+					$queryRawUnsafe: async (query, ...values) =>
+						(await connection.query(query, values)).rows
+				})
+				await connection.query('COMMIT')
+				return result
+			} catch (error) {
+				await connection.query('ROLLBACK')
+				throw error
+			} finally {
+				connection.release()
+			}
+		}
+		for (const mode of ['single', 'batch', 'transaction'] as const) {
+			const batch = mode === 'batch'
 			const id = await worker.createJob('keyed', { id: 'race' })
 			await pool.query(`CREATE FUNCTION "${schema}".block_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 			BEGIN PERFORM pg_advisory_xact_lock(${process.pid}, 912345); RETURN NEW; END$$`)
@@ -262,11 +285,20 @@ suite('long-running, per-tenant workloads', () => {
 				process.pid
 			])
 			const pending = (
-				batch
-					? adapter.enqueue.addJobs([
-							{ identifier: 'keyed', payload: {}, jobKey: 'k:race' }
-						])
-					: adapter.enqueue.addJob('keyed', {}, { jobKey: 'k:race' })
+				mode === 'transaction'
+					? inTransaction((tx) =>
+							enqueueInTransaction(tx, {
+								queue: 'keyed',
+								count: 1,
+								skipped: false,
+								...addJobSql(schema, 'keyed', {}, { jobKey: 'k:race' })
+							})
+						)
+					: batch
+						? adapter.enqueue.addJobs([
+								{ identifier: 'keyed', payload: {}, jobKey: 'k:race' }
+							])
+						: adapter.enqueue.addJob('keyed', {}, { jobKey: 'k:race' })
 			).then(
 				() => undefined,
 				(error: unknown) => error
@@ -307,7 +339,12 @@ suite('long-running, per-tenant workloads', () => {
 				)
 				await pool.query(`DROP FUNCTION "${schema}".block_insert()`)
 			}
-			expect(await pending).toBeInstanceOf(Error)
+			expect(await pending).toBeInstanceOf(EnqueueCountError)
+			expect(await pending).toMatchObject({
+				queue: 'keyed',
+				expected: 1,
+				actual: 0
+			})
 			expect(await jobs('keyed')).toHaveLength(1)
 			await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 		}
