@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.2...v2.7.0) (2026-10-30)
+
+
+### Features
+
+* **worker:** restart a runner that Graphile stops on its own ([#31](https://github.com/HansKristoffer/better-graphile-worker/issues/31)) ([091908a](https://github.com/HansKristoffer/better-graphile-worker/commit/091908ad06bb31c337eab7e8240df84f446d87f4))
+
 ## [2.6.2](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.6.1...v2.6.2) (2026-10-21)
 
 
