@@ -118,17 +118,18 @@ export type PreparedJob = {
 	readonly skipped: boolean
 }
 
-/** Prepare one job, from positional arguments or a `JobRequest` object. */
-export type PrepareJobFn<TQueues extends readonly QueueContract[]> = ((
-	job: JobRequest<TQueues>
-) => Promise<PreparedJob>) &
-	(string extends QueueName<TQueues>
+export type PrepareJobFn<TQueues extends readonly QueueContract[]> =
+	string extends QueueName<TQueues>
 		? (
 				queueName: string,
 				data?: unknown,
 				options?: JobOptions
 			) => Promise<PreparedJob>
-		: (...args: EnqueueArgs<TQueues[number]>) => Promise<PreparedJob>)
+		: (...args: EnqueueArgs<TQueues[number]>) => Promise<PreparedJob>
+/** `prepareJob` with one `JobRequest` object; `worker.prepareJob` takes this and `PrepareJobFn`. */
+export type PrepareJobRequestFn<TQueues extends readonly QueueContract[]> = (
+	job: JobRequest<TQueues>
+) => Promise<PreparedJob>
 type RequestFor<Q> = Q extends QueueContract
 	? { task: Q['name'] } & (undefined extends InferInput<Q>
 			? { payload?: InferInput<Q> }
@@ -145,17 +146,13 @@ export type JobRequest<TQueues extends readonly QueueContract[]> =
  * unless `required` makes that throw.
  */
 export type EnqueueInTransactionFn<TQueues extends readonly QueueContract[]> = {
-	(
-		tx: RawQueryClient,
-		job: JobRequest<TQueues>,
-		options: EnqueueInTransactionOptions & { required: true }
-	): Promise<string>
-	(
+	// A method keeps `tx` bivariant, so implementations typed with `PrismaRawClient` still fit.
+	enqueue(
 		tx: RawQueryClient,
 		job: JobRequest<TQueues>,
 		options?: EnqueueInTransactionOptions
 	): Promise<string | null>
-}
+}['enqueue']
 export type PrepareJobsFn<TQueues extends readonly QueueContract[]> =
 	string extends QueueName<TQueues>
 		? (

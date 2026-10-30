@@ -70,6 +70,7 @@ import type {
 	CreateJobsFn,
 	EnqueueInTransactionFn,
 	PrepareJobFn,
+	PrepareJobRequestFn,
 	PrepareJobsFn,
 	CronQueueName,
 	GetJobProgressFn,
@@ -174,8 +175,11 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	readonly queues: TQueues
 	readonly createJob: CreateJobFn<TQueues>
 	readonly createJobs: CreateJobsFn<TQueues>
-	/** Build enqueue SQL to execute inside your own transaction. */
-	readonly prepareJob: PrepareJobFn<TQueues>
+	/**
+	 * Build enqueue SQL to execute inside your own transaction, from a queue name and
+	 * arguments or one `JobRequest` object.
+	 */
+	readonly prepareJob: PrepareJobRequestFn<TQueues> & PrepareJobFn<TQueues>
 	readonly prepareJobs: PrepareJobsFn<TQueues>
 	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
 	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>

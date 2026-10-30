@@ -162,10 +162,33 @@ export function createBetterWorkerPool<
 		if (failed) throw failed.reason
 	}
 	const stopAll = () => Promise.allSettled(all.map((worker) => worker.stop()))
-	/** A pool without runners idles from start() until stop(), as a running pool would. */
+	/**
+	 * A pool without runners idles from start() until stop(), as a running pool would,
+	 * including stopping on SIGINT/SIGTERM with `handleSignals`.
+	 */
 	let idle: { promise: Promise<void>; stop(): void } | undefined
 	const idleOr = (operation: () => Promise<void>) =>
 		idle ? idle.promise : operation()
+	function startIdle() {
+		let resolve = () => {}
+		const promise = new Promise<void>((done) => {
+			resolve = done
+		})
+		const onSignal = () => idle?.stop()
+		if (options.handleSignals) {
+			process.on('SIGINT', onSignal)
+			process.on('SIGTERM', onSignal)
+		}
+		idle = {
+			promise,
+			stop() {
+				process.off('SIGINT', onSignal)
+				process.off('SIGTERM', onSignal)
+				idle = undefined
+				void primary.stop().finally(resolve)
+			}
+		}
+	}
 
 	return {
 		...delegated,
@@ -175,13 +198,7 @@ export function createBetterWorkerPool<
 		},
 		async start() {
 			if (!all.length) {
-				if (!idle) {
-					let stop = () => {}
-					const promise = new Promise<void>((resolve) => {
-						stop = resolve
-					})
-					idle = { promise, stop }
-				}
+				if (!idle) startIdle()
 				return
 			}
 			try {
@@ -197,11 +214,11 @@ export function createBetterWorkerPool<
 		stop(stopOptions) {
 			const { probeDatabase, ...runnerStop } = stopOptions ?? {}
 			const probe = resolveDatabaseProbe(probeDatabase)
+			const waiting = idle?.promise
 			idle?.stop()
-			idle = undefined
 			const stopping = all.length
 				? each((worker) => worker.stop(runnerStop))
-				: primary.stop()
+				: (waiting ?? primary.stop())
 			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
 		},
 		waitUntilStopped: () =>

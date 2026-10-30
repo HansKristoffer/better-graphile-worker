@@ -41,6 +41,7 @@ export type {
 	CreateJobsFn,
 	PreparedJob,
 	PrepareJobFn,
+	PrepareJobRequestFn,
 	PrepareJobsFn,
 	JobRequest,
 	EnqueueInTransactionFn,

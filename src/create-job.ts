@@ -31,6 +31,7 @@ import type {
 	JobsApi,
 	PreparedJob,
 	PrepareJobFn,
+	PrepareJobRequestFn,
 	PrepareJobsFn
 } from './types.js'
 import {
@@ -587,7 +588,7 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	return {
 		createJob,
 		createJobs,
-		prepareJob: prepareJob as PrepareJobFn<T>,
+		prepareJob: prepareJob as PrepareJobRequestFn<T> & PrepareJobFn<T>,
 		prepareJobs: prepareMany as PrepareJobsFn<T>,
 		enqueueInTransaction:
 			enqueueOneInTransaction as unknown as EnqueueInTransactionFn<T>,

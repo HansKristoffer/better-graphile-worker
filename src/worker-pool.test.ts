@@ -151,11 +151,27 @@ describe('createBetterWorkerPool', () => {
 		const waiting = workers.waitUntilStopped().then(() => {
 			stopped = true
 		})
-		await Promise.resolve()
+		// Every pending microtask runs before the next macrotask.
+		await new Promise((resolve) => setImmediate(resolve))
 		expect(stopped).toBe(false)
 		await workers.stop()
 		await waiting
 		await workers.promise
+	})
+
+	test('an idle pool with handleSignals stops on SIGTERM', async () => {
+		const workers = createBetterWorkerPool({
+			pgPool: {} as Pool,
+			queues: [],
+			runners: {},
+			handleSignals: true
+		})
+		const listeners = process.listenerCount('SIGTERM')
+		await workers.start()
+		expect(process.listenerCount('SIGTERM')).toBe(listeners + 1)
+		process.emit('SIGTERM')
+		await workers.waitUntilStopped()
+		expect(process.listenerCount('SIGTERM')).toBe(listeners)
 	})
 
 	test('pgPoolSize covers each runner and its LISTEN and maintenance connections', () => {

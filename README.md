@@ -194,7 +194,7 @@ await prisma.$transaction(async (tx) => {
 
 Pass `{ required: true }` when the transaction must not commit without its jobs: a statement skipped by `shouldSkipEnqueue()` then throws `EnqueueSkippedError` instead of returning no ids. Immediate enqueues that lose a job to the same race throw `EnqueueCountError` too.
 
-For one job, `worker.enqueueInTransaction(tx, job)` prepares and runs it in one call and returns its id (null when skipped; with `{ required: true }` as a third argument, always a string). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
+For one job, `worker.enqueueInTransaction(tx, job, { required })` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
 
 ```ts
 const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJobKeyMode: 'unsafe_dedupe' })
@@ -243,8 +243,9 @@ await workers.jobs.sendReply({ id })
 
 ```ts
 const runners = { interactive: { concurrency: 6 }, background: { concurrency: 4 } }
+// Counts only the runners that have queues, + producer headroom.
+const pgPool = new Pool({ connectionString, max: pgPoolSize(runners, { queues, defaultRunner: 'background' }) + 4 })
 const workers = createBetterWorkerPool({ pgPool, queues, runners, defaultRunner: 'background' })
-const max = pgPoolSize(runners, { queues, defaultRunner: 'background' }) + 4 // counts started runners only
 ```
 
 A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections; `pgPoolSize(runners, { queues, defaultRunner })` counts only the runners that have queues. The CLI accepts a pool.

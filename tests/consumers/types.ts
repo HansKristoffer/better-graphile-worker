@@ -887,19 +887,12 @@ export const plainTransactional = async (
 	const ids: string[] = await enqueueInTransaction(tx, prepared, {
 		required: true
 	})
-	const id: string = await workerPool.enqueueInTransaction(
+	const id: string | null = await workerPool.enqueueInTransaction(
 		tx,
 		{ task: 'turnReply', payload: { id: 'a' } },
 		{ required: true }
 	)
-	const maybe: string | null = await workerPool.enqueueInTransaction(tx, {
-		task: 'nightly'
-	})
-	// @ts-expect-error Without required, a skipped job returns null
-	const notRequired: string = await workerPool.enqueueInTransaction(tx, {
-		task: 'nightly'
-	})
-	return [ids, id, maybe, notRequired]
+	return [ids, id]
 }
 // A union of requests prepares without a branch per queue.
 export const preparedUnion = (job: publicApi.JobRequest<typeof pooled>) =>
@@ -953,3 +946,10 @@ createBetterWorkerPool({
 	queues: [looseQueue],
 	runners: fixedRunners
 })
+// Test doubles written against 2.7.0 still fit.
+export const prepareDouble: publicApi.PrepareJobFn<typeof pooled> = async (
+	...args
+) => workerPool.prepareJob(...args)
+export const enqueueDouble: publicApi.EnqueueInTransactionFn<
+	typeof pooled
+> = async (_tx: PrismaTransactionLike, _job) => null

@@ -1,11 +1,4 @@
-import {
-	afterAll,
-	beforeAll,
-	describe,
-	expect,
-	expectTypeOf,
-	test
-} from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
 import { createJobClient } from './job-client.js'
@@ -16,7 +9,12 @@ import {
 	type RawQueryClient
 } from './prisma.js'
 import { EnqueueCountError, EnqueueSkippedError } from './errors.js'
-import type { JobRequest, PreparedJob } from './types.js'
+import type {
+	EnqueueInTransactionFn,
+	JobRequest,
+	PrepareJobFn,
+	PreparedJob
+} from './types.js'
 
 const prepared = (count: number): PreparedJob => ({
 	queue: 'q',
@@ -134,18 +132,16 @@ describe('enqueueInTransaction on a producer', () => {
 		})
 	})
 
-	test('required makes a skipped job throw, and types the id as a string', async () => {
+	test('required makes a skipped job throw', async () => {
 		const { tx, calls } = recording()
 		const client = producer()
-		const id = await client.enqueueInTransaction(
-			tx,
-			{ task: 'charge', payload: { id: 'a' } },
-			{ required: true }
-		)
-		expectTypeOf(id).toEqualTypeOf<string>()
-		expect(id).toBe('7')
-		const optional = await client.enqueueInTransaction(tx, { task: 'nightly' })
-		expectTypeOf(optional).toEqualTypeOf<string | null>()
+		expect(
+			await client.enqueueInTransaction(
+				tx,
+				{ task: 'charge', payload: { id: 'a' } },
+				{ required: true }
+			)
+		).toBe('7')
 
 		const skipping = createJobClient({
 			pgPool: new Pool(),
@@ -158,7 +154,17 @@ describe('enqueueInTransaction on a producer', () => {
 		await expect(
 			skipping.enqueueInTransaction(tx, { task: 'nightly' }, { required: true })
 		).rejects.toBeInstanceOf(EnqueueSkippedError)
-		expect(calls).toHaveLength(2)
+		expect(calls).toHaveLength(1)
+	})
+
+	test('2.7.0-style test doubles still fit the function types', () => {
+		const prepare: PrepareJobFn<typeof queues> = async (...args) =>
+			producer().prepareJob(...args)
+		const enqueue: EnqueueInTransactionFn<typeof queues> = async (
+			_tx: PrismaRawClient,
+			_job
+		) => null
+		expect([typeof prepare, typeof enqueue]).toEqual(['function', 'function'])
 	})
 
 	test('prepareJob takes a request object, so a union of jobs prepares without casts', async () => {
