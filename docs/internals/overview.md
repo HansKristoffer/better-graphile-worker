@@ -67,6 +67,10 @@ A wait's children, its group row and one wait row per child commit in one transa
 
 Children report because the wait marks their envelope `waited`. A job that nobody waits on costs nothing extra, and there is no worker option to forget. Workers without the mark, such as an older version, complete children silently, and the sweep fails those waits. A child completes itself in the same statement that reports, the way `jobOutcomes` completes jobs, so a crash cannot record a result and then run the child again, or the reverse.
 
+## A runner Graphile stops is restarted in the process
+
+Graphile shuts its worker pool down on errors it cannot recover from, such as a failed `completeJobs`, and its runner then resolves as if `stop()` had been called. Nothing in Graphile starts it again. Exiting is a poor default: the worker often shares its process with an API, and a platform that gives up after a few failed restarts turns a short database outage into a dead service. So the lifecycle ([`src/lifecycle.ts`](../../src/lifecycle.ts)) starts a new runner with backoff. `promise` stays pending, so an app awaiting it neither crashes nor wakes up with no worker. This is the one loop the library runs on top of Graphile. It replaces the whole runner rather than repairing it: the new pool has a new id, so crash recovery treats the old one like any dead worker and releases what it still held. The first `start()` does not retry, so a wrong URL or a missing migration still fails at boot.
+
 ## Observers cannot change outcomes
 
 Hooks, loggers and tracing run around the job, never in its decision path ([`src/observers.ts`](../../src/observers.ts)). Their failures are reported separately and never change acknowledgement or replace the job's error. `shouldSkipEnqueue` is the exception: it is a behavioral decision, so its errors propagate.

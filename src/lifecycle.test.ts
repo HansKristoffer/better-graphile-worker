@@ -162,6 +162,48 @@ test('a runner that ends on its own is forgotten: start() runs a new one, stop()
 	expect(runs.map((run) => run.stopped)).toEqual([0, 1])
 	expect(releases).toBe(1)
 })
+test('stop() during a restart attempt waits for it and stops the runner it started', async () => {
+	const runs: {
+		stopped: number
+		completion: ReturnType<typeof deferred<void>>
+	}[] = []
+	const restartBegan = deferred<void>()
+	const restartStartup = deferred<void>()
+	const lifecycle = createLifecycle({
+		start: async (restarting) => {
+			if (restarting) {
+				restartBegan.resolve()
+				await restartStartup.promise
+			}
+			const run = { stopped: 0, completion: deferred<void>() }
+			runs.push(run)
+			return {
+				promise: run.completion.promise,
+				async stop() {
+					run.stopped++
+					run.completion.resolve()
+				}
+			}
+		},
+		release: async () => {},
+		onError: () => {},
+		restart: {
+			delay: 0,
+			maxDelay: 0,
+			onStopped() {},
+			onRestartFailed() {},
+			onRestarted() {}
+		}
+	})
+	await lifecycle.start()
+	runs[0]!.completion.reject(new Error('runner died'))
+	await restartBegan.promise
+	const stopped = lifecycle.stop()
+	restartStartup.resolve()
+	await stopped
+	await lifecycle.promise
+	expect(runs.map((run) => run.stopped)).toEqual([0, 1])
+})
 test('signals during startup wait for the runner and shut it down', async () => {
 	const completed = deferred<void>()
 	let stopped = false

@@ -128,7 +128,7 @@ export function createBetterWorkerPool<
 				await stopAll()
 				throw error
 			}
-			// Likewise a runner that stops on its own: the pool stops the rest and rejects.
+			// Likewise a runner that stopped and is not restarted: the pool stops the rest and rejects.
 			for (const worker of all) void worker.promise.catch(stopAll)
 		},
 		stop: (stopOptions) => each((worker) => worker.stop(stopOptions)),
