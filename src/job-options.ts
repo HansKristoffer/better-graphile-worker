@@ -22,6 +22,19 @@ export type JobOptions = Pick<
 export type StopOptions = {
 	/** Reject after this many milliseconds; shutdown continues and can still be awaited. */
 	timeout?: number
+	/**
+	 * Wait only while the database answers: probe it on a fresh connection outside the
+	 * pool, and reject with `DatabaseUnreachableError` once a probe gets no answer.
+	 * Shutdown continues and can still be awaited. Off by default.
+	 */
+	probeDatabase?: boolean | DatabaseProbeOptions | undefined
+}
+
+export type DatabaseProbeOptions = {
+	/** Wait between probes, in ms. Default 1 second. */
+	interval?: number
+	/** How long one probe may take to connect and answer `SELECT 1`, in ms. Default 2 seconds. */
+	timeout?: number
 }
 
 /** Graphile batch enqueue does not support jobKeyMode or a shared job key. */

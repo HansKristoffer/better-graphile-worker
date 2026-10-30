@@ -40,7 +40,11 @@ import {
 	type IdempotentJobSpec
 } from './enqueue-sql.js'
 import { assertValidSchemaName } from './schema-name.js'
-import { enqueueInTransaction, type PrismaRawClient } from './prisma.js'
+import {
+	enqueueInTransaction,
+	type EnqueueInTransactionOptions,
+	type RawQueryClient
+} from './prisma.js'
 
 export const DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS = 4
 const DEFAULT_IDEMPOTENCY_TTL = 30 * 86_400_000
@@ -68,6 +72,8 @@ export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 }
 
 export type JobKeyMode = NonNullable<JobOptions['jobKeyMode']>
+/** The erased shape of a `JobRequest`. */
+type JobRequestObject = { task: string; payload?: unknown } & JobOptions
 const JOB_KEY_MODES: readonly JobKeyMode[] = [
 	'replace',
 	'preserve_run_at',
@@ -547,8 +553,9 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		})
 	}
 	async function enqueueOneInTransaction(
-		tx: PrismaRawClient,
-		job: { task: string; payload?: unknown } & JobOptions
+		tx: RawQueryClient,
+		job: JobRequestObject,
+		transactionOptions?: EnqueueInTransactionOptions
 	): Promise<string | null> {
 		const { task, payload, ...jobOptions } = job
 		const prepared = await prepareOne(
@@ -557,8 +564,22 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			jobOptions,
 			transactionalJobKeyMode
 		)
-		const [id] = await enqueueInTransaction(tx, prepared)
+		const [id] = await enqueueInTransaction(tx, prepared, transactionOptions)
 		return id ?? null
+	}
+	/** `prepareJob` takes a queue name and arguments, or one `JobRequest` object. */
+	function prepareJob(
+		first: string | JobRequestObject,
+		data?: unknown,
+		jobOptions?: JobOptions
+	): Promise<PreparedJob> {
+		if (typeof first === 'string') return prepareOne(first, data, jobOptions)
+		if (!isPlainObject(first) || typeof first.task !== 'string')
+			return Promise.reject(
+				new TypeError('prepareJob takes a queue name or a { task } request')
+			)
+		const { task, payload, ...requestOptions } = first
+		return prepareOne(task, payload, requestOptions)
 	}
 	// All erased calls pass through this registry/validation boundary.
 	const createJob = enqueueOne as CreateJobFn<T>
@@ -566,7 +587,7 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 	return {
 		createJob,
 		createJobs,
-		prepareJob: prepareOne as PrepareJobFn<T>,
+		prepareJob: prepareJob as PrepareJobFn<T>,
 		prepareJobs: prepareMany as PrepareJobsFn<T>,
 		enqueueInTransaction:
 			enqueueOneInTransaction as unknown as EnqueueInTransactionFn<T>,

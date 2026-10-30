@@ -53,6 +53,7 @@ import {
 	type RestartOptions
 } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
+import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
 import { assertInteger } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
@@ -424,7 +425,11 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		},
 		migrate: () => client.migrate(),
 		start: () => lifecycle.start(),
-		stop: (stopOptions) => lifecycle.stop(stopOptions?.timeout),
+		stop(stopOptions) {
+			const probe = resolveDatabaseProbe(stopOptions?.probeDatabase)
+			const stopping = lifecycle.stop(stopOptions?.timeout)
+			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
+		},
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
 			lifecycle.runOnce(async () => {

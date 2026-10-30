@@ -26,8 +26,28 @@ function required(value: string | undefined, label: string): string {
 	if (!value) throw new Error(`${label} required`)
 	return value
 }
+/** Commands that read or write the database; the rest only describe the registry. */
+const DATABASE_COMMANDS = new Set([
+	'create-job',
+	'stats',
+	'list-jobs',
+	'get-job',
+	'retry',
+	'fail',
+	'run-once'
+])
+
+export type CliOptions = {
+	/**
+	 * Run `worker.migrate()` before a command that uses the database. Help, `list-queues`
+	 * and `schema` never connect.
+	 */
+	migrate?: boolean | undefined
+}
+
 export function createCli<T extends readonly QueueContract[]>(
-	worker: BetterWorker<T> | BetterWorkerPool<T>
+	worker: BetterWorker<T> | BetterWorkerPool<T>,
+	options: CliOptions = {}
 ): (argv?: string[]) => Promise<void> {
 	// Dynamic input always goes through the same registry and runtime validation as typed calls.
 	const enqueue = worker.createJob as (
@@ -63,6 +83,8 @@ export function createCli<T extends readonly QueueContract[]>(
 				console.log(HELP)
 				return
 			}
+			if (options.migrate && DATABASE_COMMANDS.has(command))
+				await worker.migrate()
 			switch (command) {
 				case 'list-queues':
 					print(

@@ -5,7 +5,10 @@ import { z } from 'zod'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
 import { createBetterWorkerPool, pgPoolSize } from './worker-pool.js'
-import { createBetterWorker } from './create-better-worker.js'
+import {
+	createBetterWorker,
+	type BetterWorker
+} from './create-better-worker.js'
 import { WorkerStoppedError } from './errors.js'
 import type { OtelMeter } from './otel.js'
 import type { WorkerEvents, WorkerPool } from 'graphile-worker'
@@ -75,26 +78,84 @@ describe('createBetterWorkerPool', () => {
 		).toThrow('prefetch')
 	})
 
-	test('rejects queues without a configured runner and runners without queues', () => {
-		const create = (runners: Record<string, object>, queues = contracts) =>
+	test('rejects queues without a configured runner, and a defaultRunner that is not one', () => {
+		const create = (
+			runners: Record<string, object>,
+			queues: readonly object[] = contracts,
+			defaultRunner?: string
+		) =>
 			createBetterWorkerPool({
 				pgPool: {} as Pool,
 				queues,
 				handlers,
-				runners
+				runners,
+				defaultRunner
 			} as never)
 		expect(() => create({ turn: {} })).toThrow(
 			'Queue "digest" uses unknown runner "background"'
 		)
-		expect(() => create({ turn: {}, background: {}, idle: {} })).toThrow(
-			'Runner "idle" has no queues'
-		)
-		expect(() => create({})).toThrow('at least one runner')
 		expect(() =>
 			create({ turn: {} }, [
 				defineQueue({ name: 'reply', inputSchema: z.string() })
-			] as never)
+			])
 		).toThrow('Queue "reply" needs a runner')
+		expect(() =>
+			create({ turn: {}, background: {} }, contracts, 'missing')
+		).toThrow('defaultRunner "missing" is not one of the runners')
+	})
+
+	test('runners may outnumber the queues: one without queues is never created', () => {
+		const workers = createBetterWorkerPool({
+			pgPool: {} as Pool,
+			queues: [reply],
+			handlers: { reply: () => {} },
+			runners: { turn: {}, background: {} }
+		})
+		expect(Object.keys(workers.runners)).toEqual(['turn'])
+		expectTypeOf(workers.runners).toEqualTypeOf<{
+			readonly turn: BetterWorker<readonly [typeof reply]>
+		}>()
+	})
+
+	test('defaultRunner takes the queues that name no runner', () => {
+		const workers = createBetterWorkerPool({
+			pgPool: {} as Pool,
+			queues: [reply, loose],
+			handlers: { reply: () => {}, loose: () => {} },
+			runners: { turn: {}, background: {} },
+			defaultRunner: 'background'
+		})
+		expect(Object.keys(workers.runners)).toEqual(['turn', 'background'])
+		expectTypeOf(workers.runners).toHaveProperty('background')
+		void (() =>
+			createBetterWorkerPool({
+				pgPool: {} as Pool,
+				queues: [reply, loose],
+				handlers: { reply: () => {}, loose: () => {} },
+				// @ts-expect-error The default runner needs options too.
+				runners: { turn: {} },
+				defaultRunner: 'background'
+			}))
+	})
+
+	test('an empty registry gives a pool that idles from start() until stop()', async () => {
+		const workers = createBetterWorkerPool({
+			pgPool: {} as Pool,
+			queues: [],
+			runners: { turn: {} }
+		})
+		expect(workers.runners).toEqual({})
+		expect(workers.getQueueDefinitions()).toEqual([])
+		await workers.start()
+		let stopped = false
+		const waiting = workers.waitUntilStopped().then(() => {
+			stopped = true
+		})
+		await Promise.resolve()
+		expect(stopped).toBe(false)
+		await workers.stop()
+		await waiting
+		await workers.promise
 	})
 
 	test('pgPoolSize covers each runner and its LISTEN and maintenance connections', () => {
@@ -102,6 +163,23 @@ describe('createBetterWorkerPool', () => {
 			pgPoolSize({ turn: { concurrency: 10 }, background: { concurrency: 4 } })
 		).toBe(18)
 		expect(pgPoolSize({ default: {} })).toBe(12)
+	})
+
+	test('pgPoolSize with the queues counts only runners the pool starts', () => {
+		const runners = {
+			turn: { concurrency: 10 },
+			background: { concurrency: 4 },
+			idle: { concurrency: 50 }
+		}
+		expect(pgPoolSize(runners, { queues: contracts })).toBe(18)
+		expect(pgPoolSize(runners, { queues: [reply] })).toBe(12)
+		expect(pgPoolSize(runners, { queues: [] })).toBe(0)
+		expect(
+			pgPoolSize(runners, { queues: [loose], defaultRunner: 'background' })
+		).toBe(6)
+		expect(() => pgPoolSize(runners, { queues: [loose] })).toThrow(
+			'needs a runner'
+		)
 	})
 })
 
@@ -175,6 +253,57 @@ suite('worker pool on PostgreSQL', () => {
 		expect(
 			counted.filter((entry) => entry.name === 'graphile_job_total')
 		).toHaveLength(2)
+	})
+
+	test('defaultRunner runs the queues that name none; a runner without queues never starts', async () => {
+		const lockedBy = new Map<string, string | null>()
+		const done = new Map<string, () => void>()
+		const finished = (queue: string) =>
+			new Promise<void>((resolve) => done.set(queue, resolve))
+		const workers = createBetterWorkerPool({
+			pgPool: pool,
+			schema,
+			queues: [reply, loose],
+			handlers: {
+				reply: (_, ctx) =>
+					void lockedBy.set('reply', ctx.helpers.job.locked_by),
+				loose: (_, ctx) => void lockedBy.set('loose', ctx.helpers.job.locked_by)
+			},
+			defaultRunner: 'background',
+			runners: {
+				turn: { concurrency: 1 },
+				background: { concurrency: 1 },
+				idle: { concurrency: 1 }
+			},
+			hooks: {
+				createLogger: () => quiet,
+				onJobFinished: ({ queue }) => done.get(queue)?.()
+			}
+		})
+		await workers.migrate()
+		const heartbeats = async () =>
+			Number(
+				(
+					await pool.query<{ count: string }>(
+						`SELECT count(*) FROM "${schema}".bgw_worker_heartbeats`
+					)
+				).rows[0]?.count
+			)
+		const before = await heartbeats()
+		await workers.start()
+		try {
+			const ran = Promise.all([finished('reply'), finished('loose')])
+			await workers.jobs.reply({ id: 'r' })
+			await workers.jobs.loose('l')
+			await ran
+			// Handlers wait for their runner's first heartbeat: one row per started runner.
+			expect((await heartbeats()) - before).toBe(2)
+		} finally {
+			await workers.stop()
+		}
+		expect(lockedBy.get('loose')).toBeString()
+		expect(lockedBy.get('loose')).not.toBe(lockedBy.get('reply'))
+		expect(Object.keys(workers.runners)).toEqual(['turn', 'background'])
 	})
 
 	test('secondLookOnNotify fetches once more after a new-job notification', async () => {
