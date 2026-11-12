@@ -7,7 +7,7 @@ import { defineQueues } from './define-queues.js'
 import { createBetterWorker } from './create-better-worker.js'
 import { createJobClient } from './job-client.js'
 import { continueJob } from './private-jobs.js'
-import { EnqueueCountError, StepPersistenceError } from './errors.js'
+import { StepPersistenceError } from './errors.js'
 import { createWorkerClient } from './client.js'
 import { addJobSql, addJobsSql } from './enqueue-sql.js'
 import { enqueueInTransaction } from './prisma.js'
@@ -189,8 +189,16 @@ suite('long-running, per-tenant workloads', () => {
 				payload: { n },
 				...(n === 4 ? { jobKey: 'ordering:key' } : {})
 			}))
+			// A keyed batch opens its own transaction; this one keeps the planner settings.
+			const query = (text: string, values?: unknown[]) =>
+				/^(BEGIN|COMMIT|ROLLBACK)$/.test(text)
+					? Promise.resolve({ rows: [] })
+					: connection.query(text, values)
 			const client = createWorkerClient({
-				pgPool: { query: connection.query.bind(connection) } as unknown as Pool,
+				pgPool: {
+					query,
+					connect: async () => ({ query, release() {} })
+				} as unknown as Pool,
 				schema
 			})
 			const rows = await client.enqueue.addJobs(specs)
@@ -248,7 +256,7 @@ suite('long-running, per-tenant workloads', () => {
 		expect(await jobs('keyed')).toHaveLength(0)
 	})
 
-	test('immediate and transactional enqueue reject Graphile results lost to a concurrent claim', async () => {
+	test('immediate and transactional enqueue rerun a key lost to a concurrent claim', async () => {
 		const adapter = createWorkerClient({ pgPool: pool, schema })
 		/** An app's own transaction seam: a `$queryRawUnsafe` without a type parameter. */
 		type Tx = {
@@ -339,13 +347,12 @@ suite('long-running, per-tenant workloads', () => {
 				)
 				await pool.query(`DROP FUNCTION "${schema}".block_insert()`)
 			}
-			expect(await pending).toBeInstanceOf(EnqueueCountError)
-			expect(await pending).toMatchObject({
-				queue: 'keyed',
-				expected: 1,
-				actual: 0
-			})
-			expect(await jobs('keyed')).toHaveLength(1)
+			// The rerun saw the claimed job, freed its key and enqueued a new one.
+			expect(await pending).toBeUndefined()
+			const [claimed, rerun, ...rest] = await jobs('keyed')
+			expect(rest).toHaveLength(0)
+			expect(claimed).toMatchObject({ id, key: null })
+			expect(rerun).toMatchObject({ key: 'k:race', attempts: 0 })
 			await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 		}
 	})

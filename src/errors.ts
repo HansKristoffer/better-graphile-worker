@@ -97,8 +97,9 @@ export class DatabaseUnreachableError extends Error {
 
 /**
  * Graphile created fewer jobs than the enqueue asked for, typically because a worker
- * claimed an existing `jobKey` at the same moment. In a transaction, throwing rolls it
- * back; retry the transaction.
+ * claimed an existing `jobKey` at the same moment and the library's own reruns lost too.
+ * Nothing was enqueued by a single job or a pool batch; in a transaction, throwing rolls
+ * it back. The enqueue, or the transaction, can be run again.
  */
 export class EnqueueCountError extends Error {
 	constructor(

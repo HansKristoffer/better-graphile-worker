@@ -1,8 +1,11 @@
 import type {
 	BetterWorkerHooks,
 	CreateLoggerOptions,
-	JobLogger
+	JobAttributes,
+	JobLogger,
+	PermanentFailureEvent
 } from './hooks.js'
+import type { QueueFailureHandler } from './queue.js'
 import { createConsoleLogger } from './default-logger.js'
 
 function report(error: unknown): void {
@@ -59,5 +62,32 @@ export function jobLogger(
 	} catch (error) {
 		report(error)
 		return safeLogger(createConsoleLogger(options))
+	}
+}
+
+/** The queue's own hook first, then the instance's; neither can change the outcome. */
+export async function reportPermanentFailure(
+	hooks: BetterWorkerHooks,
+	queueHook: QueueFailureHandler<unknown> | undefined,
+	event: PermanentFailureEvent
+): Promise<void> {
+	if (queueHook)
+		await observe((failure) => queueHook(failure.payload, failure), event)
+	await observe(hooks.onPermanentFailure, event)
+}
+
+/** `hooks.jobAttributes` for one job; a throwing hook is reported and adds nothing. */
+export function resolveJobAttributes(
+	hooks: BetterWorkerHooks,
+	queue: string,
+	payload: unknown
+): JobAttributes | undefined {
+	if (!hooks.jobAttributes) return undefined
+	try {
+		const attributes = hooks.jobAttributes({ queue, payload })
+		return attributes && typeof attributes === 'object' ? attributes : undefined
+	} catch (error) {
+		report(error)
+		return undefined
 	}
 }

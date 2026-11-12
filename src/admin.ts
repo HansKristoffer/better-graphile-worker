@@ -19,12 +19,17 @@ export type QueueDefinition = {
 	maxAttempts: number
 	/** Attempt timeout in milliseconds, including the worker default; null when unlimited. */
 	timeout: number | null
+	/** The worker pool runner that executes the queue, including the pool's `defaultRunner`. */
+	runner: string | null
 	priority: number | null
 	hasInputSchema: boolean
 	inputSchema: z.ZodType | null
 }
 
 export type JobCountRow = {
+	/** The Graphile task identifier; cron-init runs use `{name}_cron-init`. */
+	queue: string
+	/** @deprecated Use `queue`. */
 	taskIdentifier: string
 	pending: number
 	running: number
@@ -42,7 +47,13 @@ export type ListedJob = {
 	id: string
 	/** Preserve PostgreSQL timestamp precision when paginating. */
 	cursor: { createdAt: string; id: string }
+	/** The Graphile task identifier; cron-init runs use `{name}_cron-init`. */
+	queue: string
+	/** @deprecated Use `queue`; job options use `queueName` for the lane. */
 	queueName: string
+	/** The serial lane (Graphile's job queue), if any. */
+	lane: string | null
+	key: string | null
 	payload: unknown
 	priority: number
 	attempts: number
@@ -61,6 +72,8 @@ export type ListJobsOptions = {
 	offset?: number
 	queue?: string
 	state?: JobListState
+	/** Only the job with this `jobKey`. */
+	key?: string
 	/** Defaults to false. Opt in to the private-table payload debugging join. */
 	includePayload?: boolean
 	before?: { createdAt: string; id: string }
@@ -98,6 +111,7 @@ export function getQueueDefinitions(
 		serial: queue.serial ?? null,
 		maxAttempts: queue.maxAttempts ?? defaultMaxAttempts,
 		timeout: queue.timeout ?? defaultTimeout ?? null,
+		runner: queue.runner ?? null,
 		priority: queue.priority ?? null,
 		hasInputSchema: hasInputSchema(queue),
 		inputSchema: hasInputSchema(queue) ? queue.inputSchema : null
@@ -105,7 +119,7 @@ export function getQueueDefinitions(
 }
 
 export function mergeJobStats(
-	rows: readonly JobCountRow[],
+	rows: readonly Omit<JobCountRow, 'queue'>[],
 	ring: CompletedJobStats,
 	taskIdentifiers: readonly string[] = []
 ): WorkerJobStatsRow[] {
@@ -120,6 +134,7 @@ export function mergeJobStats(
 		const pg = byTask.get(taskIdentifier)
 		const mem = ring[taskIdentifier]
 		return {
+			queue: taskIdentifier,
 			taskIdentifier,
 			pending: pg?.pending ?? 0,
 			running: pg?.running ?? 0,
@@ -157,6 +172,7 @@ export async function queryJobCounts(
 	})
 
 	return result.rows.map((row) => ({
+		queue: row.task_identifier,
 		taskIdentifier: row.task_identifier,
 		pending: Number.parseInt(row.pending, 10),
 		running: Number.parseInt(row.running, 10),
@@ -194,11 +210,18 @@ export async function queryRecentJobs(
 			: { column: 'NULL::json', join: '' }
 	const queue = options.queue ?? null
 	const state = options.state ?? null
+	if (
+		options.key !== undefined &&
+		(typeof options.key !== 'string' || !options.key)
+	)
+		throw new RangeError('Invalid job key')
 
 	const result = await utils.withPgClient(async (pgClient) => {
 		return pgClient.query<{
 			id: string
 			task_identifier: string
+			queue_name: string | null
+			key: string | null
 			payload: unknown
 			priority: number
 			attempts: number
@@ -214,6 +237,8 @@ export async function queryRecentJobs(
 			SELECT
 				jobs.id,
 				jobs.task_identifier,
+				jobs.queue_name,
+				jobs.key,
 				${debug.column} as payload,
 				jobs.priority,
 				jobs.attempts,
@@ -246,6 +271,7 @@ export async function queryRecentJobs(
 					)
 				)
 			AND ($5::timestamptz IS NULL OR (jobs.created_at, jobs.id) < ($5::timestamptz, $6::bigint))
+			AND ($7::text IS NULL OR jobs.key = $7)
 			ORDER BY jobs.created_at DESC, jobs.id DESC
 			LIMIT $1 OFFSET $4
 		`,
@@ -255,7 +281,8 @@ export async function queryRecentJobs(
 				state,
 				offset,
 				options.before?.createdAt ?? null,
-				options.before?.id ?? null
+				options.before?.id ?? null,
+				options.key ?? null
 			]
 		)
 	})
@@ -263,7 +290,10 @@ export async function queryRecentJobs(
 	return result.rows.map((row) => ({
 		id: row.id,
 		cursor: { createdAt: row.cursor_created_at, id: row.id },
+		queue: row.task_identifier,
 		queueName: row.task_identifier,
+		lane: row.queue_name,
+		key: row.key,
 		payload:
 			options.includePayload === true
 				? extractProducerLink(row.payload).cleanPayload
@@ -277,4 +307,42 @@ export async function queryRecentJobs(
 		lockedBy: row.locked_by,
 		lastError: row.last_error
 	}))
+}
+
+/**
+ * Delete permanently failed jobs last updated longer ago than `olderThan` milliseconds,
+ * through Graphile's `complete_jobs`, which skips locked jobs. Returns their ids.
+ */
+export async function deleteFailedJobs(
+	utils: Pick<WorkerUtils, 'withPgClient'>,
+	schema: string,
+	olderThan: number
+): Promise<string[]> {
+	const quoted = quoteSchemaName(schema)
+	const result = await utils.withPgClient((client) =>
+		client.query<{ id: string }>(
+			`SELECT id::text FROM ${quoted}.complete_jobs(ARRAY(
+	SELECT id FROM ${quoted}.jobs
+	WHERE attempts >= max_attempts AND locked_at IS NULL
+		AND updated_at < now() - $1::float8 * interval '1 millisecond'
+))`,
+			[olderThan]
+		)
+	)
+	return result.rows.map((row) => row.id)
+}
+
+/** Graphile's `remove_job`: the removed (or, when running, disarmed) job's id. */
+export async function removeJobByKey(
+	utils: Pick<WorkerUtils, 'withPgClient'>,
+	schema: string,
+	key: string
+): Promise<string | null> {
+	const result = await utils.withPgClient((client) =>
+		client.query<{ id: string | null }>(
+			`SELECT id::text FROM ${quoteSchemaName(schema)}.remove_job($1::text)`,
+			[key]
+		)
+	)
+	return result.rows[0]?.id ?? null
 }

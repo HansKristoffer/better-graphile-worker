@@ -1,6 +1,6 @@
 import type { CronItemOptions, CronMatcher, JobHelpers } from 'graphile-worker'
 import type z from 'zod'
-import type { JobLogger, JobSpan } from './hooks.js'
+import type { JobLogger, JobSpan, PermanentFailureEvent } from './hooks.js'
 import type { ProgressOf } from './progress.js'
 import type { JobStep } from './steps.js'
 import type { JsonCompatible } from './validation.js'
@@ -37,6 +37,8 @@ export type DerivedJobOptions = {
 	jobKeyMode?: 'replace' | 'preserve_run_at' | 'unsafe_dedupe'
 	priority?: number
 	flags?: readonly string[]
+	/** Run no earlier than this long after the enqueue, such as a debounce with `replace`. */
+	delay?: Duration
 	idempotencyKey?: string
 	idempotencyTtl?: Duration
 }
@@ -109,6 +111,12 @@ export type QueueContract<
 	 */
 	readonly outputSchema?: TOutput
 	readonly maxAttempts?: number
+	/**
+	 * How long to wait before each retry of a failed attempt: entry `n` follows attempt `n`
+	 * and the last entry repeats. Never sooner than Graphile's own backoff; a thrown
+	 * `RetryAtError` wins.
+	 */
+	readonly retryDelay?: Duration | readonly Duration[]
 	readonly priority?: number
 	readonly flags?: readonly string[]
 	/**
@@ -153,9 +161,23 @@ type JsonOutput<T> = [Exclude<T, undefined>] extends [
 	? T
 	: never
 
+/**
+ * Runs once a job of the queue has failed for good, however its last attempt ended (see
+ * `PermanentFailureEvent['reason']`), with the job's wire input. It can run more than
+ * once for a job, so make it idempotent; its own failure is logged and changes nothing.
+ */
+export type QueueFailureHandler<Input> = (
+	input: Input,
+	event: PermanentFailureEvent
+) => void | Promise<void>
+
 /** Shared contracts cannot carry competing inline handler implementations. */
 export type HandlerFreeQueueContract<Q extends QueueContract = QueueContract> =
-	Q & { readonly processFn?: never; readonly initFn?: never }
+	Q & {
+		readonly processFn?: never
+		readonly initFn?: never
+		readonly onPermanentFailure?: never
+	}
 
 export type RegularQueueContract<
 	S extends z.ZodType,
@@ -221,6 +243,7 @@ export type RegularQueue<
 		NoInfer<O>
 	>
 	readonly initFn?: never
+	readonly onPermanentFailure?: QueueFailureHandler<z.input<NoInfer<S>>>
 }
 export type CronQueue<
 	N extends string = string,
@@ -228,6 +251,7 @@ export type CronQueue<
 > = CronQueueContract<N, P> & {
 	readonly processFn: InlineProcessHandler<undefined, NoInfer<N>, NoInfer<P>>
 	readonly initFn?: never
+	readonly onPermanentFailure?: QueueFailureHandler<undefined>
 }
 export type CronInitQueue<
 	S extends z.ZodType,
@@ -244,6 +268,8 @@ export type CronInitQueue<
 	readonly initFn: (
 		ctx: InlineJobContext<`${NoInfer<N>}_cron-init`>
 	) => Promise<readonly z.input<NoInfer<S>>[]> | readonly z.input<NoInfer<S>>[]
+	/** Called for the queue's jobs, not for a failed `initFn` run. */
+	readonly onPermanentFailure?: QueueFailureHandler<z.input<NoInfer<S>>>
 }
 
 /** Handler presence only; concrete definitions retain their schema and context. */
@@ -345,8 +371,14 @@ export type QueueHandlers<T extends readonly QueueContract[]> = {
 				initFn: (
 					ctx: JobContext<T, `${Q['name']}_cron-init`>
 				) => Promise<readonly InferInput<Q>[]> | readonly InferInput<Q>[]
+				onPermanentFailure?: QueueFailureHandler<InferInput<Q>>
 			}
-		: ProcessHandler<Q, T> | { processFn: ProcessHandler<Q, T> }
+		:
+				| ProcessHandler<Q, T>
+				| {
+						processFn: ProcessHandler<Q, T>
+						onPermanentFailure?: QueueFailureHandler<InferInput<Q>>
+				  }
 }
 
 /** Suffix automatically appended to cron init task names. */

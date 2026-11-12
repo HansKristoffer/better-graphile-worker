@@ -109,6 +109,8 @@ Separate handlers infer context enqueue methods from the complete registry and u
 
 Migrate separately using a database owner before starting producers. Ordinary enqueue uses Graphile's public SQL functions and performs no migration checks. An enqueue-only role still needs Graphile's required table, sequence and row-level-security permissions, but does not need schema creation permission. `migrate()`, worker startup and the advanced `getWorkerUtils()` initialize Graphile and can run migrations. `migrate()` also creates this library's tables in the Graphile schema (`bgw_idempotency_keys`, `bgw_worker_heartbeats`, `bgw_job_outcomes`, `bgw_wait_groups` and `bgw_waits`); `start()` and `runOnce()` create them when they are missing. Concurrent utility requests share one initialization. Release/stop never close your pool.
 
+A process that enqueues without starting a worker (an API-only process, a script, a test file) fails on a fresh database until something migrates. `autoMigrate: true` on a worker, pool or job client runs `migrate()` once before its first enqueue, prepare or admin read. It is off by default so enqueue-only roles keep working.
+
 `isRegularQueue`, `isCronQueue`, `isCronInitQueue` and `hasInputSchema` preserve literal names, concrete schemas and any inline handlers while narrowing variants. Contract guards do not invent handler functions; worker construction checks the required functions.
 
 ## Queues, defaults and batching
@@ -121,15 +123,17 @@ Migrate separately using a database owner before starting producers. Ordinary en
 
 A library queue is a Graphile task identifier. `serial: true` sets its Graphile serialization queue name to the task name; a string selects a shared serialization queue. `cron` accepts a string, readonly string array or Graphile matcher. Multiple schedules have distinct identifiers, including with a custom `cronOptions.identifier`.
 
-Defaults follow explicit job options, then `deriveJobOptions` (or cron options for cron operations), then queue defaults, then `defaultMaxAttempts`, then the library default of 4. Native schedules and manual cron triggers inherit serial queues, priority and retry defaults. Native Graphile cron does not support queue flags; manual triggers do. `backfillPeriod` belongs to native scheduling. Graphile uses the database clock unless `graphile.useNodeTime` is enabled.
+Defaults follow explicit job options, then `deriveJobOptions` (or cron options for cron operations), then queue defaults, then `defaultMaxAttempts`, then the library default of 4. `delay: '5s'` (or milliseconds) runs a job no earlier than that long after the enqueue; an explicit `runAt` wins. Native schedules and manual cron triggers inherit serial queues, priority and retry defaults. Native Graphile cron does not support queue flags; manual triggers do. `backfillPeriod` belongs to native scheduling. Graphile uses the database clock unless `graphile.useNodeTime` is enabled.
+
+A cron tick that outlasts its period runs next to the next tick unless the queue is `serial`, and nothing bounds that without a [timeout](#timeouts). A short-period maintenance cron usually wants `serial: true`, a `timeout` and `maxAttempts: 1`, since the next tick retries anyway.
 
 `createJob` creates one job even for array schemas. `createJobs` accepts a readonly array and performs one atomic SQL statement after validating every input; failures include the item index. Shared `jobKey` and `jobKeyMode` are unavailable in batch options; per-item keys come from `deriveJobOptions` (below). Within one batch, keys must be distinct and every keyed item must use the same mode, `replace` or `preserve_run_at`. Ids are returned in input order. Batches are never automatically chunked, since that would change atomicity. Keyed array jobs replace a single payload consistently, regardless of tracing.
 
-`shouldSkipEnqueue()` returning true produces `null` for one job and `[]` for a batch. Named functions in `jobs` are stable, enumerable and frozen.
+`shouldSkipEnqueue({ queue })` returning true produces `null` for one job and `[]` for a batch. Named functions in `jobs` are stable, enumerable and frozen.
 
 ## Lanes, transactions and long-running jobs
 
-`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority`, `flags`, `idempotencyKey` and `idempotencyTtl` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to `createJob`, `createJobs`, `jobs.*`, `ctx.createJob` and cron-init fan-out. A `jobKey` only holds while its job is pending: a repeated tick creates another job once the previous one is running or has completed. Use an [idempotency key](#idempotency-keys) to hold the key for a period of time instead. Plain cron queues have no input and cannot derive options.
+`deriveJobOptions` computes `queueName`, `jobKey`, `jobKeyMode`, `priority`, `flags`, `delay`, `idempotencyKey` and `idempotencyTtl` from each job's wire input (`z.input`), so callers cannot forget them; a derived `queueName` overrides `serial`. It must be synchronous and pure; errors reject the enqueue and reach `onEnqueueFail`. Precedence is explicit job options, then derived options, then queue defaults (`serial`, `priority`, `flags`), then `defaultMaxAttempts`. It applies to every enqueue: `createJob`, `createJobs`, `jobs.*`, `ctx.createJob(s)`, `prepareJob(s)`, `enqueueInTransaction`, `enqueueByName` and cron-init fan-out, so call sites pass no key of their own. A `jobKey` only holds while its job is pending: a repeated tick creates another job once the previous one is running or has completed. Use an [idempotency key](#idempotency-keys) to hold the key for a period of time instead. Plain cron queues have no input and cannot derive options.
 
 ```ts
 const advanceRun = defineQueue({
@@ -148,6 +152,22 @@ const advanceRun = defineQueue({
   }
 })
 ```
+
+### Handlers that read current state
+
+A payload is a snapshot from enqueue time. With a `jobKey` in `replace` mode, a pending job keeps only the last payload, so facts carried in earlier payloads are dropped. Put ids in the payload and read the current state in the handler; then any run, however late or merged, does the right thing. A debounce is a key, `replace` and a `delay`, declared once on the queue:
+
+```ts
+const exportDeal = defineQueue({
+  name: 'exportDeal',
+  inputSchema: z.object({ dealId: z.string() }),
+  // Five seconds after the last change, one export reads the deal as it is then.
+  deriveJobOptions: ({ dealId }) => ({ jobKey: `export-deal:${dealId}`, jobKeyMode: 'replace', delay: '5s' }),
+  processFn: async ({ dealId }) => exportCurrent(await loadDeal(dealId))
+})
+```
+
+A recovery sweep that must not postpone a pending export passes `{ jobKeyMode: 'preserve_run_at' }`. Use a `jobKey` to merge pending work, and an [idempotency key](#idempotency-keys) to run something at most once in a period even after it ran.
 
 ### Idempotency keys
 
@@ -175,7 +195,7 @@ await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}`
 - Keys live in the `bgw_idempotency_keys` table in the Graphile schema, created by `migrate()`. Worker maintenance deletes expired keys. An enqueue-only role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on that table.
 - The test harness records keys in `enqueued[].options` but does not deduplicate.
 
-`prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction; Graphile 0.17.3 can return fewer jobs if a worker claims an existing key during enqueue. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
+`prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction: Graphile 0.17.3 can return fewer jobs if a worker locks a job whose key the enqueue is replacing. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
 `prepareJob` also takes one job as an object, `prepareJob({ task, payload, ...options })`, the same `JobRequest` that `enqueueInTransaction` takes below. A union of jobs across queues then prepares without a branch per queue.
 
@@ -190,23 +210,23 @@ await prisma.$transaction(async (tx) => {
 // node-postgres: await client.query(job.text, job.values) between BEGIN and COMMIT
 ```
 
-`enqueueInTransaction` runs the statement through `$queryRawUnsafe`, returns the job ids in input order (none when skipped or empty) and throws `EnqueueCountError` (with `queue`, `expected` and `actual`) when Graphile returned fewer jobs than `job.count`, which rolls the transaction back; retry the transaction. It works with any client whose `$queryRawUnsafe(query, ...values)` resolves to the rows, generic like Prisma's or not, such as your own transaction seam (`RawQueryClient`); the rows are checked at runtime. The package does not depend on Prisma.
+`enqueueInTransaction` runs the statement through `$queryRawUnsafe` and returns the job ids in input order (none when skipped or empty). A single job that lost that key race is run again in the same transaction, up to two more times; the rerun sees the locked job and frees its key. A batch, or a job that keeps losing, throws `EnqueueCountError` (with `queue`, `expected` and `actual`), which rolls the transaction back; retry the transaction. It works with any client whose `$queryRawUnsafe(query, ...values)` resolves to the rows, generic like Prisma's or not, such as your own transaction seam (`RawQueryClient`); the rows are checked at runtime. The package does not depend on Prisma.
 
-Pass `{ required: true }` when the transaction must not commit without its jobs: a statement skipped by `shouldSkipEnqueue()` then throws `EnqueueSkippedError` instead of returning no ids. Immediate enqueues that lose a job to the same race throw `EnqueueCountError` too.
+Pass `{ required: true }` when the transaction must not commit without its jobs: a statement skipped by `shouldSkipEnqueue()` then throws `EnqueueSkippedError` instead of returning no ids. Immediate enqueues rerun the same race: a keyed batch runs in its own transaction and rolls back before each rerun, so a final `EnqueueCountError` means nothing was enqueued.
+
+A keyed enqueue inside a transaction holds that job's row lock until the transaction commits, so transactions that enqueue the same key commit one at a time. Keep such transactions short, or enqueue after commit when the job need not be atomic with the write.
 
 For one job, `worker.enqueueInTransaction(tx, job, { required })` prepares and runs it in one call and returns its id (null when skipped). The job is an object whose `task` selects the queue and types `payload`, so a union of jobs across queues (`JobRequest<typeof queues>`) passes without casts. `transactionalJobKeyMode` on the worker, pool or job client sets the `jobKeyMode` for these jobs when they have a `jobKey` and no mode of their own; other enqueue paths keep Graphile's `replace`.
 
 ```ts
 const workers = createBetterWorkerPool({ pgPool, queues, runners, transactionalJobKeyMode: 'unsafe_dedupe' })
 
-type HandoffJob = JobRequest<typeof queues> & { jobKey: string }
 await prisma.$transaction(async (tx) => {
   await tx.run.update({ where: { id: runId }, data: { status: 'approved' } })
-  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId }, jobKey: `advance:${runId}` }, { required: true })
+  // advanceRun derives its key, which then uses unsafe_dedupe.
+  await workers.enqueueInTransaction(tx, { task: 'advanceRun', payload: { shopId, runId } }, { required: true })
 })
 ```
-
-Immediate enqueue rejects missing Graphile results, but successful peers in a batch can already have committed. Retrying unkeyed items can duplicate those peers; use prepared SQL with the row-count check when this needs to be atomic with application state.
 
 `ctx.continue({ runAt? })` ends the run successfully and enqueues the same job again: same task, wire input, lane, key, priority, flags and `max_attempts`, with fresh attempts. Completed steps and the latest progress carry over; cron metadata does not. The continuation is a new job with a new id. The enqueue and "never retry this run" commit in one transaction, so a crash or error after `continue()` cannot produce a retry next to the continuation. Code after it never runs; do not swallow its rejection in a `try/catch`, and call it once per run. If the handler catches it and throws anyway, the run still counts as continued and the worker logs `job.error_after_ending`. It also works in `initFn`, which then runs again later. `onJobFinished` reports `status: 'success'` with `continued: true`. Use it for time slices (shorter than your platform's shutdown drain time) and for waits such as rate limits, instead of throwing, which spends an attempt (see `RetryAtError` for choosing its time). Keep cursors and other business state in your own tables; `ctx.progress` is for status that others read.
 
@@ -248,19 +268,19 @@ const pgPool = new Pool({ connectionString, max: pgPoolSize(runners, { queues, d
 const workers = createBetterWorkerPool({ pgPool, queues, runners, defaultRunner: 'background' })
 ```
 
-A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN and maintenance connections; `pgPoolSize(runners, { queues, defaultRunner })` counts only the runners that have queues. The CLI accepts a pool.
+A runner takes `concurrency`, `pollInterval`, `secondLookOnNotify`, `prefetch` and `graphile`; every other option is shared, and a pool-level `prefetch` is the default runners override. `getQueueDefinitions()` gives each queue's `runner`, with the `defaultRunner` filled in. Enqueueing, `getJob`, `listJobs` and the other admin methods cover all queues, and `getCompletedJobs()` returns the history of every runner. `start()`, `stop()`, `waitUntilStopped()` and `runOnce()` apply to all runners; if one runner fails to start, the others are stopped again. A runner that Graphile stops by itself [restarts](#when-graphile-stops-a-worker) alone; the others keep running. `workers.runners.turn` is that runner's own worker. `pgPoolSize(runners)` is each runner's concurrency plus its LISTEN connection, plus one maintenance connection the runners share; `pgPoolSize(runners, { queues, defaultRunner })` counts only the runners that have queues. The CLI accepts a pool.
 
-Each started runner holds two connections for as long as it runs: Graphile's LISTEN client, which Graphile opens per worker and cannot share between runners, and the connection maintenance heartbeats on. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `2 × runners` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs two more. Through PgBouncer, LISTEN needs a session-mode connection.
+Each started runner holds Graphile's LISTEN client for as long as it runs, which Graphile opens per worker and cannot share between runners, and the runners share one connection for maintenance. A job slot uses a connection only while its job queries. `pgPoolSize(runners)` is the size at which no job ever waits for a connection. When jobs mostly wait on other work (HTTP calls, LLMs), a smaller pool is fine, but it must exceed `runners + 1` plus the queries that run at once, or jobs wait on connections the runners never release; every runner you add costs one more. `start()` throws when the pool's `max` is below `runners + 2`, which could never fetch a job. Through PgBouncer, LISTEN needs a session-mode connection.
 
 Every worker on a database wakes on each new job, and Graphile's fetch locks every available serial lane, not only its own queues' lanes. A worker that is fetching for another queue can hide a lane's job from the worker that should take it, which then waits for its next poll. `secondLookOnNotify: milliseconds` fetches once more that long after each new-job notification. It costs one extra fetch per insert; set it on runners where poll latency matters. It works on `createBetterWorker` too.
 
 `prefetch: n` fetches and locks up to `concurrency + n` jobs at once (Graphile's `localQueue.size`), so the next job is already local when a slot frees; `1` follows Graphile's `concurrency + 1` advice. Prefetched jobs stay locked to this runner until it takes them, so another worker cannot run them meanwhile. A `localQueue` in your `graphile.preset` takes precedence.
 
-Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold; a `timeout` below 4 hours enforces this.
+Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold and run it a second time; a `timeout` below 4 hours enforces this. The startup log lists each queue with its effective timeout, `no timeout` included.
 
 ### Crash recovery
 
-On its own, Graphile keeps a job and its serial lane locked for at least 4 hours after a hard crash (OOM, `SIGKILL`). Started workers shorten that to about `staleAfter`, 5 minutes by default.
+On its own, Graphile keeps a job and its serial lane locked for at least 4 hours after a hard crash (OOM, `SIGKILL`). Started workers shorten that to about `staleAfter`, 5 minutes by default. This is also what happens to running jobs after every deploy that exits before `stop()` resolves (see [shutdown](#lifecycle-and-observability)): with one replica, they wait out `staleAfter` after the new process starts. In development, a short setting such as `{ heartbeatInterval: 2_000, staleAfter: 6_000 }` keeps restarts quick.
 
 ```ts
 const worker = createBetterWorker({
@@ -270,13 +290,14 @@ const worker = createBetterWorker({
 })
 ```
 
-Each started worker records a heartbeat every `heartbeatInterval` milliseconds and, after each one, looks for workers whose last heartbeat is older than `staleAfter`. The sweep unlocks their jobs and lanes with the error `Worker <pool id> stopped sending heartbeats (crashed or blocked); released by crash recovery`, and Graphile retries them with its normal backoff. The crashed run keeps its attempt, so a job that keeps running out of memory eventually fails permanently and shows up as failed in `listJobs`. `onPermanentFailure` does not fire for it, because no handler ran; watch for `worker.crash_recovery.released` warnings in your logs. Any number of instances can sweep at once.
+Each started worker records a heartbeat every `heartbeatInterval` milliseconds and, after each one, looks for workers whose last heartbeat is older than `staleAfter`. The sweep unlocks their jobs and lanes with the error `Worker <pool id> stopped sending heartbeats (crashed or blocked); released by crash recovery`, and Graphile retries them with its normal backoff. The crashed run keeps its attempt, so a job that keeps running out of memory eventually fails permanently and shows up as failed in `listJobs`. When the released run was the job's last attempt, the sweeping worker calls [`onPermanentFailure`](#when-a-job-fails-for-good) with `reason: 'worker_lost'`. Released jobs are also logged as `worker.crash_recovery.released` warnings. Any number of instances can sweep at once.
 
 The risk is a worker that is alive but cannot heartbeat for `staleAfter`. It looks dead, so its job runs a second time while the first run is still going, even in a serial lane. The heartbeat holds its own pool connection, so busy jobs cannot starve it, but it shares the event loop with your handlers. A handler that blocks the event loop synchronously (CPU-bound work, synchronous I/O) for `staleAfter` stops it. Keep `staleAfter` well above your longest synchronous stretch, or turn crash recovery off for that worker. A worker that comes back logs `worker.crash_recovery.presumed_dead`. When it finishes the job, Graphile deletes it, even if another worker is still running it. With `jobOutcomes` on, the worker completes jobs itself only while it holds the lock, so the job survives. `staleAfter` must be at least three heartbeat intervals.
 
-- Only started workers heartbeat. Jobs held by `runOnce()`, by workers with `crashRecovery: false` or by workers on an older version of this library are left to Graphile's 4-hour scan.
+- Only started workers heartbeat. Jobs held by `runOnce()`, by workers with `crashRecovery: false` or by workers on an older version of this library are left to Graphile's 4-hour scan, or to `releaseLocks()`.
+- `worker.releaseLocks()` releases now what crash recovery would: jobs and lanes of owners whose heartbeat is older than `staleAfter`, and of owners with no heartbeat whose newest lock is older than that. `releaseLocks({ all: true })` releases every lock, for when nothing else runs, such as before a development server starts. Both keep the attempt spent. The CLI has `release-locks [--all]`, and the package's `better-graphile-worker release-locks [--all] [--schema <name>] [connection string]` binary needs no queue registry, so a start hook can run it without the app's code or secrets.
 - Handlers wait for the worker's first heartbeat before they run.
-- The heartbeat runs in the worker's maintenance loop, which every started worker runs every `heartbeatInterval` (30 seconds without crash recovery) on its own pool connection. Each pass also fails [waits](#waiting-on-child-jobs) on children that ended without reporting and deletes expired [job outcomes](#looking-up-a-job-after-it-finishes) and [idempotency keys](#idempotency-keys). `runOnce()` runs one pass when it finishes.
+- The heartbeat runs in the maintenance loop, which every started worker (or worker pool, for all its runners) runs every `heartbeatInterval` (30 seconds without crash recovery) on its own pool connection. Each pass also fails [waits](#waiting-on-child-jobs) on children that ended without reporting and deletes expired [job outcomes](#looking-up-a-job-after-it-finishes) and [idempotency keys](#idempotency-keys). `runOnce()` runs one pass when it finishes.
 - Heartbeats live in `bgw_worker_heartbeats` in the Graphile schema. If this library's tables are missing on start and the worker's role cannot create them, the worker logs `worker.maintenance.disabled` and runs without maintenance; with `crashRecovery` or `jobOutcomes` set explicitly, `start()` fails instead. Stopped workers leave their row; a later sweep removes it.
 
 ### Timeouts
@@ -299,7 +320,7 @@ The clock covers one attempt: each retry and each continuation starts a fresh on
 
 JavaScript cannot kill a function. A handler that ignores its signal keeps running, detached, in your process; a retry can run next to it. Everything it starts through the context after the timeout is refused with `JobTimeoutError`: `ctx.step.run`, `ctx.progress.set` and `flush`, `ctx.continue()`, `ctx.createJob` and `ctx.createJobs`. A checkpoint or progress write already in flight lands only if it commits before the failure is recorded; it can never be written into a later attempt. Raw `ctx.helpers` and your own side effects are not guarded, so pass `ctx.signal` to HTTP and database clients and check it in loops. When the detached handler finally settles, a `job.timed_out_handler_settled` warning is logged. Synchronous code that never yields blocks the event loop, so no timeout can fire.
 
-`ctx.continue()` after the timeout is refused, so keep time slices well inside it. A continuation that is already committing when the timeout fires wins, and the run counts as continued. During graceful shutdown, Graphile aborts `ctx.signal` with its own reason after `gracefulShutdownAbortTimeout`; `ctx.continue()` still works then. A hung handler cannot hold up `stop()` past its timeout: the attempt fails and shutdown proceeds without waiting for the detached handler.
+`ctx.continue()` after the timeout is refused, so keep time slices well inside it. A continuation that is already committing when the timeout fires wins, and the run counts as continued. During shutdown, `ctx.signal` aborts with Graphile's own reason after [`shutdownGrace`](#lifecycle-and-observability), or 5 seconds without it; `ctx.continue()` still works then. A hung handler cannot hold up `stop()` past its timeout: the attempt fails and shutdown proceeds without waiting for the detached handler.
 
 ## Payloads and failure policy
 
@@ -311,7 +332,19 @@ All new jobs, including scheduled cron, use a version-2 envelope with payload, t
 
 Input-schema failures and `NonRetriableError` are permanent. A `ZodError` thrown by your handler, such as validating a downstream response, follows normal retry behavior.
 
-To choose when the next attempt runs, throw `RetryAtError` with the time and the original error:
+Graphile waits `exp(attempts)` seconds between attempts, so five attempts are spent about 85 seconds after the first failure, and a two-minute outage downstream fails every job that ran in it. `retryDelay` sets the wait on the queue: entry `n` is the wait after attempt `n`, and the last entry repeats.
+
+```ts
+const extractText = defineQueue({
+  name: 'extractText',
+  inputSchema: z.object({ fileId: z.string() }),
+  maxAttempts: 5,
+  retryDelay: ['1m', '5m', '30m', '2h'],
+  processFn
+})
+```
+
+It works like `RetryAtError` below, for every failure that is not permanent, and a thrown `RetryAtError` wins. To choose the time per failure, throw `RetryAtError` with the time and the original error:
 
 ```ts
 import { RetryAtError } from 'better-graphile-worker'
@@ -329,6 +362,23 @@ processFn: async ({ connectionId }, ctx) => {
 ```
 
 It spends the attempt like any other failure: on the last attempt the job fails permanently, `onPermanentFailure` runs and the time is ignored. Logs, `onJobFinished` and Graphile's `last_error` record the cause's name and message, and the scheduled time appears as `retryAt` in `onJobFinished` and `retry_at` in the `job.completed` log. Completed steps and progress carry over. The job keeps its id. The time is a lower bound: if it is sooner than Graphile's own backoff for that attempt (`exp(min(attempt, 10))` seconds, about 3 s after the first attempt, 55 s after the fourth and at most about 6 h), the job waits for the backoff instead. A waiting job does not hold its serial lane, so later jobs in the lane run before it. Re-adding its `jobKey` while it waits replaces it as usual: new input, no steps, attempts reset and the wait cancelled. To wait without spending an attempt, use `ctx.continue({ runAt })`; to stop retrying, throw `NonRetriableError`.
+
+### When a job fails for good
+
+An app row that mirrors a job ("pending" until the job settles it) needs to know when the job will never run again, including when no handler finished it. Give the queue an `onPermanentFailure`, beside `processFn` inline or in its handler registry entry (`{ processFn, onPermanentFailure }`); a shared contract cannot carry one:
+
+```ts
+const extractText = defineQueue({
+  name: 'extractText',
+  inputSchema: z.object({ fileId: z.string() }),
+  processFn,
+  onPermanentFailure: async ({ fileId }, { reason, error }) => {
+    await markExtractionFailed(fileId, reason)
+  }
+})
+```
+
+It receives the wire input (`z.input`, since parsing may be what failed) and the event the instance-wide `hooks.onPermanentFailure` gets, which runs after it. `reason` says how the last attempt ended: `error`, `timeout`, `non_retriable` (including an invalid payload), `worker_lost` (crash recovery or `releaseLocks` released it), `shutdown` (cut off after `shutdownGrace`) or `failJobs`. Both run in the process that noticed, which for `worker_lost` is whichever worker swept, so register the queue there too. A cron-init queue's hook covers its jobs, not a failed `initFn`, which reaches the instance hook only. It can run more than once for a job, so make it idempotent; its errors are reported and change nothing.
 
 - `permanentFailure: 'discard'` is an explicit choice: acknowledge non-retriable jobs and let Graphile delete them. Failure history then exists only in hooks and the optional local history.
 - `permanentFailure: 'retain'` is the default. It marks the locked job's budget exhausted, then lets Graphile record the original error and unlock it. It remains visible in PostgreSQL after restart. `retryJobs` resets attempts to zero; a retained non-retriable job has a reduced attempt limit, so an explicit retry grants another attempt. Ordinary exhausted retries remain in PostgreSQL under either policy.
@@ -466,7 +516,18 @@ const job = await producer.getJobProgress('importOrders', jobId)
 
 Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
 
-`stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`.
+`stop()` stops fetching and waits for running jobs, with no limit. Running jobs see `ctx.signal` abort 5 seconds after `stop()` starts (Graphile's `gracefulShutdownAbortTimeout`), so a handler that passes its signal to HTTP calls is aborted 5 seconds into every deploy, however long your platform's drain window is, and the abort spends an attempt. Set `shutdownGrace` to the time your platform gives a stopping process, minus a margin:
+
+```ts
+const workers = createBetterWorkerPool({
+  // ...
+  shutdownGrace: 25_000 // a 30-second drain window
+})
+```
+
+Running jobs then get that long. `ctx.signal` aborts when it ends, and jobs still running 500 ms later are failed and unlocked at once (their attempt spent, as a crash would), so `stop()` resolves and another worker can retry them without waiting for crash recovery. A job cut off on its last attempt reaches `onPermanentFailure` with `reason: 'shutdown'`. A handler that ignores its signal keeps running, detached, until the process exits. If the process exits before `stop()` resolves anyway, its jobs stay locked until [crash recovery](#crash-recovery) releases them.
+
+`stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`, and its `gracefulShutdownAbortTimeout` wins over `shutdownGrace`.
 
 When the database goes away, Graphile's stop waits forever on queries that will never return. `stop({ probeDatabase: true })` waits only while the database answers: it opens a fresh connection outside the pool every second and runs `SELECT 1`, and rejects with `DatabaseUnreachableError` once a probe gets no answer within 2 seconds. Tune both with `probeDatabase: { interval, timeout }` in milliseconds. A server that answers with an error, such as too many connections, counts as reachable, so a busy database never cuts a shutdown short. A fast stop finishes before the first probe. Shutdown continues in the background, as after a timeout. The pool is still yours: after `DatabaseUnreachableError`, its checked-out clients may never be released, so don't wait for `pgPool.end()`:
 
@@ -480,9 +541,9 @@ try {
 }
 ```
 
-Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail`, [`onRunnerStopped`](#when-graphile-stops-a-worker) and `shouldSkipEnqueue`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `shouldSkipEnqueue` is a behavioral decision; its errors propagate.
+Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail`, [`onRunnerStopped`](#when-graphile-stops-a-worker), `shouldSkipEnqueue` and `jobAttributes`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` runs for [every way a job fails for good](#when-a-job-fails-for-good) and receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `jobAttributes: ({ queue, payload }) => ({ organization_id: payload.organizationId })` returns attributes to set on each job's span, pass to `createLogger` as `attributes` (the default logger adds them to every line) and add to `onJobFinished`; it is synchronous, and a throwing hook adds nothing. `onJobFinished` also reports `waitMs`, how long the job waited past its `run_at` before its handler started, by this process's clock against the database's. `shouldSkipEnqueue({ queue })` is a behavioral decision; its errors propagate.
 
-Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` (every path that fails a job for good), `graphile_job_wait_ms` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
 
 ### When Graphile stops a worker
 
@@ -527,10 +588,16 @@ const first = await worker.listJobs({ limit: 50, state: 'failed', includePayload
 const last = first.at(-1)
 if (last) await worker.listJobs({ limit: 50, state: 'failed', includePayload: false, before: last.cursor })
 await worker.retryJobs(['123'])
-await worker.failJobs(['123'], 'gave up')
+await worker.failJobs(['123'], 'gave up') // also calls onPermanentFailure
 await worker.getJobProgress('importOrders', '123')
+await worker.getJobByKey('file-text:abc') // the live job with this jobKey, payload included, or null
+await worker.removeJob('file-text:abc') // Graphile's removeJob: its id, or null
+await worker.deleteFailedJobs('30d') // permanently failed jobs not updated for 30 days
+await worker.enqueueByName(name, payload) // a name known only at runtime, validated like createJob
 worker.getQueueDefinitions()
 ```
+
+`enqueueByName` takes an untyped name and payload, for admin routes and scripts. A cron queue, or a cron-init queue without a payload, triggers its cron run; anything else goes through `createJob`. `listJobs({ key })` filters by `jobKey`. Listed jobs, `getJobStats()` rows and the completed-jobs history name the Graphile task `queue`; their older `queueName` and `taskIdentifier` fields mean the same and are deprecated. A listed job's `lane` is its serial lane.
 
 `pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. For a durable record per job, use [job outcomes](#looking-up-a-job-after-it-finishes). Database failures cannot be hidden by local history.
 
@@ -578,22 +645,32 @@ import { createCli } from 'better-graphile-worker/cli'
 await createCli(worker)(process.argv.slice(2))
 ```
 
-Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `stats`, `list-jobs`, `get-job <id>`, `retry <id>`, `fail <id>`, `run-once`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
+Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `trigger-cron <name>`, `stats`, `list-jobs`, `get-job <id>`, `get-job --key <key>`, `retry <id>`, `fail <id>`, `release-locks [--all]`, `delete-failed <duration>`, `run-once`. `create-job` on a cron queue without a payload triggers its run, like `trigger-cron`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
 
-Help, `list-queues` and `schema` only read the registry and never connect, so they work without a database. `createCli(worker, { migrate: true })` runs `worker.migrate()` before every other command, and only then.
+Help, `list-queues` and `schema` only read the registry and never connect, so they work without a database. `createCli(worker, { migrate: true })` runs `worker.migrate()` before every other command, and only then. The `better-graphile-worker` binary has only `release-locks` (see [crash recovery](#crash-recovery)) and needs no registry.
 
 ### Testing
 
 ```ts
 import { createTestHarness } from 'better-graphile-worker/testing'
-const harness = createTestHarness(queues)
+const harness = createTestHarness(queues) // or one queue: createTestHarness([sendEmail])
 await harness.process('sendEmail', { to: 'person@example.com' })
+await harness.process('sendEmail', { to: 'person@example.com' }, { attempt: 5, maxAttempts: 5 }) // the last attempt
 console.log(harness.logs, harness.enqueued, harness.continued)
 ```
 
-The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Waits run their children inline, once and in order, through the same validation and checkpoints; a child that throws is a failed result, without retries, and `timeout` is ignored. A waited child that calls `ctx.continue()` is rejected. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+Code under test that enqueues through your app's producer can use the harness's instead: `harness.createJob`, `createJobs`, `enqueueInTransaction` (the transaction is ignored) and `triggerCron` validate and derive options exactly as the worker does, and record into `enqueued`. `await harness.drain()` then runs every enqueued job that has not run yet, and the jobs those enqueue, in order until none is left, ignoring `runAt`; a cron-init trigger runs its `initFn` and enqueues its items. It throws the first job's error, or after `maxJobs` runs (default 1000), and resolves to how many ran. Continuations stay in `continued`.
 
-## Types and major-version migration
+```ts
+mock.module('../lib/queue', () => ({ createJob: harness.createJob }))
+await placeOrder(order)
+await harness.drain()
+expect(harness.enqueued.map((job) => job.queue)).toEqual(['chargeCard', 'sendReceipt'])
+```
+
+The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs, attempt 1 and the queue's own `maxAttempts` unless the extras say otherwise. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Waits run their children inline, once and in order, through the same validation and checkpoints; a child that throws is a failed result, without retries, and `timeout` is ignored. A waited child that calls `ctx.continue()` is rejected. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+
+## Types
 
 `QueueName`, `QueueInput`, `QueuePayload`, `InputsOf` and `PayloadsOf` preserve names and input/output inference. An unknown queue resolves to `never`. Enqueue calls correlate names with payloads; uncorrelated unions fail compilation. `TasksOf` requires current payload envelopes around producer input, before transforms. Worker and harness constructors check schema/handler agreement even for manually constructed inline definitions. `DerivedJobOptions`, `ContinueOptions`, `PreparedJob`, `PrepareJobFn` and `PrepareJobsFn` type the long-running-job APIs. Instance methods need no global augmentation. Augment `GraphileWorker.Tasks` only when using Graphile's raw typed API.
 
@@ -601,46 +678,8 @@ Low-level builders, SQL adapters and payload helpers are available exclusively f
 
 Custom adapters must implement `EnqueueAdapter.addIdempotentJobs(specs)` to accept `idempotencyKey`; without it, keyed enqueues are rejected. Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
 
-This implementation requires a **major release**. There are no deprecated aliases or readers for the previous wire format:
-
-1. Pause old producers and cron scheduling. Drain old queued jobs before switching versions. Delayed or failed jobs that need to survive the upgrade must be explicitly re-enqueued through the new client with their business input and scheduling options. Resubmission can repeat work; preserve application idempotency keys.
-2. Stop the old workers and upgrade producers and workers together. New workers accept only version-2 envelopes; raw, flat and version-1 jobs are rejected as permanent failures.
-3. Rename `createQueue` to `defineQueue`; keep `processFn` and cron-init `initFn` in their definitions:
-
-   ```ts
-   const sendEmail = defineQueue({
-     name: 'sendEmail',
-     inputSchema: z.object({ to: z.string() }),
-     processFn: (payload, ctx) => {
-       ctx.logger.info('sending', { to: payload.to })
-     }
-   })
-   const queues = defineQueues([sendEmail])
-   const worker = createBetterWorker({ pgPool, queues })
-   const harness = createTestHarness(queues)
-   ```
-
-   Inline context enqueues now take queue references: replace `ctx.createJob('sendEmail', input)` with `ctx.createJob(sendEmail, input)`, and do the same for `ctx.createJobs`. Instance methods still use typed names. For separately shared producer contracts, supply a typed `handlers` registry instead.
-4. Move low-level imports to `/advanced`. Remove `setOtelApi` and pass `otel: { api }` to each instance. Use `QueueName` in place of `QueueNames`. Advanced `bindCreateJob` requires an enqueue adapter, and `createJobsApi` requires an explicit registry.
-5. Use `recentCompleted` and `recentFailed` for bounded local history; `failed` always means current database failures. Job listing returns metadata by default; request `includePayload: true` for payload debugging. Permanent failures are retained by default; explicitly choose `'discard'` if deletion is desired.
-
-JSON-changing step outputs such as Dates require codecs; void replays as undefined. The pg peer requires 8.16+. Batch keys/modes, lossy wire values, malformed numeric options and reserved queue names are rejected. Handler-thrown Zod errors retry; use `NonRetriableError` for intentional permanent failures. Shutdown timeouts reject while retaining the pending shutdown.
+Upgrading from 1.x: see the [2.0 migration notes](docs/migrations/2.0.md).
 
 ## Development
 
-```sh
-bun install --frozen-lockfile
-bun run lint
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/bgw_test bun test
-bun run build
-bun run test:consumers
-bun run attw
-bun run publint
-bun run verify:package
-```
-
-The PostgreSQL tests create/drop their own schema; the existing baseline integration tests also use the default Graphile schema. Use a disposable test database. Packed consumers exercise NodeNext/bundler compilation, optional-peer absence and native Node runtime behavior; set `PEER_PROFILE=minimum|latest`, `TYPESCRIPT_VERSION=5.7.3` and optionally `NODE_VERSION=20` to select a profile.
-
-## Releasing
-
-Squash PRs with conventional titles (`fix:`, `feat:`, or `feat!:`). Release Please keeps the version and changelog in a release PR; merge that PR to publish with release notes and npm provenance. See [release and recovery instructions](docs/operations/releasing.md).
+See [development](docs/operations/development.md) and [releasing](docs/operations/releasing.md).

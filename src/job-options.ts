@@ -8,6 +8,8 @@ export type JobOptions = Pick<
 	'priority' | 'runAt' | 'queueName' | 'maxAttempts' | 'jobKey' | 'jobKeyMode'
 > & {
 	flags?: readonly string[]
+	/** Run no earlier than this long after the enqueue; an explicit `runAt` wins. */
+	delay?: Duration
 	/** Override worker-level enqueue validation. Defaults to the worker/client setting. */
 	validateOnEnqueue?: boolean
 	/**

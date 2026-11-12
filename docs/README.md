@@ -8,4 +8,9 @@ The [README](../README.md) is the user guide. These pages are for people working
 
 ## Operations
 
+- [Development](./operations/development.md): local checks and the test database.
 - [Releasing and recovery](./operations/releasing.md)
+
+## Migrations
+
+- [1.x to 2.0](./migrations/2.0.md)

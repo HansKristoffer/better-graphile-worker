@@ -10,7 +10,8 @@ import {
 	type CronMatcher,
 	type JobHelpers,
 	type WorkerEventMap,
-	type WorkerEvents
+	type WorkerEvents,
+	type WorkerPool
 } from 'graphile-worker'
 import { EventEmitter } from 'node:events'
 import type { Pool } from 'pg'
@@ -22,15 +23,19 @@ import {
 	formatCronSchedule,
 	parseContinueRunAt,
 	resolveSerialQueueName,
-	type QueueContract
+	type QueueContract,
+	type QueueFailureHandler
 } from './queue.js'
-import type { NormalizedQueue } from './registry.js'
+import { retryDelayAfter, type NormalizedQueue } from './registry.js'
 import type { CompletedJobsStore } from './completed-jobs-store.js'
 import type {
 	BetterWorkerHooks,
+	JobAttributes,
 	JobLogger,
 	JobSpan,
-	LogAttributes
+	LogAttributes,
+	PermanentFailureEvent,
+	PermanentFailureReason
 } from './hooks.js'
 import type { CreateJobFn, CreateJobsFn, PreparedJob } from './types.js'
 import {
@@ -56,7 +61,12 @@ import {
 	injectTraceContext
 } from './payload.js'
 import { otelStatusCodes, withActiveSpan, type OtelApi } from './otel.js'
-import { jobLogger, observe } from './observers.js'
+import {
+	jobLogger,
+	observe,
+	reportPermanentFailure,
+	resolveJobAttributes
+} from './observers.js'
 import {
 	continueJob,
 	enterWait,
@@ -98,6 +108,36 @@ export type TaskListRuntime<
 	prepareJobs?:
 		| ((name: string, data: readonly unknown[]) => Promise<PreparedJob>)
 		| undefined
+	/** Jobs this worker's attempts are running, so a forced shutdown can report them. */
+	running?: Map<string, RunningJob> | undefined
+}
+
+/** A running job, as a permanent-failure report would describe it. */
+export type RunningJob = {
+	event: Omit<PermanentFailureEvent, 'reason' | 'error'>
+	hook: QueueFailureHandler<unknown> | undefined
+	/** Set once a permanent failure was reported, so no later path reports it again. */
+	reported: boolean
+}
+
+/**
+ * Report the running jobs on their last attempt, which a forced shutdown just failed for
+ * good. Their handlers may still be running, detached.
+ */
+export async function reportShutdownFailures(
+	runtime: Pick<TaskListRuntime, 'running' | 'hooks'>
+): Promise<void> {
+	for (const job of runtime.running?.values() ?? []) {
+		if (job.reported || job.event.attempts < job.event.maxAttempts) continue
+		job.reported = true
+		await reportPermanentFailure(runtime.hooks, job.hook, {
+			...job.event,
+			reason: 'shutdown',
+			error: new Error(
+				'The worker shut down before the job finished and failed its last attempt'
+			)
+		})
+	}
 }
 
 export { extractProducerLink } from './payload.js'
@@ -228,7 +268,8 @@ function createJobContext(
 	rawPayload: unknown,
 	attempt: Attempt,
 	progress: ProgressRunner,
-	endings: Endings
+	endings: Endings,
+	attributes: JobAttributes | undefined
 ): JobContext {
 	return {
 		jobId,
@@ -270,7 +311,8 @@ function createJobContext(
 			queue: queueName,
 			jobId,
 			attempt: helpers.job.attempts,
-			span
+			span,
+			attributes
 		}),
 		step: createStepRunner({
 			store: createPgStepStore({
@@ -348,10 +390,18 @@ type ExecuteTaskOptions = {
 	runtime: TaskListRuntime
 	timeout: number | undefined
 	progressSchema?: z.ZodType | undefined
+	/** The queue's own `onPermanentFailure`; init runs have none. */
+	onPermanentFailure?: QueueFailureHandler<unknown> | undefined
+	retryDelays?: readonly number[] | undefined
 }
 
 function isNonRetriable(error: unknown): boolean {
 	return error instanceof NonRetriableError
+}
+
+function failureReason(error: unknown): PermanentFailureReason {
+	if (isNonRetriable(error)) return 'non_retriable'
+	return error instanceof JobTimeoutError ? 'timeout' : 'error'
 }
 
 async function executeTask(options: ExecuteTaskOptions) {
@@ -364,7 +414,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 		extraAttributes,
 		runtime,
 		timeout,
-		progressSchema
+		progressSchema,
+		retryDelays
 	} = options
 	const jobId = String(helpers.job.id)
 	const spanName = `job: ${queueName}`
@@ -373,7 +424,24 @@ async function executeTask(options: ExecuteTaskOptions) {
 		: { link: null, cleanPayload: undefined }
 	const cron = extractCronMeta(payload)
 	const statusCodes = otelStatusCodes(runtime.otel)
+	const attributes = resolveJobAttributes(
+		runtime.hooks,
+		queueName,
+		cleanPayload
+	)
 	await runtime.heartbeatReady?.()
+	const running: RunningJob = {
+		event: {
+			queue: queueName,
+			jobId,
+			operation,
+			attempts: helpers.job.attempts,
+			maxAttempts: helpers.job.max_attempts,
+			payload: cleanPayload
+		},
+		hook: options.onPermanentFailure,
+		reported: false
+	}
 
 	const suspended = await withActiveSpan(
 		'graphile-worker',
@@ -381,6 +449,12 @@ async function executeTask(options: ExecuteTaskOptions) {
 		compact({ kind: 'consumer' as const, links: link ? [link] : undefined }),
 		async (span) => {
 			const startTime = Date.now()
+			// Hand-built helpers (tests, adapters) may leave run_at out.
+			const runAt = helpers.job.run_at as Date | undefined
+			const waitMs = runAt
+				? Math.max(0, startTime - new Date(runAt).getTime())
+				: 0
+			runtime.running?.set(jobId, running)
 
 			span.setAttributes({
 				'messaging.system': 'graphile-worker',
@@ -392,7 +466,9 @@ async function executeTask(options: ExecuteTaskOptions) {
 				'graphile.task_identifier': helpers.job.task_identifier,
 				'graphile.attempts': helpers.job.attempts,
 				'graphile.max_attempts': helpers.job.max_attempts,
-				...extraAttributes
+				'graphile.wait_ms': waitMs,
+				...extraAttributes,
+				...attributes
 			})
 
 			if (link) {
@@ -418,7 +494,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 				payload,
 				attempt,
 				progress,
-				endings
+				endings,
+				attributes
 			)
 			// Set by the wait that enqueued this job: report its final state to the parent.
 			const waited = isPayloadEnvelope(payload) && payload.waited === true
@@ -559,15 +636,18 @@ async function executeTask(options: ExecuteTaskOptions) {
 					helpers.job.attempts >= helpers.job.max_attempts
 
 				if (permanent) {
-					await observe(runtime.hooks.onPermanentFailure, {
-						error: reported,
-						queue: queueName,
-						jobId,
-						operation,
-						attempts: helpers.job.attempts,
-						maxAttempts: helpers.job.max_attempts,
-						payload: cleanPayload
-					})
+					if (!running.reported) {
+						running.reported = true
+						await reportPermanentFailure(
+							runtime.hooks,
+							options.onPermanentFailure,
+							{
+								...running.event,
+								reason: failureReason(error),
+								error: reported
+							}
+						)
+					}
 					runtime.completedJobs.add({
 						id: jobId,
 						queueName,
@@ -589,6 +669,23 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 				if (!permanent && error instanceof RetryAtError)
 					retryAt = await scheduleRetry(helpers, runtime.schema, error.runAt)
+				else if (!permanent) {
+					const delay = retryDelayAfter(retryDelays, helpers.job.attempts)
+					// Without the shift Graphile's own backoff applies, so a failed write only logs.
+					if (delay !== undefined)
+						retryAt = await scheduleRetry(
+							helpers,
+							runtime.schema,
+							new Date(Date.now() + delay)
+						).catch((scheduleError: unknown) => {
+							ctx.logger.warn('job.retry_delay.failed', {
+								event: 'job.retry_delay.failed',
+								job_id: jobId,
+								error: String(scheduleError)
+							})
+							return undefined
+						})
+				}
 
 				// Retention must hold, like a checkpoint; throwing the original error then lets
 				// Graphile record it and release the lock.
@@ -618,6 +715,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 				throw error
 			} finally {
 				attempt.dispose()
+				if (runtime.running?.get(jobId) === running)
+					runtime.running.delete(jobId)
 				const durationMs = Date.now() - startTime
 				const permanentlyFailed = status === 'failed' && permanent
 				await observe(runtime.hooks.onJobFinished, {
@@ -629,6 +728,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 					operation,
 					attempt: helpers.job.attempts,
 					maxAttempts: helpers.job.max_attempts,
+					waitMs,
+					...(attributes ? { attributes } : {}),
 					errorType,
 					errorMessage,
 					...(retryAt ? { retryAt } : {}),
@@ -644,6 +745,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					attempt: helpers.job.attempts,
 					max_attempts: helpers.job.max_attempts,
 					duration_ms: durationMs,
+					wait_ms: waitMs,
 					status,
 					...(continued ? { continued } : {}),
 					...(suspended ? { waiting: true } : {}),
@@ -718,6 +820,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					runtime: erasedRuntime,
 					timeout,
 					progressSchema: q.progressSchema,
+					onPermanentFailure: q.onPermanentFailure,
+					retryDelays: q.retryDelays,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = await parseQueuePayload(q, cleanPayload)
 						return encodeQueueOutput(
@@ -736,6 +840,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 					runtime: erasedRuntime,
 					timeout,
 					progressSchema: q.progressSchema,
+					onPermanentFailure: q.onPermanentFailure,
+					retryDelays: q.retryDelays,
 					executor: async (ctx, cleanPayload) => {
 						const validatedPayload = q.inputSchema
 							? await parseQueuePayload(q, cleanPayload)
@@ -808,9 +914,19 @@ export function buildCronItems(
 	return cronItems
 }
 
+/** `30s`, `1.5m`: the timeouts the startup log lists. */
+function formatTimeout(ms: number | undefined): string {
+	if (ms === undefined) return 'no timeout'
+	if (ms % 1000) return `timeout ${ms}ms`
+	const seconds = ms / 1000
+	if (seconds < 60) return `timeout ${seconds}s`
+	return seconds % 60 ? `timeout ${seconds}s` : `timeout ${seconds / 60}m`
+}
+
 export function logRegisteredQueues(
 	queues: readonly QueueContract[],
-	logger: JobLogger
+	logger: JobLogger,
+	defaultTimeout?: number
 ): void {
 	if (queues.length === 0) {
 		logger.info('No queues registered')
@@ -821,15 +937,18 @@ export function logRegisteredQueues(
 	for (const queue of queues) {
 		const q = queue
 		const type = getQueueType(q)
+		const timeout = formatTimeout(q.timeout ?? defaultTimeout)
 		if (type === 'cron-init') {
 			logger.info(
-				`  - ${q.name}${CRON_INIT_SUFFIX} (cron-init: ${formatCronSchedule(q.cron)})`
+				`  - ${q.name}${CRON_INIT_SUFFIX} (cron-init: ${formatCronSchedule(q.cron)}, ${timeout})`
 			)
-			logger.info(`  - ${q.name} (processor)`)
+			logger.info(`  - ${q.name} (processor, ${timeout})`)
 		} else if (type === 'cron') {
-			logger.info(`  - ${q.name} (cron: ${formatCronSchedule(q.cron)})`)
+			logger.info(
+				`  - ${q.name} (cron: ${formatCronSchedule(q.cron)}, ${timeout})`
+			)
 		} else {
-			logger.info(`  - ${q.name} (regular)`)
+			logger.info(`  - ${q.name} (regular, ${timeout})`)
 		}
 	}
 }
@@ -859,7 +978,8 @@ export type GraphileRunnerOverrides = Omit<
  */
 function withDurableCompletion(
 	graphile: GraphileRunnerOverrides | undefined,
-	localQueueSize?: number
+	localQueueSize?: number,
+	shutdownGrace?: number
 ) {
 	return {
 		...graphile,
@@ -871,7 +991,10 @@ function withDurableCompletion(
 						failJobBatchDelay: 0,
 						...(localQueueSize === undefined
 							? {}
-							: { localQueue: { size: localQueueSize } })
+							: { localQueue: { size: localQueueSize } }),
+						...(shutdownGrace === undefined
+							? {}
+							: { gracefulShutdownAbortTimeout: shutdownGrace })
 					}
 				},
 				...(graphile?.preset ? [graphile.preset] : [])
@@ -899,6 +1022,9 @@ function secondLookListener(delayMs: number | undefined) {
 	}
 }
 
+/** How long handlers have after `shutdownGrace` aborts their signal to reject before a forced shutdown. */
+const FORCE_AFTER_ABORT = 500
+
 /** One Graphile worker pool and its maintenance; `stop()` can be called more than once. */
 export type BetterRunner = { promise: Promise<void>; stop(): Promise<void> }
 
@@ -921,6 +1047,13 @@ export async function startRunner(options: {
 	secondLookOnNotify?: number | undefined
 	/** Names the pool runner in a `WorkerStoppedError`. */
 	runnerName?: string | undefined
+	/**
+	 * After `stop()`, abort job signals at this many ms and force the shutdown (fail and
+	 * unlock the jobs still running) `FORCE_AFTER_ABORT` ms later.
+	 */
+	shutdownGrace?: number | undefined
+	/** Runs after a forced shutdown failed the jobs still running; `stop()` awaits it. */
+	onForcedShutdown?: (() => Promise<void>) | undefined
 }): Promise<BetterRunner> {
 	const parsedCronItems =
 		options.cronItems.length > 0 ? parseCronItems(options.cronItems) : undefined
@@ -934,8 +1067,10 @@ export async function startRunner(options: {
 	const stopMaintenance = async () => {
 		await maintenance?.stop()
 	}
-	const onCreate = ({ workerPool }: WorkerEventMap['pool:create']) => {
-		maintenance = maintain?.(workerPool.id)
+	let workerPool: WorkerPool | undefined
+	const onCreate = (event: WorkerEventMap['pool:create']) => {
+		workerPool = event.workerPool
+		maintenance = maintain?.(event.workerPool.id)
 	}
 	events.on('pool:create', onCreate)
 	const secondLook = secondLookListener(options.secondLookOnNotify)
@@ -970,7 +1105,8 @@ export async function startRunner(options: {
 					graphile,
 					options.prefetch === undefined
 						? undefined
-						: options.concurrency + options.prefetch
+						: options.concurrency + options.prefetch,
+					options.shutdownGrace
 				),
 				events,
 				pgPool: options.pgPool,
@@ -1002,16 +1138,42 @@ export async function startRunner(options: {
 		() => {},
 		() => {}
 	)
+	let stopping: Promise<void> | undefined
+	const forceAfter = (grace: number) => {
+		let forced: Promise<void> | undefined
+		// Not unref'd: a handler that ignores its signal must not keep its lock past exit.
+		// Graphile's runner.kill() does nothing once a graceful stop has begun.
+		const timer = setTimeout(() => {
+			forced = Promise.resolve(
+				workerPool?.forcefulShutdown(
+					`Shutdown grace of ${grace}ms ended before the job finished`
+				)
+			)
+				.then(options.onForcedShutdown)
+				.catch(() => {})
+		}, grace + FORCE_AFTER_ABORT)
+		void ended.then(() => clearTimeout(timer))
+		return () => forced
+	}
 	return {
 		promise,
 		stop() {
 			requested = true
+			if (stopping) return stopping
+			const forced =
+				options.shutdownGrace === undefined
+					? undefined
+					: forceAfter(options.shutdownGrace)
 			// Graphile rejects a second stop, including one that races its own shutdown;
 			// either way the runner is ending, so wait for that.
-			return runner.stop().then(
-				() => ended,
-				() => ended
-			)
+			stopping = runner
+				.stop()
+				.then(
+					() => ended,
+					() => ended
+				)
+				.then(() => forced?.())
+			return stopping
 		}
 	}
 }

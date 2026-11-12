@@ -57,6 +57,28 @@ describe('enqueueInTransaction', () => {
 		}
 	})
 
+	test('reruns a single job that lost a jobKey race, then gives up', async () => {
+		const answers = [[], [], [{ id: '7' }]]
+		let runs = 0
+		const racing: RawQueryClient = {
+			$queryRawUnsafe: async () => answers[runs++] ?? []
+		}
+		expect(await enqueueInTransaction(racing, prepared(1))).toEqual(['7'])
+		expect(runs).toBe(3)
+
+		runs = 0
+		const losing: RawQueryClient = {
+			$queryRawUnsafe: async () => {
+				runs++
+				return []
+			}
+		}
+		await expect(enqueueInTransaction(losing, prepared(1))).rejects.toThrow(
+			EnqueueCountError
+		)
+		expect(runs).toBe(3)
+	})
+
 	test('required throws EnqueueSkippedError for a skipped statement', async () => {
 		const skipped = { ...prepared(0), skipped: true }
 		const error = await enqueueInTransaction(rows(), skipped, {

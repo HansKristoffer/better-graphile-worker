@@ -13,8 +13,9 @@ import { createWorkerClient, DEFAULT_GRAPHILE_WORKER_SCHEMA } from './client.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import { getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
-import { queryJobProgress } from './admin.js'
+import { queryJobProgress, queryRecentJobs, type ListedJob } from './admin.js'
 import { queryJob, type JobState } from './job-outcomes.js'
+import type { JobOptions } from './job-options.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -39,6 +40,8 @@ export type JobClientOptions<TQueues extends readonly QueueContract[]> = {
 	payloadMode?: PayloadMode
 	/** `jobKeyMode` for `enqueueInTransaction` jobs with a `jobKey` but no mode. */
 	transactionalJobKeyMode?: JobKeyMode
+	/** Run `migrate()` once before the first enqueue, prepare or read. Off by default. */
+	autoMigrate?: boolean
 }
 
 export type JobClient<TQueues extends readonly QueueContract[]> = {
@@ -55,8 +58,19 @@ export type JobClient<TQueues extends readonly QueueContract[]> = {
 	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
 	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
+	/**
+	 * Enqueue by a name known only at runtime, validated like `createJob`. A cron queue, or
+	 * a cron-init queue without a payload, triggers its cron run.
+	 */
+	enqueueByName(
+		name: string,
+		payload?: unknown,
+		options?: JobOptions
+	): Promise<string | null>
 	/** Read a job's `ctx.progress` value; null once the job no longer exists. */
 	readonly getJobProgress: GetJobProgressFn<TQueues>
+	/** The live job with this `jobKey`, payload included; null when there is none. */
+	getJobByKey(key: string): Promise<ListedJob | null>
 	migrate(): Promise<void>
 	release(): Promise<void>
 	getWorkerUtils(): Promise<WorkerUtils>
@@ -74,12 +88,14 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		pgPool: options.pgPool,
 		schema
 	})
+	const ready = options.autoMigrate ? () => client.ensureMigrated() : undefined
 	const {
 		createJob,
 		createJobs,
 		prepareJob,
 		prepareJobs,
-		enqueueInTransaction
+		enqueueInTransaction,
+		enqueueByName
 	} = bindCreateJob<TQueues>({
 		enqueue: client.enqueue,
 		otel: options.otel ? options.otel.api : getOtel(),
@@ -93,7 +109,8 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 			validateOnEnqueue: options.validateOnEnqueue,
 			defaultMaxAttempts: options.defaultMaxAttempts,
 			payloadMode: options.payloadMode,
-			transactionalJobKeyMode: options.transactionalJobKeyMode
+			transactionalJobKeyMode: options.transactionalJobKeyMode,
+			ready
 		})
 	})
 
@@ -106,14 +123,20 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		prepareJobs,
 		enqueueInTransaction,
 		jobs: createJobsApi(createJob, options.queues),
-		getJobProgress: ((queue: string, jobId: string) =>
-			queryJobProgress(
-				client,
-				schema,
-				options.queues,
-				queue,
-				jobId
-			)) as GetJobProgressFn<TQueues>,
+		enqueueByName,
+		getJobProgress: (async (queue: string, jobId: string) => {
+			await ready?.()
+			return queryJobProgress(client, schema, options.queues, queue, jobId)
+		}) as GetJobProgressFn<TQueues>,
+		async getJobByKey(key) {
+			await ready?.()
+			const [job] = await queryRecentJobs(client, schema, {
+				key,
+				includePayload: true,
+				limit: 1
+			})
+			return job ?? null
+		},
 		migrate() {
 			return client.migrate()
 		},
@@ -123,7 +146,8 @@ export function createJobClient<const TQueues extends readonly QueueContract[]>(
 		getWorkerUtils() {
 			return client.getUtils()
 		},
-		getJob(id) {
+		async getJob(id) {
+			await ready?.()
 			return queryJob(client, schema, id)
 		}
 	}

@@ -59,7 +59,12 @@
 			}
 		},
 		{
-			"includes": ["**/cli.ts", "**/default-logger.ts", "**/scripts/**"],
+			"includes": [
+				"**/cli.ts",
+				"**/bin.ts",
+				"**/default-logger.ts",
+				"**/scripts/**"
+			],
 			"linter": {
 				"rules": {
 					"suspicious": {

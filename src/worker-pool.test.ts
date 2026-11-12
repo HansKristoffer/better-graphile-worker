@@ -177,7 +177,7 @@ describe('createBetterWorkerPool', () => {
 	test('pgPoolSize covers each runner and its LISTEN and maintenance connections', () => {
 		expect(
 			pgPoolSize({ turn: { concurrency: 10 }, background: { concurrency: 4 } })
-		).toBe(18)
+		).toBe(17)
 		expect(pgPoolSize({ default: {} })).toBe(12)
 	})
 
@@ -187,7 +187,7 @@ describe('createBetterWorkerPool', () => {
 			background: { concurrency: 4 },
 			idle: { concurrency: 50 }
 		}
-		expect(pgPoolSize(runners, { queues: contracts })).toBe(18)
+		expect(pgPoolSize(runners, { queues: contracts })).toBe(17)
 		expect(pgPoolSize(runners, { queues: [reply] })).toBe(12)
 		expect(pgPoolSize(runners, { queues: [] })).toBe(0)
 		expect(
@@ -196,6 +196,43 @@ describe('createBetterWorkerPool', () => {
 		expect(() => pgPoolSize(runners, { queues: [loose] })).toThrow(
 			'needs a runner'
 		)
+	})
+})
+
+describe('pool size and definitions', () => {
+	test('start refuses a pgPool that cannot hold every runner plus one fetch', async () => {
+		const tiny = { options: { max: 3 } } as unknown as Pool
+		const workers = createBetterWorkerPool({
+			pgPool: tiny,
+			queues: contracts,
+			handlers,
+			runners: { turn: {}, background: {} }
+		})
+		await expect(workers.start()).rejects.toThrow(
+			'pgPool max is 3, but 2 started runner(s) hold 3 connections'
+		)
+		const single = createBetterWorker({
+			pgPool: { options: { max: 2 } } as unknown as Pool,
+			queues: [loose],
+			handlers: { loose: () => {} }
+		})
+		await expect(single.start()).rejects.toThrow('set max to at least 3')
+	})
+
+	test('queue definitions name every queue runner, defaultRunner included', () => {
+		const workers = createBetterWorkerPool({
+			pgPool: {} as Pool,
+			queues: [reply, loose],
+			handlers: { reply: () => {}, loose: () => {} },
+			defaultRunner: 'background',
+			runners: { turn: {}, background: {} }
+		})
+		expect(
+			workers.getQueueDefinitions().map(({ name, runner }) => [name, runner])
+		).toEqual([
+			['reply', 'turn'],
+			['loose', 'background']
+		])
 	})
 })
 
@@ -430,5 +467,38 @@ suite('worker pool on PostgreSQL', () => {
 		await workers.start()
 		await workers.stop()
 		await workers.promise
+	})
+
+	test('runners share one maintenance connection, so runners + 2 connections run them all', async () => {
+		const small = new Pool({
+			connectionString: process.env.DATABASE_URL,
+			max: 4
+		})
+		small.on('error', () => {})
+		const done = new Map<string, () => void>()
+		const finished = (queue: string) =>
+			new Promise<void>((resolve) => done.set(queue, resolve))
+		const workers = createBetterWorkerPool({
+			pgPool: small,
+			schema,
+			queues: contracts,
+			handlers,
+			runners: { turn: { concurrency: 1 }, background: { concurrency: 1 } },
+			hooks: {
+				createLogger: () => quiet,
+				onJobFinished: ({ queue }) => done.get(queue)?.()
+			}
+		})
+		await workers.migrate()
+		await workers.start()
+		try {
+			const ran = Promise.all([finished('reply'), finished('digest')])
+			await workers.createJob('reply', { id: 'small' })
+			await workers.createJob('digest', { id: 'small' })
+			await ran
+		} finally {
+			await workers.stop()
+			await small.end()
+		}
 	})
 })

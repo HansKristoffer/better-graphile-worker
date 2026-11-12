@@ -1,4 +1,8 @@
-import type { BetterWorkerHooks, JobFinishedEvent } from './hooks.js'
+import type {
+	BetterWorkerHooks,
+	JobFinishedEvent,
+	PermanentFailureEvent
+} from './hooks.js'
 import type { OtelApi } from './otel.js'
 
 type MetricsApi = Pick<OtelApi, 'metrics'>
@@ -27,13 +31,22 @@ export const queueMetricDefinitions = [
 	{
 		name: 'graphile_job_permanently_failed_total',
 		kind: 'counter',
-		description: 'Graphile Worker jobs that exhausted max attempts',
+		description:
+			'Graphile Worker jobs that failed for good: attempts exhausted, NonRetriableError, a lost worker, a forced shutdown or failJobs',
 		attributes: { queue: 'string' }
 	},
 	{
 		name: 'graphile_job_enqueue_fail_total',
 		kind: 'counter',
 		description: 'Failed createJob / prepareJob enqueue attempts',
+		attributes: { queue: 'string' }
+	},
+	{
+		name: 'graphile_job_wait_ms',
+		kind: 'histogram',
+		unit: 'ms',
+		description:
+			'How long Graphile Worker jobs waited past their run_at before their handler started',
 		attributes: { queue: 'string' }
 	}
 ] as const satisfies readonly QueueMetricDefinition[]
@@ -46,8 +59,13 @@ export type QueueMetricDefinition = {
 	readonly attributes: Readonly<Record<string, 'string' | readonly string[]>>
 }
 
-const [totalMetric, durationMetric, permanentMetric, enqueueFailMetric] =
-	queueMetricDefinitions
+const [
+	totalMetric,
+	durationMetric,
+	permanentMetric,
+	enqueueFailMetric,
+	waitMetric
+] = queueMetricDefinitions
 
 /**
  * Queue metrics recorded through the instance's OTel meter. Recording runs before the
@@ -73,7 +91,8 @@ function createQueueMetrics(api: MetricsApi) {
 		enqueueFailed: meter.createCounter(
 			enqueueFailMetric.name,
 			options(enqueueFailMetric)
-		)
+		),
+		wait: meter.createHistogram(waitMetric.name, options(waitMetric))
 	}
 }
 
@@ -98,7 +117,7 @@ export function withQueueMetrics(
 		return hooks
 	}
 	if (!metrics) return hooks
-	const { jobs, duration, permanentlyFailed, enqueueFailed } = metrics
+	const { jobs, duration, permanentlyFailed, enqueueFailed, wait } = metrics
 	return {
 		...hooks,
 		onJobFinished(event: JobFinishedEvent) {
@@ -106,10 +125,14 @@ export function withQueueMetrics(
 				const attributes = { queue: event.queue, status: event.status }
 				jobs.add(1, attributes)
 				duration.record(event.durationMs, attributes)
-				if (event.permanentlyFailed)
-					permanentlyFailed.add(1, { queue: event.queue })
+				wait.record(event.waitMs, { queue: event.queue })
 			})
 			return hooks.onJobFinished?.(event)
+		},
+		// Also reported for jobs no handler finished, such as those of a lost worker.
+		onPermanentFailure(event: PermanentFailureEvent) {
+			record(() => permanentlyFailed.add(1, { queue: event.queue }))
+			return hooks.onPermanentFailure?.(event)
 		},
 		onEnqueueFail(event) {
 			record(() => enqueueFailed.add(1, { queue: event.queue }))

@@ -3,6 +3,9 @@ export type CompletedJobStatus = 'completed' | 'failed'
 
 export type CompletedJob = {
 	id: string
+	/** The Graphile task identifier; cron-init runs use `{name}_cron-init`. */
+	queue: string
+	/** @deprecated Use `queue`. */
 	queueName: string
 	payload: unknown
 	status: CompletedJobStatus
@@ -22,7 +25,8 @@ export type CompletedJobStats = Record<
 const DEFAULT_MAX_JOBS_PER_QUEUE = 50
 
 export type CompletedJobsStore = {
-	add(job: CompletedJob): void
+	/** `queue` defaults to `queueName`. */
+	add(job: Omit<CompletedJob, 'queue'> & { queue?: string }): void
 	getAll(): CompletedJob[]
 	getStats(): CompletedJobStats
 }
@@ -34,7 +38,8 @@ export function createCompletedJobsStore(
 	const completedJobsMap = new Map<string, CompletedJob[]>()
 
 	return {
-		add(job) {
+		add(added) {
+			const job = { ...added, queue: added.queue ?? added.queueName }
 			const queueJobs = completedJobsMap.get(job.queueName) ?? []
 			queueJobs.unshift(job)
 			if (queueJobs.length > maxJobsPerQueue) {

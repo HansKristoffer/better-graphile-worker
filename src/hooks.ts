@@ -24,11 +24,16 @@ export type JobSpan = {
 	end(): void
 }
 
+/** Span and log attributes `hooks.jobAttributes` derives from a job's payload. */
+export type JobAttributes = Record<string, string | number | boolean>
+
 export type CreateLoggerOptions = {
 	queue: string
 	jobId: string
 	attempt: number
 	span: JobSpan
+	/** From `hooks.jobAttributes`, for the logger to add to every line. */
+	attributes?: JobAttributes | undefined
 }
 
 export type JobFinishedEvent = {
@@ -43,8 +48,16 @@ export type JobFinishedEvent = {
 	errorType?: string | undefined
 	/** The failed attempt's error message, untrimmed. */
 	errorMessage?: string | undefined
-	/** The attempt threw `RetryAtError`; the next attempt runs at this time. */
+	/** The next attempt runs at this time, from `RetryAtError` or the queue's `retryDelay`. */
 	retryAt?: Date
+	/**
+	 * How long the job waited past its `run_at` (enqueue time, or the scheduled retry)
+	 * before its handler started, in milliseconds. Uses this process's clock against the
+	 * database's, so clock skew shows up here.
+	 */
+	waitMs: number
+	/** From `hooks.jobAttributes`. */
+	attributes?: JobAttributes | undefined
 	/** The run ended with `ctx.continue()`; a continuation job was enqueued. */
 	continued?: boolean
 	/**
@@ -54,7 +67,22 @@ export type JobFinishedEvent = {
 	waiting?: boolean
 }
 
+/**
+ * What ended a job's last attempt: its handler threw (`error`), ran past its `timeout`,
+ * threw `NonRetriableError` (including an invalid payload), its worker stopped
+ * heartbeating (`worker_lost`), shutdown cut it off after `shutdownGrace`, or `failJobs`
+ * failed it.
+ */
+export type PermanentFailureReason =
+	| 'error'
+	| 'timeout'
+	| 'non_retriable'
+	| 'worker_lost'
+	| 'shutdown'
+	| 'failJobs'
+
 export type PermanentFailureEvent = {
+	reason: PermanentFailureReason
 	error: unknown
 	queue: string
 	jobId: string
@@ -95,5 +123,15 @@ export type BetterWorkerHooks = {
 	onEnqueueFail?: (event: EnqueueFailEvent) => void | Promise<void>
 	/** Once per stop Graphile made on its own, before the first restart try. */
 	onRunnerStopped?: (event: RunnerStoppedEvent) => void | Promise<void>
-	shouldSkipEnqueue?: () => boolean
+	/** Return true to enqueue nothing; producers then get null (or `[]`). */
+	shouldSkipEnqueue?: (event: { queue: string }) => boolean
+	/**
+	 * Attributes to set on each job's span, pass to `createLogger` and add to
+	 * `onJobFinished`, such as tenant ids from the wire payload. Synchronous; the hook
+	 * decides what leaves the payload.
+	 */
+	jobAttributes?: (event: {
+		queue: string
+		payload: unknown
+	}) => JobAttributes | undefined
 }

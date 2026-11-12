@@ -70,6 +70,8 @@ export type BindCreateJobOptions<T extends readonly QueueContract[]> = {
 	payloadMode?: PayloadMode
 	/** Mode for `enqueueInTransaction` jobs with a `jobKey` but no mode of their own. */
 	transactionalJobKeyMode?: JobKeyMode | undefined
+	/** Awaited before each enqueue or prepare, such as `autoMigrate`'s migration. */
+	ready?: (() => Promise<void>) | undefined
 }
 
 export type JobKeyMode = NonNullable<JobOptions['jobKeyMode']>
@@ -153,6 +155,7 @@ function deriveOptions(
 		jobKeyMode: derived.jobKeyMode,
 		priority: derived.priority,
 		flags: derived.flags,
+		delay: derived.delay,
 		idempotencyKey: derived.idempotencyKey,
 		idempotencyTtl: derived.idempotencyTtl
 	})
@@ -192,6 +195,11 @@ export function resolveEnqueueSpec(
 	if (priority !== undefined) assertInteger(priority, 'priority', -32768, 32767)
 	if (options?.runAt && !Number.isFinite(new Date(options.runAt).getTime()))
 		throw new RangeError('runAt must be a valid timestamp')
+	// A delay is relative to the producer's clock, like a runAt it computed itself.
+	const delay =
+		options?.delay === undefined
+			? undefined
+			: parseDuration(options.delay, 'delay')
 	const idempotencyKey = options?.idempotencyKey
 	if (
 		idempotencyKey !== undefined &&
@@ -215,7 +223,9 @@ export function resolveEnqueueSpec(
 			options?.queueName ??
 			cronOptions?.queueName ??
 			resolveSerialQueueName(queue.serial, queue.name),
-		runAt: options?.runAt,
+		runAt:
+			options?.runAt ??
+			(delay === undefined ? undefined : new Date(Date.now() + delay)),
 		jobKey: options?.jobKey ?? cronOptions?.jobKey,
 		jobKeyMode: options?.jobKeyMode ?? cronOptions?.jobKeyMode,
 		idempotencyKey,
@@ -277,11 +287,14 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		jobOptions?: JobOptions,
 		index?: number
 	) {
-		const wire = payloadMode === 'json-compat' ? toJsonCompat(data) : data
-		assertJsonValue(wire, true)
 		// Validate the wire input; transforms are applied again by the consumer.
-		const snapshot =
-			wire === undefined ? undefined : JSON.parse(JSON.stringify(wire))
+		let snapshot: unknown
+		if (payloadMode === 'json-compat') snapshot = toJsonCompat(data)
+		else {
+			assertJsonValue(data, true)
+			snapshot =
+				data === undefined ? undefined : JSON.parse(JSON.stringify(data))
+		}
 		if (jobOptions?.validateOnEnqueue ?? options.validateOnEnqueue ?? true)
 			await parseQueuePayload(queue, snapshot, index)
 		return snapshot
@@ -411,7 +424,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		cron = false
 	): Promise<string | null> {
 		return observed(name, async () => {
-			if (hooks.shouldSkipEnqueue?.()) return null
+			if (hooks.shouldSkipEnqueue?.({ queue: name })) return null
+			await options.ready?.()
 			const { task, payload, spec } = await resolveOne(
 				name,
 				data,
@@ -448,7 +462,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		jobOptions?: BatchJobOptions
 	): Promise<string[]> {
 		return observed(name, async () => {
-			if (hooks.shouldSkipEnqueue?.()) return []
+			if (hooks.shouldSkipEnqueue?.({ queue: name })) return []
+			await options.ready?.()
 			const { specs, preserveRunAt, idempotent } = await resolveMany(
 				name,
 				data,
@@ -492,7 +507,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		defaultJobKeyMode?: JobKeyMode
 	): Promise<PreparedJob> {
 		return observed(name, async () => {
-			if (hooks.shouldSkipEnqueue?.()) return skippedJob(name)
+			if (hooks.shouldSkipEnqueue?.({ queue: name })) return skippedJob(name)
+			await options.ready?.()
 			const { task, payload, spec } = await resolveOne(
 				name,
 				data,
@@ -522,7 +538,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		jobOptions?: BatchJobOptions
 	): Promise<PreparedJob> {
 		return observed(name, async () => {
-			if (hooks.shouldSkipEnqueue?.()) return skippedJob(name)
+			if (hooks.shouldSkipEnqueue?.({ queue: name })) return skippedJob(name)
+			await options.ready?.()
 			const { specs, preserveRunAt, idempotent } = await resolveMany(
 				name,
 				data,
@@ -582,6 +599,22 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		const { task, payload, ...requestOptions } = first
 		return prepareOne(task, payload, requestOptions)
 	}
+	/**
+	 * Enqueue by a name known only at runtime: a cron queue, or a cron-init queue without a
+	 * payload, triggers its cron run; anything else is `createJob`.
+	 */
+	function enqueueByName(
+		name: string,
+		data?: unknown,
+		jobOptions?: JobOptions
+	): Promise<string | null> {
+		const queue = registry.get(name)
+		const cron =
+			queue !== undefined &&
+			queue.cron !== undefined &&
+			(!queue.inputSchema || data === undefined)
+		return enqueueOne(name, data, jobOptions, cron)
+	}
 	// All erased calls pass through this registry/validation boundary.
 	const createJob = enqueueOne as CreateJobFn<T>
 	const createJobs = enqueueMany as CreateJobsFn<T>
@@ -597,7 +630,8 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		prepareOne,
 		prepareMany,
 		triggerCron: (name: string, opts?: JobOptions) =>
-			enqueueOne(name, undefined, opts, true)
+			enqueueOne(name, undefined, opts, true),
+		enqueueByName
 	}
 }
 

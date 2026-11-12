@@ -85,3 +85,73 @@ test('handler-free contracts still require handlers', () => {
 		createTestHarness([sendEmail])
 	).toThrow('requires a processFn')
 })
+
+describe('enqueueing through the harness', () => {
+	const order = defineQueue({
+		name: 'order',
+		inputSchema: z.object({ id: z.string() }),
+		maxAttempts: 2,
+		deriveJobOptions: ({ id }) => ({ jobKey: `order:${id}` }),
+		processFn: async (payload, ctx) => {
+			attempts.push([payload.id, ctx.attempt, ctx.maxAttempts])
+			await ctx.createJob(receipt, { orderId: payload.id })
+		}
+	})
+	const receipt = defineQueue({
+		name: 'receipt',
+		inputSchema: z.object({ orderId: z.string() }),
+		processFn: async (payload) => void sent.push(payload.orderId)
+	})
+	const digest = defineQueue({
+		name: 'digest',
+		cron: '0 * * * *',
+		inputSchema: z.object({ id: z.string() }),
+		initFn: async () => [{ id: 'nightly' }],
+		processFn: async (payload) => void sent.push(payload.id)
+	})
+	const attempts: [string, number, number][] = []
+	const sent: string[] = []
+
+	test('createJob validates and derives like the worker; drain runs what follows', async () => {
+		const harness = createTestHarness([order, receipt, digest])
+		await harness.createJob('order', { id: 'a' })
+		await harness.enqueueInTransaction(
+			{ $queryRawUnsafe: async () => [] },
+			{ task: 'order', payload: { id: 'b' } }
+		)
+		await expect(
+			harness.createJob('order', { id: 1 } as never)
+		).rejects.toThrow()
+		expect(harness.enqueued[0]).toMatchObject({
+			queue: 'order',
+			options: { jobKey: 'order:a' }
+		})
+		expect(await harness.drain()).toBe(4)
+		// The queue's own maxAttempts, not Graphile's default.
+		expect(attempts).toEqual([
+			['a', 1, 2],
+			['b', 1, 2]
+		])
+		expect(sent).toEqual(['a', 'b'])
+		expect(await harness.drain()).toBe(0)
+	})
+
+	test('drain runs a cron-init trigger and the items it returns', async () => {
+		sent.length = 0
+		const harness = createTestHarness([order, receipt, digest])
+		await harness.triggerCron('digest')
+		expect(await harness.drain()).toBe(2)
+		expect(sent).toEqual(['nightly'])
+	})
+
+	test('drain stops a job that keeps enqueueing itself', async () => {
+		const loop = defineQueue({
+			name: 'loop',
+			inputSchema: z.number(),
+			processFn: async (n, ctx) => void (await ctx.createJob(loop, n + 1))
+		})
+		const harness = createTestHarness([loop])
+		await harness.createJob('loop', 0)
+		await expect(harness.drain({ maxJobs: 5 })).rejects.toThrow('ran 5 jobs')
+	})
+})

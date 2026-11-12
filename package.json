@@ -45,7 +45,11 @@
 		"./prisma": {
 			"types": "./dist/prisma.d.ts",
 			"import": "./dist/prisma.js"
-		}
+		},
+		"./package.json": "./package.json"
+	},
+	"bin": {
+		"better-graphile-worker": "./dist/bin.js"
 	},
 	"types": "./dist/index.d.ts",
 	"files": [

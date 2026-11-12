@@ -550,3 +550,97 @@ describe('payloadMode', () => {
 		).toThrow('payloadMode')
 	})
 })
+
+describe('enqueue options', () => {
+	const delayed = defineQueue({
+		name: 'delayed',
+		inputSchema: z.object({ id: z.string() }),
+		deriveJobOptions: ({ id }) => ({
+			jobKey: `delayed:${id}`,
+			jobKeyMode: 'replace',
+			delay: '5s'
+		})
+	})
+	const tick = defineQueue({ name: 'tick', cron: '* * * * *' })
+	const fanOut = defineQueue({
+		name: 'fanOut',
+		cron: '* * * * *',
+		inputSchema: z.string()
+	})
+
+	function producer(hooks = {}, ready?: () => Promise<void>) {
+		const { utils, added } = mockUtils()
+		const bound = bindCreateJob({
+			queues: [delayed, tick, fanOut],
+			enqueue: utils,
+			otel: null,
+			hooks,
+			ready
+		})
+		return { bound, added }
+	}
+	const runAtOf = (job: RecordedJob | undefined) =>
+		new Date((job!.spec as { runAt: Date }).runAt).getTime()
+
+	test('a derived delay debounces from now; explicit runAt and delay win', async () => {
+		const { bound, added } = producer()
+		const before = Date.now()
+		await bound.createJob('delayed', { id: 'a' })
+		expect(runAtOf(added[0]) - before).toBeGreaterThanOrEqual(5000)
+		expect(runAtOf(added[0]) - before).toBeLessThan(6000)
+		const at = new Date('2030-01-01T00:00:00Z')
+		await bound.createJob('delayed', { id: 'a' }, { runAt: at })
+		expect(runAtOf(added[1])).toBe(at.getTime())
+		await bound.createJob('delayed', { id: 'a' }, { delay: '1m' })
+		expect(runAtOf(added[2]) - before).toBeGreaterThanOrEqual(60_000)
+		await expect(
+			bound.createJob('delayed', { id: 'a' }, { delay: 'soon' as '1s' })
+		).rejects.toThrow('delay')
+	})
+
+	test('enqueueByName routes cron names to their cron run and validates the rest', async () => {
+		const { bound, added } = producer()
+		await bound.enqueueByName('tick')
+		await bound.enqueueByName('fanOut')
+		await bound.enqueueByName('fanOut', 'item')
+		await bound.enqueueByName('delayed', { id: 'b' })
+		expect(added.map((job) => job.identifier)).toEqual([
+			'tick',
+			'fanOut_cron-init',
+			'fanOut',
+			'delayed'
+		])
+		await expect(bound.enqueueByName('delayed', { id: 1 })).rejects.toThrow(
+			JobValidationError
+		)
+		await expect(bound.enqueueByName('missing')).rejects.toThrow(
+			UnknownQueueError
+		)
+	})
+
+	test('shouldSkipEnqueue is told the queue', async () => {
+		const asked: string[] = []
+		const { bound, added } = producer({
+			shouldSkipEnqueue: ({ queue }: { queue: string }) => {
+				asked.push(queue)
+				return queue === 'tick'
+			}
+		})
+		expect(await bound.triggerCron('tick')).toBeNull()
+		await bound.createJob('delayed', { id: 'c' })
+		expect(asked).toEqual(['tick', 'delayed'])
+		expect(added.map((job) => job.identifier)).toEqual(['delayed'])
+	})
+
+	test('ready runs before every enqueue and prepare, after the skip check', async () => {
+		let readied = 0
+		const { bound } = producer({}, async () => {
+			readied++
+		})
+		await bound.createJob('delayed', { id: 'd' })
+		await bound.prepareJob('delayed', { id: 'd' })
+		await bound.createJobs('fanOut', ['x'])
+		await bound.prepareJobs('fanOut', ['x'])
+		expect(readied).toBe(4)
+	})
+})

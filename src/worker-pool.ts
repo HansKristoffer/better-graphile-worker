@@ -1,4 +1,5 @@
 import {
+	assertPoolSize,
 	createWorker,
 	resolveCompletedJobsStore,
 	type BetterWorker,
@@ -7,6 +8,7 @@ import {
 	type WorkerRunnerOptions
 } from './create-better-worker.js'
 import type { QueueContract } from './queue.js'
+import { createMaintenance } from './maintenance.js'
 import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
 import { DEFAULT_CONCURRENCY } from './worker.js'
 
@@ -94,9 +96,10 @@ function assignQueues(
 }
 
 /**
- * The `pgPool` size a set of runners needs: each runner's concurrency plus its LISTEN and
- * maintenance connections. Pass the queues (and `defaultRunner`) to count only runners
- * that have queues, as the pool starts them. Add headroom for producers that share the pool.
+ * The `pgPool` size a set of runners needs: each runner's concurrency plus its LISTEN
+ * connection, and one maintenance connection they share. Pass the queues (and
+ * `defaultRunner`) to count only runners that have queues, as the pool starts them. Add
+ * headroom for producers that share the pool.
  */
 export function pgPoolSize(
 	runners: Readonly<Record<string, WorkerRunnerOptions>>,
@@ -106,8 +109,8 @@ export function pgPoolSize(
 		? [...assignQueues(runners, registry).keys()].map((name) => runners[name])
 		: Object.values(runners)
 	return started.reduce(
-		(total, runner) => total + (runner?.concurrency ?? DEFAULT_CONCURRENCY) + 2,
-		0
+		(total, runner) => total + (runner?.concurrency ?? DEFAULT_CONCURRENCY) + 1,
+		started.length ? 1 : 0
 	)
 }
 
@@ -125,6 +128,7 @@ export function createBetterWorkerPool<
 	})
 
 	const completedJobs = resolveCompletedJobsStore(options.completedJobs)
+	const maintenance = createMaintenance()
 	// The registration union stays generic here; each runner gets the caller's options.
 	const create = (runner?: string, queues?: string[]) =>
 		createWorker<TQueues>(
@@ -134,7 +138,8 @@ export function createBetterWorkerPool<
 				process: queues
 			} as never,
 			completedJobs,
-			runner
+			runner,
+			maintenance
 		)
 	const workers = Object.fromEntries(
 		[...assigned].map(([name, queues]) => [name, create(name, queues)])
@@ -151,6 +156,7 @@ export function createBetterWorkerPool<
 		runOnce: _runOnce,
 		buildTaskList: _buildTaskList,
 		buildCronItems: _buildCronItems,
+		getQueueDefinitions,
 		...delegated
 	} = primary
 	/** Waits for every runner, then rejects with the first failure, so none is left mid-transition. */
@@ -193,6 +199,11 @@ export function createBetterWorkerPool<
 	return {
 		...delegated,
 		runners: workers as BetterWorkerPool<TQueues, TDefault>['runners'],
+		getQueueDefinitions: () =>
+			getQueueDefinitions().map((definition) => ({
+				...definition,
+				runner: definition.runner ?? defaultRunner ?? null
+			})),
 		get promise() {
 			return idleOr(() => each((worker) => worker.promise))
 		},
@@ -201,6 +212,7 @@ export function createBetterWorkerPool<
 				if (!idle) startIdle()
 				return
 			}
+			assertPoolSize(options.pgPool, all.length)
 			try {
 				await each((worker) => worker.start())
 			} catch (error) {
