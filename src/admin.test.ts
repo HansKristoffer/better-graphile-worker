@@ -26,7 +26,7 @@ describe('getQueueDefinitions', () => {
 describe('mergeJobStats', () => {
 	test('merges postgres counts with the completed-jobs ring', () => {
 		const stats = mergeJobStats(
-			[{ taskIdentifier: 'sendEmail', pending: 2, running: 1, failed: 9 }],
+			[{ queue: 'sendEmail', pending: 2, running: 1, failed: 9 }],
 			{ sendEmail: { completed: 4, failed: 1 } },
 			['sendEmail', 'dailySweep']
 		)
@@ -34,7 +34,6 @@ describe('mergeJobStats', () => {
 		expect(stats).toEqual([
 			{
 				queue: 'sendEmail',
-				taskIdentifier: 'sendEmail',
 				pending: 2,
 				running: 1,
 				recentCompleted: 4,
@@ -43,7 +42,6 @@ describe('mergeJobStats', () => {
 			},
 			{
 				queue: 'dailySweep',
-				taskIdentifier: 'dailySweep',
 				pending: 0,
 				running: 0,
 				recentCompleted: 0,
@@ -55,7 +53,7 @@ describe('mergeJobStats', () => {
 
 	test('falls back to postgres failed when the ring has no row', () => {
 		const stats = mergeJobStats(
-			[{ taskIdentifier: 'sendEmail', pending: 0, running: 0, failed: 3 }],
+			[{ queue: 'sendEmail', pending: 0, running: 0, failed: 3 }],
 			{},
 			['sendEmail']
 		)
@@ -72,7 +70,6 @@ describe('mergeJobStats', () => {
 		expect(stats).toEqual([
 			{
 				queue: 'leftover',
-				taskIdentifier: 'leftover',
 				pending: 0,
 				running: 0,
 				recentCompleted: 2,

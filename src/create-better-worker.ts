@@ -5,6 +5,8 @@ import {
 	CRON_INIT_SUFFIX,
 	getQueueType,
 	type QueueContract,
+	isCronQueue,
+	resolveSerialQueueName,
 	type HandlerFreeQueueContract,
 	type InlineQueues,
 	type RunnableQueue,
@@ -37,11 +39,14 @@ import {
 	buildTaskList,
 	DEFAULT_CONCURRENCY,
 	DEFAULT_POLL_INTERVAL,
+	DEFAULT_SHUTDOWN_GRACE,
+	DEFAULT_TIMEOUT,
 	logRegisteredQueues,
 	reportShutdownFailures,
 	runOnceTasks,
 	startRunner,
 	type GraphileRunnerOverrides,
+	type TaskListRuntime,
 	type RunningJob
 } from './worker.js'
 import { jobLogger, observe, reportPermanentFailure } from './observers.js'
@@ -57,7 +62,11 @@ import {
 	type RestartOptions
 } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
-import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
+import {
+	resolveDatabaseProbe,
+	thenEndPool,
+	whileReachable
+} from './shutdown.js'
 import { assertInteger, parseDuration } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
@@ -101,8 +110,12 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	hooks?: BetterWorkerHooks
 	validateOnEnqueue?: boolean
 	defaultMaxAttempts?: number
-	/** Fail attempts that run longer than this many milliseconds; queues override it with `timeout`. */
-	defaultTimeout?: number
+	/**
+	 * Fail attempts that run longer than this many milliseconds; queues override it with
+	 * `timeout`. Defaults to 3 h 50 min, below Graphile's 4-hour reclaim; `false` means no
+	 * limit.
+	 */
+	defaultTimeout?: number | false
 	completedJobs?: CompletedJobsOption
 	/** Record final job states in PostgreSQL so `getJob` can read them after completion. */
 	jobOutcomes?: JobOutcomesOption
@@ -111,11 +124,6 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	otel?: OtelOption
 	/** Retain failures in PostgreSQL by default; discard acknowledges and deletes them. */
 	permanentFailure?: 'discard' | 'retain' | undefined
-	/**
-	 * Run only these queues (and their cron schedules); defaults to all. Enqueueing still
-	 * covers every queue, so separate instances can give workloads their own concurrency.
-	 */
-	process?: readonly NoInfer<QueueName<TQueues>>[]
 	/**
 	 * Heartbeat this worker and release jobs (and lanes) held by workers that stopped
 	 * heartbeating, instead of waiting for Graphile's 4-hour stale-lock scan. On by
@@ -135,8 +143,10 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	secondLookOnNotify?: number | undefined
 	/**
 	 * Fetch and lock up to `concurrency + prefetch` jobs at once, so the next job is ready
-	 * when a slot frees (Graphile's `localQueue.size`). Off by default; `1` is a common start.
-	 * Locked jobs wait locally, so another worker cannot take them meanwhile.
+	 * when a slot frees (Graphile's `localQueue.size`). Off by default. Graphile fetches
+	 * the batch in one statement, which can take several jobs of one serial lane, so they
+	 * run at the same time: use it only on runners without lanes. Locked jobs wait
+	 * locally, so another worker cannot take them meanwhile.
 	 */
 	prefetch?: number | undefined
 	/**
@@ -150,12 +160,12 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 */
 	transactionalJobKeyMode?: JobKeyMode | undefined
 	/**
-	 * How long running jobs get after `stop()`, in milliseconds. `ctx.signal` aborts when it
-	 * ends; jobs still running 500 ms later are failed (their attempt spent) and unlocked,
-	 * and `stop()` resolves. Without it, `ctx.signal` aborts 5 seconds after `stop()` and
-	 * `stop()` waits for running jobs with no limit.
+	 * How long running jobs get after `stop()`, in milliseconds; defaults to 25 seconds.
+	 * `ctx.signal` aborts when it ends; jobs still running 500 ms later are failed (their
+	 * attempt spent) and unlocked, and `stop()` resolves. `false` leaves Graphile's own
+	 * shutdown: `ctx.signal` aborts after 5 seconds and `stop()` waits with no limit.
 	 */
-	shutdownGrace?: number | undefined
+	shutdownGrace?: number | false | undefined
 	/**
 	 * Run `migrate()` once before the first enqueue, prepare or admin read, for processes
 	 * that enqueue without starting a worker. Off by default: enqueue-only roles that
@@ -190,7 +200,7 @@ export type WorkerRunnerOptions = Pick<
 export type SharedWorkerOptions<TQueues extends readonly QueueContract[]> =
 	Omit<
 		BaseWorkerOptions<TQueues>,
-		'process' | Exclude<keyof WorkerRunnerOptions, 'prefetch'>
+		Exclude<keyof WorkerRunnerOptions, 'prefetch'>
 	>
 
 export type BetterWorker<TQueues extends readonly QueueContract[]> = {
@@ -311,6 +321,34 @@ export function assertPoolSize(pgPool: Pool, runners: number): void {
 }
 
 /**
+ * Graphile's prefetching fetch can take several jobs of one serial lane in one batch.
+ * Lanes from `deriveJobOptions` are only known per job, so a queue that derives options
+ * counts too.
+ */
+function warnPrefetchWithLanes(
+	queues: readonly QueueContract[],
+	prefetch: number,
+	logger: JobLogger,
+	runner: string | undefined
+) {
+	if (!prefetch) return
+	const laned = queues
+		.filter(
+			(queue) =>
+				resolveSerialQueueName(queue.serial, queue.name, isCronQueue(queue)) !==
+					undefined || queue.deriveJobOptions !== undefined
+		)
+		.map((queue) => queue.name)
+	if (laned.length)
+		logger.warn('worker.prefetch.lanes', {
+			runner,
+			queues: laned.join(','),
+			message:
+				'prefetch can run several jobs of one serial lane at once (Graphile fetches them in one batch); set prefetch: 0 on runners whose queues use lanes'
+		})
+}
+
+/**
  * A worker pool's runners share one history, so any of them reports all its jobs, and
  * one maintenance loop.
  */
@@ -318,11 +356,13 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 	options: BetterWorkerOptions<TQueues>,
 	completedJobs: CompletedJobsStore,
 	runnerName?: string,
-	maintenanceLoop: Maintenance = createMaintenance()
+	maintenanceLoop: Maintenance = createMaintenance(),
+	/** A pool runner's queues; a single worker runs them all. */
+	processed?: readonly string[]
 ): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
 	const registered = normalizeWorkerQueues(options.queues, options.handlers)
-	const queues = selectProcessed(registered, options.process)
+	const queues = selectProcessed(registered, processed)
 	const failureHooks = new Map(
 		registered.map((queue) => [queue.name, queue.onPermanentFailure])
 	)
@@ -334,10 +374,18 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		1,
 		2147483647
 	)
-	if (options.defaultTimeout !== undefined)
-		assertInteger(options.defaultTimeout, 'defaultTimeout', 1, 2147483647)
-	if (options.prefetch !== undefined)
-		assertInteger(options.prefetch, 'prefetch', 0)
+	const defaultTimeout =
+		options.defaultTimeout === false
+			? undefined
+			: (options.defaultTimeout ?? DEFAULT_TIMEOUT)
+	if (defaultTimeout !== undefined)
+		assertInteger(defaultTimeout, 'defaultTimeout', 1, 2147483647)
+	const prefetch = options.prefetch ?? 0
+	assertInteger(prefetch, 'prefetch', 0)
+	const shutdownGrace =
+		options.shutdownGrace === false
+			? undefined
+			: (options.shutdownGrace ?? DEFAULT_SHUTDOWN_GRACE)
 	if (options.secondLookOnNotify !== undefined)
 		assertInteger(
 			options.secondLookOnNotify,
@@ -345,8 +393,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			0,
 			2147483647
 		)
-	if (options.shutdownGrace !== undefined)
-		assertInteger(options.shutdownGrace, 'shutdownGrace', 0, 2147483647)
+	if (shutdownGrace !== undefined)
+		assertInteger(shutdownGrace, 'shutdownGrace', 0, 2147483647)
 
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 	const restart = resolveRestart(options.restart)
@@ -412,7 +460,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			)
 		}
 	}
-	const runtime = {
+	const runtime: TaskListRuntime<TQueues> = {
 		hooks,
 		completedJobs,
 		createJob: producer.enqueueOne,
@@ -421,7 +469,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		schema,
 		otel,
 		permanentFailure: options.permanentFailure,
-		defaultTimeout: options.defaultTimeout,
+		defaultTimeout,
 		jobOutcomes: outcomeRetention !== undefined,
 		heartbeatReady: () => maintenance?.ready,
 		queues: options.queues,
@@ -466,7 +514,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			if (!restarting) {
 				if (runnerName === undefined) assertPoolSize(options.pgPool, 1)
 				logger.info('Starting graphile-worker')
-				logRegisteredQueues(queues, logger, options.defaultTimeout)
+				logRegisteredQueues(queues, logger, defaultTimeout)
+				warnPrefetchWithLanes(queues, prefetch, logger, runnerName)
 			}
 			const maintained = await prepareTables()
 			return startRunner({
@@ -481,7 +530,10 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				secondLookOnNotify: options.secondLookOnNotify,
 				prefetch: options.prefetch,
 				runnerName,
-				shutdownGrace: options.shutdownGrace,
+				shutdownGrace,
+				onNudge: (nudge) => {
+					runtime.nudge = nudge
+				},
 				onForcedShutdown: () => reportShutdownFailures(runtime),
 				maintain: maintained
 					? (workerId) =>
@@ -545,8 +597,13 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		start: () => lifecycle.start(),
 		stop(stopOptions) {
 			const probe = resolveDatabaseProbe(stopOptions?.probeDatabase)
-			const stopping = lifecycle.stop(stopOptions?.timeout)
-			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
+			const lifecycleStop = lifecycle.stop(stopOptions?.timeout)
+			const stopping = probe
+				? whileReachable(lifecycleStop, options.pgPool, probe)
+				: lifecycleStop
+			return stopOptions?.endPool
+				? thenEndPool(stopping, options.pgPool)
+				: stopping
 		},
 		waitUntilStopped: () => lifecycle.waitUntilStopped(),
 		runOnce: () =>
@@ -633,7 +690,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			return getQueueDefinitions(
 				options.queues,
 				options.defaultMaxAttempts,
-				options.defaultTimeout
+				defaultTimeout
 			)
 		}
 	}

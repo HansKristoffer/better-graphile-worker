@@ -8,6 +8,7 @@ import {
 import {
 	CRON_INIT_SUFFIX,
 	getQueueType,
+	isCronQueue,
 	resolveSerialQueueName,
 	type DerivedJobOptions,
 	type QueueContract
@@ -42,7 +43,7 @@ import {
 } from './enqueue-sql.js'
 import { assertValidSchemaName } from './schema-name.js'
 import {
-	enqueueInTransaction,
+	runPreparedJob,
 	type EnqueueInTransactionOptions,
 	type RawQueryClient
 } from './prisma.js'
@@ -222,7 +223,7 @@ export function resolveEnqueueSpec(
 		queueName:
 			options?.queueName ??
 			cronOptions?.queueName ??
-			resolveSerialQueueName(queue.serial, queue.name),
+			resolveSerialQueueName(queue.serial, queue.name, isCronQueue(queue)),
 		runAt:
 			options?.runAt ??
 			(delay === undefined ? undefined : new Date(Date.now() + delay)),
@@ -287,7 +288,9 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 		jobOptions?: JobOptions,
 		index?: number
 	) {
-		// Validate the wire input; transforms are applied again by the consumer.
+		// Validate the wire input; transforms are applied again by the consumer. The
+		// snapshot also fixes the value at call time: a caller that reuses and mutates one
+		// object across concurrent enqueues still stores each value it passed.
 		let snapshot: unknown
 		if (payloadMode === 'json-compat') snapshot = toJsonCompat(data)
 		else {
@@ -582,7 +585,7 @@ export function bindCreateJob<const T extends readonly QueueContract[]>(
 			jobOptions,
 			transactionalJobKeyMode
 		)
-		const [id] = await enqueueInTransaction(tx, prepared, transactionOptions)
+		const [id] = await runPreparedJob(tx, prepared, transactionOptions)
 		return id ?? null
 	}
 	/** `prepareJob` takes a queue name and arguments, or one `JobRequest` object. */

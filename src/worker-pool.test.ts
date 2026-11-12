@@ -299,7 +299,7 @@ suite('worker pool on PostgreSQL', () => {
 		expect(reply).not.toBe(digest)
 		const history = workers
 			.getCompletedJobs()
-			.map((job) => job.queueName)
+			.map((job) => job.queue)
 			.sort()
 		expect(history).toEqual(['digest', 'reply'])
 		expect(workers.runners.turn.getCompletedJobs()).toHaveLength(2)

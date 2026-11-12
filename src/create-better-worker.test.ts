@@ -3,6 +3,7 @@ import { z } from 'zod'
 import type { Pool } from 'pg'
 import { defineQueue } from './queue.js'
 import { createBetterWorker } from './create-better-worker.js'
+import { lazyWorker } from './lazy.js'
 import type { JobLogger } from './hooks.js'
 
 const silentLogger: JobLogger = {
@@ -108,4 +109,82 @@ test('handler-free contracts require a handler registry', () => {
 		// @ts-expect-error A handler-free queue cannot run by itself.
 		createBetterWorker({ pgPool: {} as Pool, queues: [sendEmail] })
 	).toThrow('requires a processFn')
+})
+
+describe('3.0 defaults', () => {
+	const tick = defineQueue({ name: 'tick', cron: '* * * * *' })
+	const overlapping = defineQueue({
+		name: 'overlapping',
+		cron: '* * * * *',
+		serial: false
+	})
+	const unlimited = defineQueue({
+		name: 'unlimited',
+		inputSchema: z.string(),
+		timeout: false
+	})
+	const make = (options: { defaultTimeout?: number | false } = {}) =>
+		createBetterWorker({
+			pgPool: {} as Pool,
+			queues: [sendEmail, tick, overlapping, unlimited],
+			handlers: {
+				sendEmail: () => {},
+				tick: () => {},
+				overlapping: () => {},
+				unlimited: () => {}
+			},
+			...options
+		})
+
+	test('plain cron queues get their own lane unless serial is false', () => {
+		const items = make().buildCronItems()
+		expect(items.map((item) => [item.task, item.options?.queueName])).toEqual([
+			['tick', 'tick'],
+			['overlapping', undefined]
+		])
+		expect(
+			make()
+				.getQueueDefinitions()
+				.map(({ name, serial }) => [name, serial])
+		).toEqual([
+			['sendEmail', null],
+			['tick', true],
+			['overlapping', false],
+			['unlimited', null]
+		])
+	})
+
+	test('attempts time out below Graphile reclaim unless the worker or queue says false', () => {
+		const timeouts = (worker: ReturnType<typeof make>) =>
+			worker.getQueueDefinitions().map(({ timeout }) => timeout)
+		expect(timeouts(make())).toEqual([13_800_000, 13_800_000, 13_800_000, null])
+		expect(timeouts(make({ defaultTimeout: false }))).toEqual([
+			null,
+			null,
+			null,
+			null
+		])
+		expect(timeouts(make({ defaultTimeout: 60_000 }))).toEqual([
+			60_000,
+			60_000,
+			60_000,
+			null
+		])
+	})
+})
+
+test('lazyWorker builds the worker on first use, once', () => {
+	let built = 0
+	const worker = lazyWorker(() => {
+		built++
+		return createTestWorker()
+	})
+	expect(built).toBe(0)
+	expect(worker.getQueueDefinitions().map(({ name }) => name)).toEqual([
+		'sendEmail',
+		'dailySweep'
+	])
+	expect(worker.schema).toBe('graphile_worker')
+	expect('createJob' in worker).toBe(true)
+	expect(built).toBe(1)
 })

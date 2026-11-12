@@ -113,6 +113,41 @@ A process that enqueues without starting a worker (an API-only process, a script
 
 `isRegularQueue`, `isCronQueue`, `isCronInitQueue` and `hasInputSchema` preserve literal names, concrete schemas and any inline handlers while narrowing variants. Contract guards do not invent handler functions; worker construction checks the required functions.
 
+### The app's queue module
+
+Queue files import providers, providers enqueue through the app's worker, and the worker needs the registry of queue files. `lazyWorker` builds the worker or pool on first use, so that import cycle never reads the registry while modules load and needs no `require()` or dynamic import. Read members when you call them (`workers.createJob(...)`); destructuring at module load builds the worker then.
+
+```ts
+// lib/queue.ts
+import pg from 'pg'
+import { createBetterWorkerPool, lazyWorker, pgPoolSize } from 'better-graphile-worker'
+import { queues } from '../registries/queues'
+
+const runners = { default: { concurrency: 10 }, background: { concurrency: 4 } }
+
+export const workers = lazyWorker(() => {
+  const pgPool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: pgPoolSize(runners, { queues, defaultRunner: 'default' }) + 4 // + producer headroom
+  })
+  pgPool.on('error', (error) => logger.error('pg pool', { error: String(error) }))
+  return createBetterWorkerPool({
+    pgPool,
+    queues,
+    runners,
+    defaultRunner: 'default',
+    autoMigrate: true, // API-only processes enqueue without starting the pool
+    shutdownGrace: 25_000, // your platform's drain window minus a margin
+    hooks: { jobAttributes: ({ payload }) => tenantIds(payload) }
+  })
+})
+
+// Worker entry: await workers.start(), then on SIGTERM:
+export const stopWorkers = () => workers.stop({ probeDatabase: true, endPool: true })
+```
+
+Producers call `workers.createJob`, `workers.enqueueInTransaction` and `workers.jobs.*`; tests replace the module with a [harness](#testing) (`harness.createJob`). Development start hooks run `better-graphile-worker release-locks --all <url>`.
+
 ## Queues, defaults and batching
 
 | Kind | Contract | Handler | Manual trigger |
@@ -125,7 +160,7 @@ A library queue is a Graphile task identifier. `serial: true` sets its Graphile 
 
 Defaults follow explicit job options, then `deriveJobOptions` (or cron options for cron operations), then queue defaults, then `defaultMaxAttempts`, then the library default of 4. `delay: '5s'` (or milliseconds) runs a job no earlier than that long after the enqueue; an explicit `runAt` wins. Native schedules and manual cron triggers inherit serial queues, priority and retry defaults. Native Graphile cron does not support queue flags; manual triggers do. `backfillPeriod` belongs to native scheduling. Graphile uses the database clock unless `graphile.useNodeTime` is enabled.
 
-A cron tick that outlasts its period runs next to the next tick unless the queue is `serial`, and nothing bounds that without a [timeout](#timeouts). A short-period maintenance cron usually wants `serial: true`, a `timeout` and `maxAttempts: 1`, since the next tick retries anyway.
+A plain cron queue (no `inputSchema`) is serial by default, so a tick that outlasts its period waits for the previous one instead of running next to it; `serial: false` lets ticks overlap. A short-period maintenance cron usually also wants a `timeout` shorter than its period and `maxAttempts: 1`, since the next tick retries anyway.
 
 `createJob` creates one job even for array schemas. `createJobs` accepts a readonly array and performs one atomic SQL statement after validating every input; failures include the item index. Shared `jobKey` and `jobKeyMode` are unavailable in batch options; per-item keys come from `deriveJobOptions` (below). Within one batch, keys must be distinct and every keyed item must use the same mode, `replace` or `preserve_run_at`. Ids are returned in input order. Batches are never automatically chunked, since that would change atomicity. Keyed array jobs replace a single payload consistently, regardless of tracing.
 
@@ -197,20 +232,20 @@ await worker.createJob('sendEmail', input, { idempotencyKey: `welcome:${userId}`
 
 `prepareJob` and `prepareJobs` validate, derive options and build the envelope, then return SQL (`text`, scalar `values`) instead of enqueueing. Run it in your own transaction so a state change and its job commit together. Prepare before opening the transaction; the statement has no effect until executed. Check for one non-null `id` per input inside the transaction: Graphile 0.17.3 can return fewer jobs if a worker locks a job whose key the enqueue is replacing. `prepareJobs` returns its rows in input order. No rows are expected when `shouldSkipEnqueue()` applied (`skipped: true`) or the batch is empty. `onEnqueueFail` covers prepare errors only; execution errors surface in your transaction. Run `migrate()` first.
 
-`prepareJob` also takes one job as an object, `prepareJob({ task, payload, ...options })`, the same `JobRequest` that `enqueueInTransaction` takes below. A union of jobs across queues then prepares without a branch per queue.
+`prepareJob` also takes one job as an object, `prepareJob({ task, payload, ...options })`, the same `JobRequest` that `worker.enqueueInTransaction` takes below. A union of jobs across queues then prepares without a branch per queue.
 
 ```ts
-import { enqueueInTransaction } from 'better-graphile-worker/prisma'
+import { runPreparedJob } from 'better-graphile-worker/prisma'
 
 const job = await worker.prepareJob('advanceRun', { shopId, runId })
 await prisma.$transaction(async (tx) => {
   await tx.run.update({ where: { id: runId, status: 'sealed' }, data: { status: 'approved' } })
-  const [jobId] = await enqueueInTransaction(tx, job)
+  const [jobId] = await runPreparedJob(tx, job)
 })
 // node-postgres: await client.query(job.text, job.values) between BEGIN and COMMIT
 ```
 
-`enqueueInTransaction` runs the statement through `$queryRawUnsafe` and returns the job ids in input order (none when skipped or empty). A single job that lost that key race is run again in the same transaction, up to two more times; the rerun sees the locked job and frees its key. A batch, or a job that keeps losing, throws `EnqueueCountError` (with `queue`, `expected` and `actual`), which rolls the transaction back; retry the transaction. It works with any client whose `$queryRawUnsafe(query, ...values)` resolves to the rows, generic like Prisma's or not, such as your own transaction seam (`RawQueryClient`); the rows are checked at runtime. The package does not depend on Prisma.
+`runPreparedJob` runs the statement through `$queryRawUnsafe` and returns the job ids in input order (none when skipped or empty). A single job that lost that key race is run again in the same transaction, up to two more times; the rerun sees the locked job and frees its key. A batch, or a job that keeps losing, throws `EnqueueCountError` (with `queue`, `expected` and `actual`), which rolls the transaction back; retry the transaction. It works with any client whose `$queryRawUnsafe(query, ...values)` resolves to the rows, generic like Prisma's or not, such as your own transaction seam (`RawQueryClient`); the rows are checked at runtime. The package does not depend on Prisma.
 
 Pass `{ required: true }` when the transaction must not commit without its jobs: a statement skipped by `shouldSkipEnqueue()` then throws `EnqueueSkippedError` instead of returning no ids. Immediate enqueues rerun the same race: a keyed batch runs in its own transaction and rolls back before each rerun, so a final `EnqueueCountError` means nothing was enqueued.
 
@@ -232,13 +267,7 @@ await prisma.$transaction(async (tx) => {
 
 Re-adding a key held by a running job clears that job's key and exhausts its attempts, so it will not be retried if it later fails. Only the job's own continuation should reuse its key. If another producer has already replaced a running job's key, its continuation remains unkeyed and does not overwrite the replacement.
 
-`process` limits an instance to some queues (and their cron schedules) while enqueueing still covers all of them, so separate instances give workloads their own concurrency. Two instances with disjoint lists never schedule the same cron. `runOnce()` follows the same list. Contract-mode workers still need handlers for every queue. Size a shared pool for `Σ concurrency + 2 per started instance (LISTEN and maintenance) + producer headroom`.
-
-```ts
-const exportsWorker = createBetterWorker({ pgPool, queues, process: ['exportRun'], concurrency: 2 })
-const apiWorker = createBetterWorker({ pgPool, queues, process: ['advanceRun'], concurrency: 8 })
-await Promise.all([exportsWorker.start(), apiWorker.start()])
-```
+To give workloads their own concurrency, use a [worker pool](#worker-pools).
 
 ### Worker pools
 
@@ -274,7 +303,9 @@ Each started runner holds Graphile's LISTEN client for as long as it runs, which
 
 Every worker on a database wakes on each new job, and Graphile's fetch locks every available serial lane, not only its own queues' lanes. A worker that is fetching for another queue can hide a lane's job from the worker that should take it, which then waits for its next poll. `secondLookOnNotify: milliseconds` fetches once more that long after each new-job notification. It costs one extra fetch per insert; set it on runners where poll latency matters. It works on `createBetterWorker` too.
 
-`prefetch: n` fetches and locks up to `concurrency + n` jobs at once (Graphile's `localQueue.size`), so the next job is already local when a slot frees; `1` follows Graphile's `concurrency + 1` advice. Prefetched jobs stay locked to this runner until it takes them, so another worker cannot run them meanwhile. A `localQueue` in your `graphile.preset` takes precedence.
+A serial lane's next job starts as soon as the previous one finishes: the worker completes a lane job itself, which frees the lane, and fetches again. Graphile would complete it in a batch after the task returns and send no notification, so the next job waited for a poll; that is why `pollInterval` now defaults to 1 second. It still bounds how late a delayed job or a retry starts.
+
+`prefetch: n` fetches and locks up to `concurrency + n` jobs at once (Graphile's `localQueue.size`), so the next job is already local when a slot frees. That nearly doubles throughput on a runner of short jobs. **Do not use it on a runner whose queues use lanes** (`serial`, a derived `queueName`, or a plain cron queue): Graphile fetches the batch in one statement, which can take several jobs of one lane, and they then run at the same time. A runner with `prefetch` and such queues logs `worker.prefetch.lanes` at start. Prefetched jobs stay locked to this runner until it takes them, so another worker cannot run them meanwhile. A `localQueue` in your `graphile.preset` takes precedence.
 
 Keep individual executions below 4 hours: Graphile can reclaim a live job beyond that threshold and run it a second time; a `timeout` below 4 hours enforces this. The startup log lists each queue with its effective timeout, `no timeout` included.
 
@@ -302,7 +333,7 @@ The risk is a worker that is alive but cannot heartbeat for `staleAfter`. It loo
 
 ### Timeouts
 
-Graphile has no execution time limit: a hung handler holds its lock and its lane until it returns. Set `timeout` (milliseconds) on a queue, or `defaultTimeout` on a worker for every queue without its own.
+Graphile has no execution time limit: a hung handler holds its lock and its lane until it returns, and after 4 hours Graphile can reclaim the job and run it a second time. So an attempt times out after `defaultTimeout`, 3 h 50 min unless you set it on the worker. Set `timeout` (milliseconds) on a queue to override it, and `false` on either for no limit.
 
 ```ts
 const exportRun = defineQueue({
@@ -412,6 +443,164 @@ const when = await ctx.step.run('timestamp-v1', () => new Date(), {
 
 Use the same result type and codec for every use of an ID. Version IDs when the stored format changes. Checkpoints cannot guarantee exactly-once external effects: a process can crash after an effect but before its checkpoint. External effects must be idempotent. Steps memoize results; to wait for other jobs, see [Waiting on child jobs](#waiting-on-child-jobs). For a durable sleep, use `ctx.continue({ runAt })`.
 
+## Lifecycle and observability
+
+Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
+
+`stop()` stops fetching and gives running jobs `shutdownGrace`, 25 seconds by default, which fits the 30 seconds most platforms give a stopping process. Set it to your platform's drain window minus a margin:
+
+```ts
+const workers = createBetterWorkerPool({
+  // ...
+  shutdownGrace: 55 * 60_000 // a one-hour drain window
+})
+``` Running jobs get that long. `ctx.signal` aborts when it ends, and jobs still running 500 ms later are failed and unlocked at once (their attempt spent, as a crash would), so `stop()` resolves and another worker can retry them without waiting for crash recovery. A job cut off on its last attempt reaches `onPermanentFailure` with `reason: 'shutdown'`. A handler that ignores its signal keeps running, detached, until the process exits. If the process exits before `stop()` resolves anyway, its jobs stay locked until [crash recovery](#crash-recovery) releases them. `shutdownGrace: false` leaves Graphile's own behaviour: `ctx.signal` aborts after 5 seconds and `stop()` waits with no limit.
+
+`stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`, and its `gracefulShutdownAbortTimeout` wins over `shutdownGrace`.
+
+When the database goes away, Graphile's stop waits forever on queries that will never return. `stop({ probeDatabase: true })` waits only while the database answers: it opens a fresh connection outside the pool every second and runs `SELECT 1`, and rejects with `DatabaseUnreachableError` once a probe gets no answer within 2 seconds. Tune both with `probeDatabase: { interval, timeout }` in milliseconds. A server that answers with an error, such as too many connections, counts as reachable, so a busy database never cuts a shutdown short. A fast stop finishes before the first probe. Shutdown continues in the background, as after a timeout. The pool is still yours: after `DatabaseUnreachableError`, its checked-out clients may never be released, so don't wait for `pgPool.end()`:
+
+```ts
+try {
+  await workers.stop({ probeDatabase: true })
+  await pgPool.end()
+} catch (error) {
+  if (!(error instanceof DatabaseUnreachableError)) throw error
+  void pgPool.end() // the database is gone; exit without waiting
+}
+```
+
+`stop({ probeDatabase: true, endPool: true })` does the same in one call, for a process that exits next: it ends the pool after the stop, or without waiting after `DatabaseUnreachableError`, which it still rejects with.
+
+Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail`, [`onRunnerStopped`](#when-graphile-stops-a-worker), `shouldSkipEnqueue` and `jobAttributes`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` runs for [every way a job fails for good](#when-a-job-fails-for-good) and receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `jobAttributes: ({ queue, payload }) => ({ organization_id: payload.organizationId })` returns attributes to set on each job's span, pass to `createLogger` as `attributes` (the default logger adds them to every line) and add to `onJobFinished`; it is synchronous, and a throwing hook adds nothing. `onJobFinished` also reports `waitMs`, how long the job waited past its `run_at` before its handler started, by this process's clock against the database's. `shouldSkipEnqueue({ queue })` is a behavioral decision; its errors propagate.
+
+Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` (every path that fails a job for good), `graphile_job_wait_ms` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
+
+### When Graphile stops a worker
+
+Graphile can stop a worker by itself, for example when it cannot record a job's completion during a database outage. The worker then starts a new runner, and keeps trying while the database is unreachable:
+
+```ts
+createBetterWorker({
+	// ...
+	restart: { delay: 1_000, maxDelay: 30_000 } // the defaults; `false` turns it off
+})
+```
+
+It logs `worker.runner.stopped` as an error, with Graphile's reason in `error`, and tries again after `delay` milliseconds. Each failed try logs `worker.runner.restart_failed` and doubles the wait, up to `maxDelay`; success logs `worker.runner.restarted`. All three carry `runner` (in a pool), `restart_attempt` and, before a try, `restart_in_ms`.
+
+To report the stop, for example to an error tracker, use the `onRunnerStopped` hook rather than matching the log. It fires once per stop Graphile made by itself, before the first restart try, with `runner` (undefined for a single worker), the `error` (usually a `WorkerStoppedError` whose `cause` is Graphile's reason), `restartAttempt` and `restartInMs`. Failed restart tries do not call it again. The restart does not wait for it, and its errors are reported without affecting the restart.
+
+```ts
+hooks: {
+	onRunnerStopped: ({ runner, error }) => reportError(error, { runner })
+}
+```
+
+- `promise` and `waitUntilStopped()` stay pending through restarts. They settle only when `stop()` finishes, and `stop()` also cancels a restart that is waiting.
+- Only restarts retry. If the database is unreachable when you first call `start()`, it rejects.
+- The job whose completion could not be recorded stays locked by the stopped runner, and so may jobs it had prefetched. With crash recovery, they are released once that runner's heartbeat is `staleAfter` old (5 minutes by default) and run again as a failed attempt. Without it, Graphile's 4-hour scan releases them. Make their external effects idempotent.
+
+With `restart: false`, `onRunnerStopped` is not called: `promise` and `waitUntilStopped()` reject with `WorkerStoppedError` instead, whose `cause` carries Graphile's reason. A pool then stops its other runners too, and nothing starts them again. Watch `promise`, and exit or call `start()` again:
+
+```ts
+await workers.start()
+workers.promise.catch((error) => {
+	logger.error('worker stopped', { error })
+	process.exit(1)
+})
+```
+
+## Administration, CLI and testing
+
+```ts
+await worker.getJobStats()
+const first = await worker.listJobs({ limit: 50, state: 'failed', includePayload: false })
+const last = first.at(-1)
+if (last) await worker.listJobs({ limit: 50, state: 'failed', includePayload: false, before: last.cursor })
+await worker.retryJobs(['123'])
+await worker.failJobs(['123'], 'gave up') // also calls onPermanentFailure
+await worker.getJobProgress('importOrders', '123')
+await worker.getJobByKey('file-text:abc') // the live job with this jobKey, payload included, or null
+await worker.removeJob('file-text:abc') // Graphile's removeJob: its id, or null
+await worker.deleteFailedJobs('30d') // permanently failed jobs not updated for 30 days
+await worker.enqueueByName(name, payload) // a name known only at runtime, validated like createJob
+worker.getQueueDefinitions()
+```
+
+`enqueueByName` takes an untyped name and payload, for admin routes and scripts. A cron queue, or a cron-init queue without a payload, triggers its cron run; anything else goes through `createJob`. `listJobs({ key })` filters by `jobKey`. Listed jobs, `getJobStats()` rows and the completed-jobs history name the Graphile task `queue`. A listed job's `lane` is its serial lane.
+
+`pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. That history is kept in memory by the process that ran the jobs: an API process that runs no jobs has an empty one, and two worker pods each have their own. For a durable record per job, use [job outcomes](#looking-up-a-job-after-it-finishes). Database failures cannot be hidden by local history.
+
+Metadata uses Graphile's public `jobs` view. `includePayload` defaults to false and returns null payloads. Set it to true to add the private-table debugging join and inspect business payloads. Listing validates integer limits (0–1000), offsets and states. Use the returned `cursor` to retain PostgreSQL timestamp precision; the display `createdAt` loses sub-millisecond precision. Cursor and offset cannot be combined. Counts scan current jobs; avoid unnecessary high-frequency polling on large queues. Schema identifiers, including uppercase names, are quoted consistently.
+
+### Looking up a job after it finishes
+
+Graphile deletes a job once it succeeds. Set `jobOutcomes` on your workers to keep each job's final state in PostgreSQL, then look a job up by id from a worker or a job client:
+
+```ts
+const worker = createBetterWorker({
+  pgPool,
+  queues,
+  jobOutcomes: { retention: 14 * 24 * 60 * 60 * 1000 } // milliseconds; defaults to 7 days
+})
+await worker.migrate()
+
+const job = await producer.getJob(jobId)
+switch (job.state) {
+  case 'pending': // waiting for job.runAt
+  case 'running':
+  case 'retrying': // an attempt failed (job.lastError); the next one runs at job.runAt
+  case 'waiting': // ended at ctx.step.triggerAndWait; job.waitingOn lists the unfinished children
+    break
+  case 'completed':
+    break
+  case 'continued': // ctx.continue() ended this run; job.continuedTo is the next run's id
+    break
+  case 'failed': // permanently: attempts exhausted, NonRetriableError or failJobs
+    break
+  case 'not_found': // never existed, deleted outside the worker, or its outcome expired
+}
+```
+
+A job still in Graphile's table is reported from there, so a failed job that you retry reads `pending` again. Every state except `not_found` carries `queue` (the Graphile task identifier), `attempts`, `maxAttempts`, `createdAt` and `lastError`; finished states add `finishedAt`. Payloads are not stored.
+
+With the option on, a worker completes a successful job itself: it deletes the job and writes its outcome in one transaction while holding the job's lock. A continuation's enqueue, its outcome and the old run's removal also commit together. So within the retention period, a completed or continued job always has an outcome. If that write fails, the attempt fails and is retried, as with a failed step checkpoint. A failure outcome that cannot be written is logged, not raised. A permanently failed job also stays in Graphile's table unless you chose `permanentFailure: 'discard'`.
+
+Enable the option on every worker instance that processes jobs in the schema; an instance without it lets Graphile complete jobs and records nothing. Producers need no option: `getJob` reads live jobs either way, and recorded outcomes. Worker maintenance deletes expired outcomes. Worker roles need `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the table; roles that call `getJob` need `SELECT` on it and on Graphile's `jobs` view.
+
+### CLI
+
+```ts
+import { createCli } from 'better-graphile-worker/cli'
+await createCli(worker)(process.argv.slice(2))
+```
+
+Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `trigger-cron <name>`, `stats`, `list-jobs`, `get-job <id>`, `get-job --key <key>`, `retry <id>`, `fail <id>`, `release-locks [--all]`, `delete-failed <duration>`, `run-once`. `create-job` on a cron queue without a payload triggers its run, like `trigger-cron`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
+
+Help, `list-queues` and `schema` only read the registry and never connect, so they work without a database. `createCli(worker, { migrate: true })` runs `worker.migrate()` before every other command, and only then. The `better-graphile-worker` binary has only `release-locks` (see [crash recovery](#crash-recovery)) and needs no registry.
+
+### Testing
+
+```ts
+import { createTestHarness } from 'better-graphile-worker/testing'
+const harness = createTestHarness(queues) // or one queue: createTestHarness([sendEmail])
+await harness.process('sendEmail', { to: 'person@example.com' })
+await harness.process('sendEmail', { to: 'person@example.com' }, { attempt: 5, maxAttempts: 5 }) // the last attempt
+console.log(harness.logs, harness.enqueued, harness.continued)
+```
+
+Code under test that enqueues through your app's producer can use the harness's instead: `harness.createJob`, `createJobs`, `enqueueInTransaction` (the transaction is ignored) and `triggerCron` validate and derive options exactly as the worker does, and record into `enqueued`. `await harness.drain()` then runs every enqueued job that has not run yet, and the jobs those enqueue, in order until none is left, ignoring `runAt`; a cron-init trigger runs its `initFn` and enqueues its items. It throws the first job's error, or after `maxJobs` runs (default 1000), and resolves to how many ran. Continuations stay in `continued`.
+
+```ts
+mock.module('../lib/queue', () => ({ createJob: harness.createJob }))
+await placeOrder(order)
+await harness.drain()
+expect(harness.enqueued.map((job) => job.queue)).toEqual(['chargeCard', 'sendReceipt'])
+```
+
+The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs, attempt 1 and the queue's own `maxAttempts` unless the extras say otherwise. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Waits run their children inline, once and in order, through the same validation and checkpoints; a child that throws is a failed result, without retries, and `timeout` is ignored. A waited child that calls `ctx.continue()` is rejected. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+
 ## Waiting on child jobs
 
 A handler can enqueue child jobs and wait for their results. While the children run, the parent holds no worker slot, no lane and no attempt, for minutes or days.
@@ -512,163 +701,26 @@ const job = await producer.getJobProgress('importOrders', jobId)
 - The `progressSchema` output must be JSON; encode dates as strings. Readers get the stored value without parsing it again, so a value written under an older schema is returned as it was stored. Change the shape compatibly, or version it.
 - `getJobProgress` takes the queue name so the result is typed, and returns `null` for a job of a different queue. A cron-init `initFn` has untyped progress that it can only use itself.
 
-## Lifecycle and observability
+## Upgrading from 2.x
 
-Concurrent `start()` calls share startup; stop during startup waits and shuts down the resulting runner. Starts during shutdown wait for completion. `runOnce()` requires an idle instance and cannot overlap another run. Call `stop()` and then `pgPool.end()` when finished.
+3.0 keeps the wire format, so producers and workers can be upgraded in any order without draining queues. What changes:
 
-`stop()` stops fetching and waits for running jobs, with no limit. Running jobs see `ctx.signal` abort 5 seconds after `stop()` starts (Graphile's `gracefulShutdownAbortTimeout`), so a handler that passes its signal to HTTP calls is aborted 5 seconds into every deploy, however long your platform's drain window is, and the abort spends an attempt. Set `shutdownGrace` to the time your platform gives a stopping process, minus a margin:
+1. **`process` is gone.** Give each group of queues a `runner` and use `createBetterWorkerPool` with one runner per former instance. `createBetterWorker({ queues, process: ['exportRun'], concurrency: 2 })` becomes a `runners: { exports: { concurrency: 2 } }` entry and `runner: 'exports'` on `exportRun`.
+2. **Defaults:**
+   - `defaultTimeout` is 3 h 50 min. Set `timeout` on a queue whose attempts run longer, or `defaultTimeout: false` for the old unlimited behaviour.
+   - `shutdownGrace` is 25 seconds, so `stop()` fails and unlocks jobs still running after it. Set it to your drain window minus a margin, or `false` for the old behaviour.
+   - Plain cron queues are serial. Add `serial: false` to a cron queue whose ticks must overlap.
+   - `pollInterval` is 1 second, since a lane's next job no longer waits for the poll. Set it lower only if delayed jobs or retries must start sooner.
+3. **Prefetch and lanes.** `prefetch` on a runner whose queues use lanes runs several jobs of one lane at once, a Graphile limitation that 2.x had too. Set `prefetch: 0` on such runners; the start-up warning `worker.prefetch.lanes` names their queues.
+4. **Renames and removals:**
+   - The free `enqueueInTransaction(tx, prepared)` from `better-graphile-worker/prisma` is `runPreparedJob(tx, prepared)`. `worker.enqueueInTransaction(tx, job)` is unchanged.
+   - `PrismaRawClient` is gone; use `RawQueryClient`.
+   - `createJobClient` and its types come from `better-graphile-worker/client` only.
+   - `ListedJob.queueName`, `CompletedJob.queueName` and `JobCountRow.taskIdentifier` are gone; use `queue`. `mergeJobStats` (advanced) takes rows with `queue`.
+   - `EnqueueAdapter.addJob` (advanced) resolves to `{ id }`; it no longer sends the job row back.
+   - `UniqueQueueNames<T>` is now the tuple with error messages in place of bad entries.
 
-```ts
-const workers = createBetterWorkerPool({
-  // ...
-  shutdownGrace: 25_000 // a 30-second drain window
-})
-```
-
-Running jobs then get that long. `ctx.signal` aborts when it ends, and jobs still running 500 ms later are failed and unlocked at once (their attempt spent, as a crash would), so `stop()` resolves and another worker can retry them without waiting for crash recovery. A job cut off on its last attempt reaches `onPermanentFailure` with `reason: 'shutdown'`. A handler that ignores its signal keeps running, detached, until the process exits. If the process exits before `stop()` resolves anyway, its jobs stay locked until [crash recovery](#crash-recovery) releases them.
-
-`stop({ timeout: milliseconds })` rejects with `ShutdownTimeoutError` if the deadline expires. Shutdown continues, the runner stays tracked, and a subsequent `stop()` or `waitUntilStopped()` can await it. Timers and optional signal listeners are cleaned up. Graphile's graceful-shutdown/abort options remain available under `graphile`, and its `gracefulShutdownAbortTimeout` wins over `shutdownGrace`.
-
-When the database goes away, Graphile's stop waits forever on queries that will never return. `stop({ probeDatabase: true })` waits only while the database answers: it opens a fresh connection outside the pool every second and runs `SELECT 1`, and rejects with `DatabaseUnreachableError` once a probe gets no answer within 2 seconds. Tune both with `probeDatabase: { interval, timeout }` in milliseconds. A server that answers with an error, such as too many connections, counts as reachable, so a busy database never cuts a shutdown short. A fast stop finishes before the first probe. Shutdown continues in the background, as after a timeout. The pool is still yours: after `DatabaseUnreachableError`, its checked-out clients may never be released, so don't wait for `pgPool.end()`:
-
-```ts
-try {
-  await workers.stop({ probeDatabase: true })
-  await pgPool.end()
-} catch (error) {
-  if (!(error instanceof DatabaseUnreachableError)) throw error
-  void pgPool.end() // the database is gone; exit without waiting
-}
-```
-
-Hooks include `createLogger`, `onJobFinished`, `onPermanentFailure`, `onEnqueueFail`, [`onRunnerStopped`](#when-graphile-stops-a-worker), `shouldSkipEnqueue` and `jobAttributes`. Observer hooks may return promises and are awaited; their errors are reported separately without changing acknowledgement or replacing a job error. Logger failures get a fallback. Keep observers quick: a slow observer still delays completion. A failed attempt's `job.completed` log carries `error_type` and `error_message` (trimmed to 500 characters); `onJobFinished` gets the full `errorMessage`. `onPermanentFailure` runs for [every way a job fails for good](#when-a-job-fails-for-good) and receives the job's `payload` so you can tag reports with tenant ids; it may contain personal data, so forward only what you need. `jobAttributes: ({ queue, payload }) => ({ organization_id: payload.organizationId })` returns attributes to set on each job's span, pass to `createLogger` as `attributes` (the default logger adds them to every line) and add to `onJobFinished`; it is synchronous, and a throwing hook adds nothing. `onJobFinished` also reports `waitMs`, how long the job waited past its `run_at` before its handler started, by this process's clock against the database's. `shouldSkipEnqueue({ queue })` is a behavioral decision; its errors propagate.
-
-Each instance captures `otel: { api }` (or detects the optional peer). Creating another instance cannot change its adapter. Pass `{ api: null }` to disable tracing. `otel: { api, metrics: true }` also records queue metrics on the `graphile-worker` meter: `graphile_job_total` and `graphile_job_duration_ms` (by `queue` and `status`), `graphile_job_permanently_failed_total` (every path that fails a job for good), `graphile_job_wait_ms` and `graphile_job_enqueue_fail_total` (by `queue`). A job client records only enqueue failures. `queueMetricDefinitions` lists these metrics (name, kind, unit, description and attribute keys, with values where the set is closed) for an app's metric catalog. Metrics are recorded before your hooks run, and a failing meter does not change job outcomes. Producer/consumer spans link through valid W3C trace contexts, including unsampled flags. Tracing method failures do not change job outcomes. Configure tracing through the instance options.
-
-### When Graphile stops a worker
-
-Graphile can stop a worker by itself, for example when it cannot record a job's completion during a database outage. The worker then starts a new runner, and keeps trying while the database is unreachable:
-
-```ts
-createBetterWorker({
-	// ...
-	restart: { delay: 1_000, maxDelay: 30_000 } // the defaults; `false` turns it off
-})
-```
-
-It logs `worker.runner.stopped` as an error, with Graphile's reason in `error`, and tries again after `delay` milliseconds. Each failed try logs `worker.runner.restart_failed` and doubles the wait, up to `maxDelay`; success logs `worker.runner.restarted`. All three carry `runner` (in a pool), `restart_attempt` and, before a try, `restart_in_ms`.
-
-To report the stop, for example to an error tracker, use the `onRunnerStopped` hook rather than matching the log. It fires once per stop Graphile made by itself, before the first restart try, with `runner` (undefined for a single worker), the `error` (usually a `WorkerStoppedError` whose `cause` is Graphile's reason), `restartAttempt` and `restartInMs`. Failed restart tries do not call it again. The restart does not wait for it, and its errors are reported without affecting the restart.
-
-```ts
-hooks: {
-	onRunnerStopped: ({ runner, error }) => reportError(error, { runner })
-}
-```
-
-- `promise` and `waitUntilStopped()` stay pending through restarts. They settle only when `stop()` finishes, and `stop()` also cancels a restart that is waiting.
-- Only restarts retry. If the database is unreachable when you first call `start()`, it rejects.
-- The job whose completion could not be recorded stays locked by the stopped runner, and so may jobs it had prefetched. With crash recovery, they are released once that runner's heartbeat is `staleAfter` old (5 minutes by default) and run again as a failed attempt. Without it, Graphile's 4-hour scan releases them. Make their external effects idempotent.
-
-With `restart: false`, `onRunnerStopped` is not called: `promise` and `waitUntilStopped()` reject with `WorkerStoppedError` instead, whose `cause` carries Graphile's reason. A pool then stops its other runners too, and nothing starts them again. Watch `promise`, and exit or call `start()` again:
-
-```ts
-await workers.start()
-workers.promise.catch((error) => {
-	logger.error('worker stopped', { error })
-	process.exit(1)
-})
-```
-
-## Administration, CLI and testing
-
-```ts
-await worker.getJobStats()
-const first = await worker.listJobs({ limit: 50, state: 'failed', includePayload: false })
-const last = first.at(-1)
-if (last) await worker.listJobs({ limit: 50, state: 'failed', includePayload: false, before: last.cursor })
-await worker.retryJobs(['123'])
-await worker.failJobs(['123'], 'gave up') // also calls onPermanentFailure
-await worker.getJobProgress('importOrders', '123')
-await worker.getJobByKey('file-text:abc') // the live job with this jobKey, payload included, or null
-await worker.removeJob('file-text:abc') // Graphile's removeJob: its id, or null
-await worker.deleteFailedJobs('30d') // permanently failed jobs not updated for 30 days
-await worker.enqueueByName(name, payload) // a name known only at runtime, validated like createJob
-worker.getQueueDefinitions()
-```
-
-`enqueueByName` takes an untyped name and payload, for admin routes and scripts. A cron queue, or a cron-init queue without a payload, triggers its cron run; anything else goes through `createJob`. `listJobs({ key })` filters by `jobKey`. Listed jobs, `getJobStats()` rows and the completed-jobs history name the Graphile task `queue`; their older `queueName` and `taskIdentifier` fields mean the same and are deprecated. A listed job's `lane` is its serial lane.
-
-`pending`, `running` and `failed` are current PostgreSQL states. `recentCompleted` and `recentFailed` count entries in this instance's optional bounded history (`completedJobs: { maxPerQueue: 50 }`); they are neither durable nor lifetime totals. For a durable record per job, use [job outcomes](#looking-up-a-job-after-it-finishes). Database failures cannot be hidden by local history.
-
-Metadata uses Graphile's public `jobs` view. `includePayload` defaults to false and returns null payloads. Set it to true to add the private-table debugging join and inspect business payloads. Listing validates integer limits (0–1000), offsets and states. Use the returned `cursor` to retain PostgreSQL timestamp precision; the display `createdAt` loses sub-millisecond precision. Cursor and offset cannot be combined. Counts scan current jobs; avoid unnecessary high-frequency polling on large queues. Schema identifiers, including uppercase names, are quoted consistently.
-
-### Looking up a job after it finishes
-
-Graphile deletes a job once it succeeds. Set `jobOutcomes` on your workers to keep each job's final state in PostgreSQL, then look a job up by id from a worker or a job client:
-
-```ts
-const worker = createBetterWorker({
-  pgPool,
-  queues,
-  jobOutcomes: { retention: 14 * 24 * 60 * 60 * 1000 } // milliseconds; defaults to 7 days
-})
-await worker.migrate()
-
-const job = await producer.getJob(jobId)
-switch (job.state) {
-  case 'pending': // waiting for job.runAt
-  case 'running':
-  case 'retrying': // an attempt failed (job.lastError); the next one runs at job.runAt
-  case 'waiting': // ended at ctx.step.triggerAndWait; job.waitingOn lists the unfinished children
-    break
-  case 'completed':
-    break
-  case 'continued': // ctx.continue() ended this run; job.continuedTo is the next run's id
-    break
-  case 'failed': // permanently: attempts exhausted, NonRetriableError or failJobs
-    break
-  case 'not_found': // never existed, deleted outside the worker, or its outcome expired
-}
-```
-
-A job still in Graphile's table is reported from there, so a failed job that you retry reads `pending` again. Every state except `not_found` carries `queue` (the Graphile task identifier), `attempts`, `maxAttempts`, `createdAt` and `lastError`; finished states add `finishedAt`. Payloads are not stored.
-
-With the option on, a worker completes a successful job itself: it deletes the job and writes its outcome in one transaction while holding the job's lock. A continuation's enqueue, its outcome and the old run's removal also commit together. So within the retention period, a completed or continued job always has an outcome. If that write fails, the attempt fails and is retried, as with a failed step checkpoint. A failure outcome that cannot be written is logged, not raised. A permanently failed job also stays in Graphile's table unless you chose `permanentFailure: 'discard'`.
-
-Enable the option on every worker instance that processes jobs in the schema; an instance without it lets Graphile complete jobs and records nothing. Producers need no option: `getJob` reads live jobs either way, and recorded outcomes. Worker maintenance deletes expired outcomes. Worker roles need `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the table; roles that call `getJob` need `SELECT` on it and on Graphile's `jobs` view.
-
-### CLI
-
-```ts
-import { createCli } from 'better-graphile-worker/cli'
-await createCli(worker)(process.argv.slice(2))
-```
-
-Commands: `list-queues`, `schema <name>`, `create-job <name> [json]`, `trigger-cron <name>`, `stats`, `list-jobs`, `get-job <id>`, `get-job --key <key>`, `retry <id>`, `fail <id>`, `release-locks [--all]`, `delete-failed <duration>`, `run-once`. `create-job` on a cron queue without a payload triggers its run, like `trigger-cron`. `--json` uses the same structured error path for argument and execution errors. Schema help describes producer input, including transforms.
-
-Help, `list-queues` and `schema` only read the registry and never connect, so they work without a database. `createCli(worker, { migrate: true })` runs `worker.migrate()` before every other command, and only then. The `better-graphile-worker` binary has only `release-locks` (see [crash recovery](#crash-recovery)) and needs no registry.
-
-### Testing
-
-```ts
-import { createTestHarness } from 'better-graphile-worker/testing'
-const harness = createTestHarness(queues) // or one queue: createTestHarness([sendEmail])
-await harness.process('sendEmail', { to: 'person@example.com' })
-await harness.process('sendEmail', { to: 'person@example.com' }, { attempt: 5, maxAttempts: 5 }) // the last attempt
-console.log(harness.logs, harness.enqueued, harness.continued)
-```
-
-Code under test that enqueues through your app's producer can use the harness's instead: `harness.createJob`, `createJobs`, `enqueueInTransaction` (the transaction is ignored) and `triggerCron` validate and derive options exactly as the worker does, and record into `enqueued`. `await harness.drain()` then runs every enqueued job that has not run yet, and the jobs those enqueue, in order until none is left, ignoring `runAt`; a cron-init trigger runs its `initFn` and enqueues its items. It throws the first job's error, or after `maxJobs` runs (default 1000), and resolves to how many ran. Continuations stay in `continued`.
-
-```ts
-mock.module('../lib/queue', () => ({ createJob: harness.createJob }))
-await placeOrder(order)
-await harness.drain()
-expect(harness.enqueued.map((job) => job.queue)).toEqual(['chargeCard', 'sendReceipt'])
-```
-
-The harness invokes handlers directly without Graphile acknowledgement/retry hooks or PostgreSQL. Parsing, child enqueue validation and step replay share production code. Invocations get fresh IDs, attempt 1 and the queue's own `maxAttempts` unless the extras say otherwise. Supply the same `{ jobId: 'retry-1' }` explicitly to simulate retry; it replays checkpoints and returns the last progress, which each invocation keeps when it ends. Different queues never share checkpoints or progress. Waits run their children inline, once and in order, through the same validation and checkpoints; a child that throws is a failed result, without retries, and `timeout` is ignored. A waited child that calls `ctx.continue()` is rejected. Read a run's progress with `ctx.progress.get()` on the context `process` returns. `init` accepts only cron-init names and infers its returned inputs. Captured child jobs include queue, wire input and options. Narrowing `job.queue` also narrows its producer input payload; `context(name)` and the context returned by `process` preserve the selected literal name. For shared handler-free contracts, pass the registry as the second argument: `createTestHarness(contracts, handlers)`.
+Upgrading from 1.x: see the [2.0 migration notes](docs/migrations/2.0.md).
 
 ## Types
 
@@ -677,8 +729,6 @@ The harness invokes handlers directly without Graphile acknowledgement/retry hoo
 Low-level builders, SQL adapters and payload helpers are available exclusively from `better-graphile-worker/advanced`. Application code should use instance methods. The package root exports constructors, contract helpers, public types and errors.
 
 Custom adapters must implement `EnqueueAdapter.addIdempotentJobs(specs)` to accept `idempotencyKey`; without it, keyed enqueues are rejected. Custom `EnqueueAdapter.addJobs(specs, jobKeyPreserveRunAt?)` implementations must return jobs in input order and honor the optional preserve-run-at flag to support derived keyed batches. Existing one-argument adapters remain type-compatible, but need to handle that flag before using `preserve_run_at`. The built-in adapter matches unkeyed rows by content, so it rejects unkeyed specs that are identical except for `identifier` or `queueName`; enqueue those separately.
-
-Upgrading from 1.x: see the [2.0 migration notes](docs/migrations/2.0.md).
 
 ## Development
 

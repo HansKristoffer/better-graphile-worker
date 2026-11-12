@@ -35,7 +35,12 @@ const LIBRARY_TABLES = [
 export const DEFAULT_GRAPHILE_WORKER_SCHEMA = 'graphile_worker'
 /** The producer's public-SQL adapter deliberately performs no migrations. */
 export type EnqueueAdapter = {
-	addJob(identifier: string, payload: unknown, spec?: TaskSpec): Promise<Job>
+	/** Resolves to the new job's id; adapters may return more of the row. */
+	addJob(
+		identifier: string,
+		payload: unknown,
+		spec?: TaskSpec
+	): Promise<Pick<Job, 'id'>>
 	/** Return jobs in spec order and honor Graphile's batch preserve_run_at flag. */
 	addJobs(
 		specs: readonly AddJobsJobSpec[],
@@ -153,10 +158,12 @@ export function createWorkerClient(options: {
 	}
 	const enqueue: EnqueueAdapter = {
 		async addJob(identifier, payload, spec = {}) {
-			const { text, values } = addJobSql(schema, identifier, payload, spec, '*')
+			// Only the id: returning the row would send the payload back over the wire.
+			const { text, values } = addJobSql(schema, identifier, payload, spec)
 			for (let run = 0; ; run++) {
-				const job = (await options.pgPool.query<DbJob>(text, values)).rows[0]
-				if (job?.id) return { ...job, task_identifier: identifier }
+				const job = (await options.pgPool.query<{ id: string }>(text, values))
+					.rows[0]
+				if (job?.id) return { id: job.id }
 				if (spec.jobKey === undefined || run === JOB_KEY_RACE_RERUNS)
 					throw new EnqueueCountError(identifier, 1, 0)
 			}

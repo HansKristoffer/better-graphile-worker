@@ -22,7 +22,7 @@ import { createJobClient } from 'better-graphile-worker/client'
 import { createTestHarness } from 'better-graphile-worker/testing'
 import { createCli } from 'better-graphile-worker/cli'
 import {
-	enqueueInTransaction,
+	runPreparedJob,
 	type RawQueryClient
 } from 'better-graphile-worker/prisma'
 
@@ -99,11 +99,10 @@ void raw
 // @ts-expect-error Raw Graphile tasks also use pre-transform input
 const invalidRaw: TasksOf<typeof contracts>['count'] = { __bgw: 2, payload: 2 }
 void invalidRaw
+const firstA = defineQueue({ name: 'a', inputSchema: z.string() })
+const secondA = defineQueue({ name: 'a', inputSchema: z.number() })
 // @ts-expect-error Duplicates rejected at definition time
-defineQueues([
-	defineQueue({ name: 'a', inputSchema: z.string() }),
-	defineQueue({ name: 'a', inputSchema: z.string() })
-])
+defineQueues([firstA, secondA])
 
 const worker = createBetterWorker({
 	pgPool: pool,
@@ -208,14 +207,14 @@ defineQueues([contracts[4], initTask])
 defineQueues([initTask, contracts[4]])
 export type ReservedDiagnostic = Assert<
 	Equal<
-		UniqueQueueNames<readonly [typeof reserved]>,
+		UniqueQueueNames<readonly [typeof reserved]>[0],
 		'Invalid queue name: "then"'
 	>
 >
 export type CollisionDiagnostic = Assert<
 	Equal<
-		UniqueQueueNames<readonly [typeof initTask, (typeof contracts)[4]]>,
-		'Queue task name collision: gather_cron-init'
+		UniqueQueueNames<readonly [typeof initTask, (typeof contracts)[4]]>[0],
+		'Duplicate queue name or task collision: gather_cron-init'
 	>
 >
 declare const dynamicName: string
@@ -660,14 +659,13 @@ defineQueue({
 })
 const processWorker = createBetterWorker({
 	pgPool: pool,
-	queues: [derived],
-	process: ['derived']
+	queues: [derived]
 })
 createBetterWorker({
 	pgPool: pool,
 	queues: [derived],
-	// @ts-expect-error Only registered queues can be processed
-	process: ['missing']
+	// @ts-expect-error 3.0 splits work with worker pools, not `process`
+	process: ['derived']
 })
 async function prepared() {
 	const job = await processWorker.prepareJob('derived', {
@@ -857,11 +855,8 @@ createBetterWorkerPool({
 	runners: { turn: {} }
 })
 export const transactional = async (tx: PrismaTransactionLike) =>
-	enqueueInTransaction(
-		tx,
-		await workerPool.prepareJob('turnReply', { id: 'a' })
-	)
-// Prisma's own signature, so its transaction client fits enqueueInTransaction.
+	runPreparedJob(tx, await workerPool.prepareJob('turnReply', { id: 'a' }))
+// Prisma's own signature, so its transaction client fits runPreparedJob.
 type PrismaTransactionLike = {
 	// biome-ignore lint/suspicious/noExplicitAny: mirrors Prisma's $queryRawUnsafe
 	$queryRawUnsafe<T = unknown>(query: string, ...values: any[]): Promise<T>
@@ -899,7 +894,7 @@ export const plainTransactional = async (
 		task: 'turnReply',
 		payload: { id: 'a' }
 	})
-	const ids: string[] = await enqueueInTransaction(tx, prepared, {
+	const ids: string[] = await runPreparedJob(tx, prepared, {
 		required: true
 	})
 	const id: string | null = await workerPool.enqueueInTransaction(

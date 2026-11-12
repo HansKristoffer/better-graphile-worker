@@ -4,12 +4,10 @@ import {
 	type CompletedJob
 } from './completed-jobs-store.js'
 
-function job(
-	overrides: Partial<CompletedJob> = {}
-): Omit<CompletedJob, 'queue'> {
+function job(overrides: Partial<CompletedJob> = {}): CompletedJob {
 	return {
 		id: '1',
-		queueName: 'q',
+		queue: 'q',
 		payload: { ok: true },
 		status: 'completed',
 		attempts: 1,
@@ -44,9 +42,9 @@ describe('createCompletedJobsStore', () => {
 
 	test('getStats counts completed and failed per queue', () => {
 		const store = createCompletedJobsStore()
-		store.add(job({ id: '1', queueName: 'a', status: 'completed' }))
-		store.add(job({ id: '2', queueName: 'a', status: 'failed' }))
-		store.add(job({ id: '3', queueName: 'b', status: 'completed' }))
+		store.add(job({ id: '1', queue: 'a', status: 'completed' }))
+		store.add(job({ id: '2', queue: 'a', status: 'failed' }))
+		store.add(job({ id: '3', queue: 'b', status: 'completed' }))
 
 		expect(store.getStats()).toEqual({
 			a: { completed: 1, failed: 1 },

@@ -4,14 +4,23 @@ import { z } from 'zod'
 import type { JobHelpers } from 'graphile-worker'
 import { defineQueue, type JobContext } from './queue.js'
 import { defineQueues } from './define-queues.js'
-import { createBetterWorker } from './create-better-worker.js'
+import { createBetterWorker, createWorker } from './create-better-worker.js'
+import { createNoopCompletedJobsStore } from './completed-jobs-store.js'
 import { createJobClient } from './job-client.js'
 import { continueJob } from './private-jobs.js'
 import { StepPersistenceError } from './errors.js'
 import { createWorkerClient } from './client.js'
 import { addJobSql, addJobsSql } from './enqueue-sql.js'
-import { enqueueInTransaction } from './prisma.js'
+import { runPreparedJob } from './prisma.js'
 import type { JobFinishedEvent } from './hooks.js'
+
+function deferred() {
+	let resolve!: () => void
+	const promise = new Promise<void>((done) => {
+		resolve = done
+	})
+	return { promise, resolve }
+}
 
 const enabled = Boolean(process.env.DATABASE_URL)
 const suite = describe.skipIf(!enabled)
@@ -112,6 +121,64 @@ suite('long-running, per-tenant workloads', () => {
 		await worker.stop()
 		await pool.query(`DROP SCHEMA "${schema}" CASCADE`)
 		await pool.end()
+	})
+
+	test("a lane's next job starts when the previous one finishes, not at the next poll", async () => {
+		const done = deferred()
+		let ran = 0
+		const lane = defineQueue({
+			name: 'quickLane',
+			inputSchema: z.number(),
+			serial: true,
+			processFn: async () => {
+				if (++ran === 20) done.resolve()
+			}
+		})
+		const slowPoll = createBetterWorker({
+			pgPool: pool,
+			schema,
+			queues: [lane],
+			pollInterval: 60_000,
+			hooks: { createLogger: () => quiet }
+		})
+		await slowPoll.createJobs(
+			'quickLane',
+			Array.from({ length: 20 }, (_, n) => n)
+		)
+		await slowPoll.start()
+		try {
+			// Before 3.0 each job after the first waited up to the 60-second poll.
+			await done.promise
+		} finally {
+			await slowPoll.stop()
+		}
+		expect(await jobs('quickLane')).toHaveLength(0)
+	})
+
+	test('prefetch warns about queues that use lanes', async () => {
+		const warnings: unknown[] = []
+		const prefetching = createBetterWorker({
+			pgPool: pool,
+			schema,
+			queues: contracts,
+			prefetch: 1,
+			hooks: {
+				createLogger: () => ({
+					...quiet,
+					warn: (message, attributes) =>
+						void warnings.push({ ...attributes, event: message })
+				})
+			},
+			handlers: handlers as never
+		})
+		await prefetching.start()
+		await prefetching.stop()
+		expect(warnings).toContainEqual(
+			expect.objectContaining({
+				event: 'worker.prefetch.lanes',
+				queues: expect.stringContaining('lane')
+			})
+		)
 	})
 
 	test('a derived queueName serializes per tenant, not globally', async () => {
@@ -295,7 +362,7 @@ suite('long-running, per-tenant workloads', () => {
 			const pending = (
 				mode === 'transaction'
 					? inTransaction((tx) =>
-							enqueueInTransaction(tx, {
+							runPreparedJob(tx, {
 								queue: 'keyed',
 								count: 1,
 								skipped: false,
@@ -516,15 +583,20 @@ suite('long-running, per-tenant workloads', () => {
 		await pool.query(`DELETE FROM "${schema}"._private_jobs`)
 	})
 
-	test('process runs a subset; other queues stay pending', async () => {
-		const narrow = createBetterWorker({
-			pgPool: pool,
-			schema,
-			queues: contracts,
-			process: ['other'],
-			hooks: { createLogger: () => quiet },
-			handlers: handlers as never
-		})
+	test('a runner of some queues leaves the other queues pending', async () => {
+		const narrow = createWorker(
+			{
+				pgPool: pool,
+				schema,
+				queues: contracts,
+				hooks: { createLogger: () => quiet },
+				handlers: handlers as never
+			},
+			createNoopCompletedJobsStore(),
+			undefined,
+			undefined,
+			['other']
+		)
 		await narrow.createJob('other', 'x')
 		await narrow.createJob('keyed', {})
 		await narrow.runOnce()

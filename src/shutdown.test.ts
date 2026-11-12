@@ -212,3 +212,38 @@ suite('stop({ probeDatabase }) on PostgreSQL', () => {
 			}
 		})
 })
+
+suite('stop({ endPool }) on PostgreSQL', () => {
+	test('ends the pool after a worker and a pool stop', async () => {
+		for (const pooled of [false, true]) {
+			const pgPool = new Pool({ connectionString: process.env.DATABASE_URL })
+			pgPool.on('error', () => {})
+			const queues = [defineQueue({ name: 'echo', inputSchema: z.string() })]
+			const worker = pooled
+				? createBetterWorkerPool({
+						pgPool,
+						schema: `bgw_endpool_${process.pid}`,
+						queues: queues.map((queue) => ({ ...queue, runner: 'main' })),
+						handlers: { echo: async () => {} },
+						runners: { main: {} },
+						hooks: { createLogger: () => quiet }
+					})
+				: createBetterWorker({
+						pgPool,
+						schema: `bgw_endpool_${process.pid}`,
+						queues,
+						handlers: { echo: async () => {} },
+						hooks: { createLogger: () => quiet }
+					})
+			await worker.migrate()
+			await worker.start()
+			await worker.stop({ endPool: true })
+			expect(pgPool.ended).toBe(true)
+		}
+		const cleanup = new Pool({ connectionString: process.env.DATABASE_URL })
+		await cleanup.query(
+			`DROP SCHEMA IF EXISTS "bgw_endpool_${process.pid}" CASCADE`
+		)
+		await cleanup.end()
+	})
+})

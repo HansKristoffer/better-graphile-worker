@@ -79,7 +79,13 @@ Graphile shuts its worker pool down on errors it cannot recover from, such as a 
 
 ## Shutdown grace forces through the worker pool
 
-`shutdownGrace` sets Graphile's `gracefulShutdownAbortTimeout`, so signals abort when the grace ends, and 500 ms later calls `forcefulShutdown` on the Graphile worker pool, which fails the still-running jobs and unlocks them and their lanes in one statement. It cannot use `runner.kill()`: once `stop()` has begun a graceful shutdown the pool is no longer active, and `kill()` does nothing. The pool comes from the `pool:create` event, like its id. The forced failure spends the attempt, as crash recovery does, so a job that hangs every deploy still runs out of attempts. It is opt-in because the default (abort at 5 seconds, wait forever) is Graphile's and changing it would change every deploy.
+`shutdownGrace` sets Graphile's `gracefulShutdownAbortTimeout`, so signals abort when the grace ends, and 500 ms later calls `forcefulShutdown` on the Graphile worker pool, which fails the still-running jobs and unlocks them and their lanes in one statement. It cannot use `runner.kill()`: once `stop()` has begun a graceful shutdown the pool is no longer active, and `kill()` does nothing. The pool comes from the `pool:create` event, like its id. The forced failure spends the attempt, as crash recovery does, so a job that hangs every deploy still runs out of attempts. It defaults to 25 seconds, inside the 30 seconds most platforms give a stopping process, because Graphile's own behaviour (abort at 5 seconds, wait forever) aborted every deploy early and then left the platform to kill the process with jobs still locked.
+
+## Lane jobs complete themselves
+
+Graphile completes a job in a batch after its task returns and notifies nothing when a serial lane frees, so the lane's next job waited for a poll. That made a short poll interval necessary for any app with lanes. The task now completes a successful lane job itself, with the statement `jobOutcomes` uses (delete the row and release its lane while holding the lock), and then nudges the pool, so the worker's next fetch finds the lane free. Graphile's batched completion then deletes nothing. It costs one statement per lane job, and lets the default poll interval be 1 second.
+
+Prefetch cannot be made safe for lanes from here. Graphile's fetch takes up to the local queue's size in one statement, and while a lane is available that statement can take several of its jobs; all of them are locked and run at once. The library warns at start when a prefetching runner has queues that use lanes, rather than changing Graphile's fetch SQL.
 
 ## Shutdown probes the database from outside the pool
 

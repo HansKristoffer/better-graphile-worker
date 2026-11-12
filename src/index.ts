@@ -73,6 +73,7 @@ export {
 	type CompletedJobsOption,
 	type WorkerRunnerOptions
 } from './create-better-worker.js'
+export { lazyWorker } from './lazy.js'
 export {
 	createBetterWorkerPool,
 	pgPoolSize,
@@ -81,11 +82,6 @@ export {
 	type RunnerName
 } from './worker-pool.js'
 export type { JobKeyMode, PayloadMode } from './create-job.js'
-export {
-	createJobClient,
-	type JobClient,
-	type JobClientOptions
-} from './job-client.js'
 export type { JobStep, StepCodec } from './steps.js'
 export type { WaitOptions, WaitResult } from './waits.js'
 export type { JobProgress, JobProgressSnapshot } from './progress.js'

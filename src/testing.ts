@@ -204,34 +204,34 @@ export function createTestHarness<
 	const continued: CapturedContinue[] = []
 	/** Captured jobs that already ran: drained ones and waited children. */
 	const ran = new Set<string>()
+	function capture(queue: string, payload: unknown, options?: JobOptions) {
+		const id = `child-${enqueued.length + 1}`
+		enqueued.push({
+			id,
+			queue,
+			payload: extractProducerLink(payload).cleanPayload,
+			options
+		})
+		return { ...fakeHelpers(queue).job, id }
+	}
 	const producer = bindCreateJob({
 		queues: contracts,
 		otel: null,
 		enqueue: {
 			async addJob(queue, payload, options) {
-				const id = `child-${enqueued.length + 1}`
-				enqueued.push({
-					id,
-					queue,
-					payload: extractProducerLink(payload).cleanPayload,
-					options
-				})
-				return { ...fakeHelpers(queue).job, id }
+				return capture(queue, payload, options)
 			},
 			async addJobs(specs) {
-				const result = []
-				for (const spec of specs)
-					result.push(await this.addJob(spec.identifier, spec.payload, spec))
-				return result
+				return specs.map((spec) =>
+					capture(spec.identifier, spec.payload, spec as JobOptions)
+				)
 			},
 			// The harness has no database, so it records keys but never deduplicates.
 			async addIdempotentJobs(specs) {
-				const result = []
-				for (const spec of specs) {
-					const job = await this.addJob(spec.identifier, spec.payload, spec)
-					result.push({ id: String(job.id), deduplicated: false })
-				}
-				return result
+				return specs.map((spec) => ({
+					id: capture(spec.identifier, spec.payload, spec as JobOptions).id,
+					deduplicated: false
+				}))
 			}
 		}
 	})

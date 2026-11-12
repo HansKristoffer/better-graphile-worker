@@ -13,14 +13,6 @@ export type RawQueryClient = {
 	): PromiseLike<unknown>
 }
 
-/** @deprecated Use `RawQueryClient`, which also accepts clients without a type parameter. */
-export type PrismaRawClient = {
-	$queryRawUnsafe<T = unknown>(
-		query: string,
-		...values: unknown[]
-	): PromiseLike<T>
-}
-
 export type EnqueueInTransactionOptions = {
 	/**
 	 * Throw `EnqueueSkippedError` instead of enqueueing nothing when `shouldSkipEnqueue()`
@@ -47,12 +39,13 @@ function jobIds(queue: string, rows: unknown): (string | null)[] {
 }
 
 /**
- * Run a `prepareJob` / `prepareJobs` statement in a Prisma transaction, so the jobs commit
+ * Run a `prepareJob` / `prepareJobs` statement in your transaction (a Prisma `tx` or any
+ * `RawQueryClient`), so the jobs commit
  * or roll back with its other writes. Returns the job ids in input order. A single job
  * that lost a `jobKey` race is rerun; otherwise it throws `EnqueueCountError`, which rolls
  * the transaction back, when Graphile created fewer jobs than prepared.
  */
-export async function enqueueInTransaction(
+export async function runPreparedJob(
 	tx: RawQueryClient,
 	prepared: PreparedJob,
 	options?: EnqueueInTransactionOptions

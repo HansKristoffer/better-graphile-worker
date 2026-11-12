@@ -29,8 +29,6 @@ export type QueueDefinition = {
 export type JobCountRow = {
 	/** The Graphile task identifier; cron-init runs use `{name}_cron-init`. */
 	queue: string
-	/** @deprecated Use `queue`. */
-	taskIdentifier: string
 	pending: number
 	running: number
 	failed: number
@@ -49,8 +47,6 @@ export type ListedJob = {
 	cursor: { createdAt: string; id: string }
 	/** The Graphile task identifier; cron-init runs use `{name}_cron-init`. */
 	queue: string
-	/** @deprecated Use `queue`; job options use `queueName` for the lane. */
-	queueName: string
 	/** The serial lane (Graphile's job queue), if any. */
 	lane: string | null
 	key: string | null
@@ -108,9 +104,12 @@ export function getQueueDefinitions(
 		name: queue.name,
 		type: getQueueType(queue),
 		cron: formatCronSchedule(queue.cron),
-		serial: queue.serial ?? null,
+		serial: queue.serial ?? (getQueueType(queue) === 'cron' ? true : null),
 		maxAttempts: queue.maxAttempts ?? defaultMaxAttempts,
-		timeout: queue.timeout ?? defaultTimeout ?? null,
+		timeout:
+			queue.timeout === false
+				? null
+				: (queue.timeout ?? defaultTimeout ?? null),
 		runner: queue.runner ?? null,
 		priority: queue.priority ?? null,
 		hasInputSchema: hasInputSchema(queue),
@@ -119,23 +118,22 @@ export function getQueueDefinitions(
 }
 
 export function mergeJobStats(
-	rows: readonly Omit<JobCountRow, 'queue'>[],
+	rows: readonly JobCountRow[],
 	ring: CompletedJobStats,
-	taskIdentifiers: readonly string[] = []
+	queues: readonly string[] = []
 ): WorkerJobStatsRow[] {
 	const names = new Set<string>([
-		...taskIdentifiers,
-		...rows.map((row) => row.taskIdentifier),
+		...queues,
+		...rows.map((row) => row.queue),
 		...Object.keys(ring)
 	])
-	const byTask = new Map(rows.map((row) => [row.taskIdentifier, row]))
+	const byQueue = new Map(rows.map((row) => [row.queue, row]))
 
-	return [...names].map((taskIdentifier) => {
-		const pg = byTask.get(taskIdentifier)
-		const mem = ring[taskIdentifier]
+	return [...names].map((queue) => {
+		const pg = byQueue.get(queue)
+		const mem = ring[queue]
 		return {
-			queue: taskIdentifier,
-			taskIdentifier,
+			queue,
 			pending: pg?.pending ?? 0,
 			running: pg?.running ?? 0,
 			recentCompleted: mem?.completed ?? 0,
@@ -173,7 +171,6 @@ export async function queryJobCounts(
 
 	return result.rows.map((row) => ({
 		queue: row.task_identifier,
-		taskIdentifier: row.task_identifier,
 		pending: Number.parseInt(row.pending, 10),
 		running: Number.parseInt(row.running, 10),
 		failed: Number.parseInt(row.failed, 10)
@@ -291,7 +288,6 @@ export async function queryRecentJobs(
 		id: row.id,
 		cursor: { createdAt: row.cursor_created_at, id: row.id },
 		queue: row.task_identifier,
-		queueName: row.task_identifier,
 		lane: row.queue_name,
 		key: row.key,
 		payload:

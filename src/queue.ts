@@ -121,10 +121,15 @@ export type QueueContract<
 	readonly flags?: readonly string[]
 	/**
 	 * Fail an attempt that runs longer than this many milliseconds. Each retry and
-	 * continuation starts a fresh clock. Overrides the worker's `defaultTimeout`.
+	 * continuation starts a fresh clock. Overrides the worker's `defaultTimeout`; `false`
+	 * means no limit.
 	 */
-	readonly timeout?: number
-	/** Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`. */
+	readonly timeout?: number | false
+	/**
+	 * Serialize jobs: `true` uses the queue name, a string is a custom Graphile `queueName`.
+	 * Plain cron queues (no `inputSchema`) are serial unless this is `false`, so a slow tick
+	 * never overlaps the next one.
+	 */
 	readonly serial?: boolean | string
 	/** The `createBetterWorkerPool` runner that executes this queue's jobs. */
 	readonly runner?: string
@@ -433,11 +438,13 @@ export function formatCronSchedule(
 	return cron.join(', ')
 }
 
+/** The lane a queue's jobs use; a plain cron queue (`plainCron`) is serial by default. */
 export function resolveSerialQueueName(
 	serial: boolean | string | undefined,
-	queueName: string
+	queueName: string,
+	plainCron = false
 ): string | undefined {
-	if (serial === true) return queueName
+	if (serial === true || (serial === undefined && plainCron)) return queueName
 	if (typeof serial === 'string') return serial
 	return undefined
 }

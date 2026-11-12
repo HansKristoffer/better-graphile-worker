@@ -23,6 +23,7 @@ import {
 	formatCronSchedule,
 	parseContinueRunAt,
 	resolveSerialQueueName,
+	isCronQueue,
 	type QueueContract,
 	type QueueFailureHandler
 } from './queue.js'
@@ -110,6 +111,8 @@ export type TaskListRuntime<
 		| undefined
 	/** Jobs this worker's attempts are running, so a forced shutdown can report them. */
 	running?: Map<string, RunningJob> | undefined
+	/** Ask the current Graphile worker pool to fetch again. */
+	nudge?: (() => void) | undefined
 }
 
 /** A running job, as a permanent-failure report would describe it. */
@@ -506,12 +509,22 @@ async function executeTask(options: ExecuteTaskOptions) {
 			let continued = false
 			let suspended: JobSuspendedSignal | undefined
 			let retryAt: Date | undefined
+			// Graphile completes a job in a batch after the task returns and sends no
+			// notification when its lane frees, so the lane's next job would wait a poll.
+			// Completing it here frees the lane before the worker fetches again.
+			const lane = helpers.job.job_queue_id != null
 			const settle = async (
 				settled: ChildReport,
 				row: Parameters<typeof settleLockedJob>[2]['row']
 			) => {
 				// Otherwise Graphile completes or fails the job itself.
-				if (!runtime.jobOutcomes && !waited && row !== 'exhaust') return true
+				if (
+					!runtime.jobOutcomes &&
+					!waited &&
+					row !== 'exhaust' &&
+					!(lane && row === 'delete' && settled.ok)
+				)
+					return true
 				const outcome = settled.ok
 					? { state: 'completed' as const }
 					: { state: 'failed' as const, error: settled.error.message }
@@ -589,7 +602,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 
 				runtime.completedJobs.add({
 					id: jobId,
-					queueName,
+					queue: queueName,
 					payload: cleanPayload,
 					status: 'completed',
 					attempts: helpers.job.attempts,
@@ -650,7 +663,7 @@ async function executeTask(options: ExecuteTaskOptions) {
 					}
 					runtime.completedJobs.add({
 						id: jobId,
-						queueName,
+						queue: queueName,
 						payload: cleanPayload,
 						status: 'failed',
 						attempts: helpers.job.attempts,
@@ -764,6 +777,8 @@ async function executeTask(options: ExecuteTaskOptions) {
 	// Graphile's failure update unlocks the job and its lane and keeps the row, where a
 	// successful return would delete it.
 	if (suspended) throw suspended
+	// The lane is free now; a worker with prefetched jobs or idle slots fetches again.
+	if (helpers.job.job_queue_id != null) runtime.nudge?.()
 }
 
 export function buildTaskList<TQueues extends readonly QueueContract[]>(
@@ -775,7 +790,8 @@ export function buildTaskList<TQueues extends readonly QueueContract[]>(
 
 	for (const queue of queues) {
 		const q = queue
-		const timeout = q.timeout ?? runtime.defaultTimeout
+		const timeout =
+			q.timeout === false ? undefined : (q.timeout ?? runtime.defaultTimeout)
 		if (q.initFn) {
 			const initFn = q.initFn
 			const processingTaskName = q.name
@@ -896,7 +912,8 @@ export function buildCronItems(
 						options?.maxAttempts ?? q.maxAttempts ?? defaultMaxAttempts,
 					backfillPeriod: options?.backfillPeriod,
 					queueName:
-						options?.queueName ?? resolveSerialQueueName(q.serial, q.name),
+						options?.queueName ??
+						resolveSerialQueueName(q.serial, q.name, isCronQueue(q)),
 					priority: options?.priority ?? q.priority,
 					jobKey: options?.jobKey,
 					jobKeyMode: options?.jobKeyMode
@@ -937,7 +954,9 @@ export function logRegisteredQueues(
 	for (const queue of queues) {
 		const q = queue
 		const type = getQueueType(q)
-		const timeout = formatTimeout(q.timeout ?? defaultTimeout)
+		const timeout = formatTimeout(
+			q.timeout === false ? undefined : (q.timeout ?? defaultTimeout)
+		)
 		if (type === 'cron-init') {
 			logger.info(
 				`  - ${q.name}${CRON_INIT_SUFFIX} (cron-init: ${formatCronSchedule(q.cron)}, ${timeout})`
@@ -954,7 +973,15 @@ export function logRegisteredQueues(
 }
 
 export const DEFAULT_CONCURRENCY = 10
-export const DEFAULT_POLL_INTERVAL = 250
+/**
+ * New jobs arrive by notification and a lane's next job is fetched when the previous one
+ * finishes, so the poll only bounds how late a scheduled job or retry starts.
+ */
+export const DEFAULT_POLL_INTERVAL = 1000
+/** Below Graphile's 4-hour reclaim, after which a live job can run a second time. */
+export const DEFAULT_TIMEOUT = 230 * 60_000
+/** Inside the 30 seconds Kubernetes and most platforms give a stopping process. */
+export const DEFAULT_SHUTDOWN_GRACE = 25_000
 
 export type GraphileRunnerOverrides = Omit<
 	Partial<RunnerOptions>,
@@ -1044,6 +1071,8 @@ export async function startRunner(options: {
 	 * claimed. It is stopped once the pool has finished, including a graceful drain.
 	 */
 	maintain?: ((poolId: string) => { stop(): Promise<void> }) | undefined
+	/** Receives a function that makes this runner's pool fetch again. */
+	onNudge?: ((nudge: () => void) => void) | undefined
 	secondLookOnNotify?: number | undefined
 	/** Names the pool runner in a `WorkerStoppedError`. */
 	runnerName?: string | undefined
@@ -1069,8 +1098,14 @@ export async function startRunner(options: {
 	}
 	let workerPool: WorkerPool | undefined
 	const onCreate = (event: WorkerEventMap['pool:create']) => {
-		workerPool = event.workerPool
-		maintenance = maintain?.(event.workerPool.id)
+		const pool = event.workerPool
+		workerPool = pool
+		maintenance = maintain?.(pool.id)
+		options.onNudge?.(() => {
+			setTimeout(() => {
+				if (pool._active && !pool._shuttingDown) pool.nudge(1)
+			}, 0).unref()
+		})
 	}
 	events.on('pool:create', onCreate)
 	const secondLook = secondLookListener(options.secondLookOnNotify)
