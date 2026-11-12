@@ -4,7 +4,7 @@ import * as otel from '@opentelemetry/api'
 import { z } from 'zod'
 import { createJobClient } from './job-client.js'
 import { defineQueue } from './queue.js'
-import type { JobFinishedEvent } from './hooks.js'
+import type { JobFinishedEvent, PermanentFailureEvent } from './hooks.js'
 import type { OtelMeter } from './otel.js'
 import {
 	QUEUE_METRICS_METER,
@@ -33,7 +33,8 @@ const finished: JobFinishedEvent = {
 	jobId: '1',
 	operation: 'process',
 	attempt: 4,
-	maxAttempts: 4
+	maxAttempts: 4,
+	waitMs: 7
 }
 
 describe('queue metrics', () => {
@@ -67,7 +68,7 @@ describe('queue metrics', () => {
 		)
 	})
 
-	test('a finished job records its count, duration and permanent failure, then runs the hook', async () => {
+	test('a finished job records its count, duration and wait, then runs the hook', async () => {
 		const { api, recorded } = fakeMeter()
 		const seen: JobFinishedEvent[] = []
 		const hooks = withQueueMetrics(
@@ -87,12 +88,40 @@ describe('queue metrics', () => {
 				attributes: { queue: 'sync', status: 'failed' }
 			},
 			{
+				name: 'graphile_job_wait_ms',
+				value: 7,
+				attributes: { queue: 'sync' }
+			}
+		])
+		expect(seen).toEqual([finished])
+	})
+
+	test('a permanent failure is counted from its own hook, whichever path reported it', async () => {
+		const { api, recorded } = fakeMeter()
+		const seen: PermanentFailureEvent[] = []
+		const hooks = withQueueMetrics(
+			{ onPermanentFailure: (event) => void seen.push(event) },
+			api
+		)
+		const failure: PermanentFailureEvent = {
+			reason: 'worker_lost',
+			error: new Error('lost'),
+			queue: 'sync',
+			jobId: '1',
+			operation: 'process',
+			attempts: 1,
+			maxAttempts: 1,
+			payload: null
+		}
+		await hooks.onPermanentFailure?.(failure)
+		expect(recorded).toEqual([
+			{
 				name: 'graphile_job_permanently_failed_total',
 				value: 1,
 				attributes: { queue: 'sync' }
 			}
 		])
-		expect(seen).toEqual([finished])
+		expect(seen).toEqual([failure])
 	})
 
 	test('a failing meter still runs the hook and never throws', async () => {

@@ -8,6 +8,7 @@ export {
 	type CronQueueContract,
 	type CronInitQueueContract,
 	type QueueHandlers,
+	type QueueFailureHandler,
 	isCronInitQueue,
 	isRegularQueue,
 	isCronQueue,
@@ -98,6 +99,8 @@ export type {
 	CreateLoggerOptions,
 	JobFinishedEvent,
 	PermanentFailureEvent,
+	PermanentFailureReason,
+	JobAttributes,
 	EnqueueFailEvent,
 	RunnerStoppedEvent,
 	LogAttributes,
@@ -113,7 +116,10 @@ export type {
 } from './admin.js'
 export type { JobOutcomesOption, JobState } from './job-outcomes.js'
 export type { GraphileRunnerOverrides } from './worker.js'
-export type { CrashRecoveryOptions } from './maintenance.js'
+export type {
+	CrashRecoveryOptions,
+	ReleaseLocksOptions
+} from './maintenance.js'
 export type { RestartOptions } from './lifecycle.js'
 export {
 	NonRetriableError,

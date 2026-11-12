@@ -3,15 +3,28 @@ import type {
 	JobContext,
 	InlineJobContext,
 	QueueContract,
+	QueueFailureHandler,
 	QueueHandlers
 } from './queue.js'
 import { UnknownQueueError } from './errors.js'
-import { assertInteger } from './validation.js'
+import { assertInteger, parseDuration } from './validation.js'
 
 /** Internal handler erasure; public APIs retain their registry-specific signatures. */
 export type NormalizedQueue = QueueContract & {
 	processFn: (payload: unknown, ctx: JobContext) => unknown
 	initFn?: (ctx: JobContext) => Promise<readonly unknown[]> | readonly unknown[]
+	onPermanentFailure?: QueueFailureHandler<unknown> | undefined
+	/** `retryDelay` in milliseconds, one entry per retry; the last repeats. */
+	retryDelays?: readonly number[] | undefined
+}
+
+/** The wait before the retry that follows `attempt`, from a queue's `retryDelays`. */
+export function retryDelayAfter(
+	delays: readonly number[] | undefined,
+	attempt: number
+): number | undefined {
+	if (!delays?.length) return undefined
+	return delays[Math.min(attempt, delays.length) - 1]
 }
 
 /** Single erasure boundary for inline definitions and shared contracts. */
@@ -83,6 +96,26 @@ export function normalizeWorkerQueues<T extends readonly QueueContract[]>(
 			throw new TypeError(
 				`initFn requires a cron schedule and inputSchema for "${queue.name}"`
 			)
+		const onPermanentFailure =
+			'onPermanentFailure' in value ? value.onPermanentFailure : undefined
+		if (
+			onPermanentFailure !== undefined &&
+			typeof onPermanentFailure !== 'function'
+		)
+			throw new TypeError(
+				`onPermanentFailure for "${queue.name}" must be a function`
+			)
+		const retryDelays =
+			queue.retryDelay === undefined
+				? undefined
+				: (Array.isArray(queue.retryDelay)
+						? queue.retryDelay
+						: [queue.retryDelay]
+					).map((delay) =>
+						parseDuration(delay, `Queue "${queue.name}" retryDelay`)
+					)
+		if (retryDelays?.length === 0)
+			throw new TypeError(`Queue "${queue.name}" retryDelay must not be empty`)
 		const processFn = value.processFn as (
 			payload: unknown,
 			ctx: JobContext | InlineJobContext
@@ -94,6 +127,13 @@ export function normalizeWorkerQueues<T extends readonly QueueContract[]>(
 			| undefined
 		return {
 			...queue,
+			...(onPermanentFailure
+				? {
+						onPermanentFailure:
+							onPermanentFailure as QueueFailureHandler<unknown>
+					}
+				: {}),
+			...(retryDelays ? { retryDelays } : {}),
 			processFn:
 				handlers === undefined
 					? (payload, ctx) => processFn(payload, referenceContext(ctx))

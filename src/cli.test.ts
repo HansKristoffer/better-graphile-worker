@@ -127,4 +127,41 @@ suite('CLI on PostgreSQL', () => {
 			lines: [expect.arrayContaining([expect.objectContaining({ pending: 1 })])]
 		})
 	})
+
+	test('trigger-cron, get-job --key, release-locks and delete-failed', async () => {
+		const worker = createBetterWorker({
+			pgPool: pool,
+			schema,
+			queues: [
+				defineQueue({
+					name: 'keyed',
+					inputSchema: z.string(),
+					deriveJobOptions: (id) => ({ jobKey: `keyed:${id}` })
+				}),
+				defineQueue({ name: 'hourly', cron: '0 * * * *' })
+			],
+			handlers: { keyed: async () => {}, hourly: async () => {} }
+		})
+		const cli = createCli(worker, { migrate: true })
+		const triggered = await output(['trigger-cron', 'hourly'], cli)
+		expect(triggered).toMatchObject({
+			code: 0,
+			lines: [{ jobId: expect.any(String) }]
+		})
+		expect((await output(['trigger-cron', 'keyed'], cli)).code).toBe(1)
+		const created = await output(['create-job', 'keyed', '"a"'], cli)
+		const { jobId } = created.lines[0] as { jobId: string }
+		expect(await output(['get-job', '--key', 'keyed:a'], cli)).toMatchObject({
+			code: 0,
+			lines: [{ id: jobId, key: 'keyed:a', payload: 'a' }]
+		})
+		expect(await output(['release-locks', '--all'], cli)).toMatchObject({
+			code: 0,
+			lines: [{ released: [] }]
+		})
+		expect(await output(['delete-failed', '30d'], cli)).toMatchObject({
+			code: 0,
+			lines: [{ deleted: [] }]
+		})
+	})
 })

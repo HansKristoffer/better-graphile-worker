@@ -4,7 +4,9 @@ import {
 	type CompletedJob
 } from './completed-jobs-store.js'
 
-function job(overrides: Partial<CompletedJob> = {}): CompletedJob {
+function job(
+	overrides: Partial<CompletedJob> = {}
+): Omit<CompletedJob, 'queue'> {
 	return {
 		id: '1',
 		queueName: 'q',

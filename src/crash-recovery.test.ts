@@ -133,7 +133,7 @@ suite('crash recovery in PostgreSQL', () => {
 
 		const swept = await sweep()
 
-		expect(swept).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
+		expect(swept).toMatchObject({ workerIds: ['pool-dead'], jobIds: [dead!] })
 		expect(await job(dead!)).toEqual({
 			locked_by: null,
 			attempts: 1,
@@ -162,7 +162,7 @@ suite('crash recovery in PostgreSQL', () => {
 
 		const swept = await sweep('pool-self')
 
-		expect(swept).toEqual({ workerIds: ['pool-dead'], jobIds: [dead!] })
+		expect(swept).toMatchObject({ workerIds: ['pool-dead'], jobIds: [dead!] })
 		expect(await job(own!)).toMatchObject({
 			locked_by: 'pool-self',
 			queue_locked_by: 'pool-self'

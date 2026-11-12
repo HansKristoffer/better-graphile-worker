@@ -4,12 +4,12 @@ import { z } from 'zod'
 import type { QueueContract } from './queue.js'
 import type { BetterWorker } from './create-better-worker.js'
 import type { BetterWorkerPool } from './worker-pool.js'
-import type { JobOptions } from './job-options.js'
+import type { Duration, JobOptions } from './job-options.js'
 import { assertInteger } from './validation.js'
 
 const HELP = `better-graphile-worker CLI
-Commands: list-queues | schema <queue> | create-job <queue> [json] | stats | list-jobs | get-job <id> | retry <id> | fail <id> [reason] | run-once
-Options: --json --priority <n> --run-at <iso> --max-attempts <n> --job-key <key> --queue <name> --state <pending|running|failed> --limit <n> --offset <n> -h, --help`
+Commands: list-queues | schema <queue> | create-job <queue> [json] | trigger-cron <queue> | stats | list-jobs | get-job <id> | get-job --key <key> | retry <id> | fail <id> [reason] | release-locks [--all] | delete-failed <duration> | run-once
+Options: --json --priority <n> --run-at <iso> --max-attempts <n> --job-key <key> --key <key> --queue <name> --state <pending|running|failed> --limit <n> --offset <n> --all -h, --help`
 function number(
 	value: string | undefined,
 	label: string,
@@ -22,6 +22,10 @@ function number(
 	assertInteger(parsed, label, min, max)
 	return parsed
 }
+/** `30d`, or plain milliseconds. */
+function duration(value: string): Duration {
+	return /^\d+$/.test(value) ? Number(value) : (value as Duration)
+}
 function required(value: string | undefined, label: string): string {
 	if (!value) throw new Error(`${label} required`)
 	return value
@@ -29,6 +33,9 @@ function required(value: string | undefined, label: string): string {
 /** Commands that read or write the database; the rest only describe the registry. */
 const DATABASE_COMMANDS = new Set([
 	'create-job',
+	'trigger-cron',
+	'release-locks',
+	'delete-failed',
 	'stats',
 	'list-jobs',
 	'get-job',
@@ -49,12 +56,6 @@ export function createCli<T extends readonly QueueContract[]>(
 	worker: BetterWorker<T> | BetterWorkerPool<T>,
 	options: CliOptions = {}
 ): (argv?: string[]) => Promise<void> {
-	// Dynamic input always goes through the same registry and runtime validation as typed calls.
-	const enqueue = worker.createJob as (
-		name: string,
-		payload?: unknown,
-		options?: JobOptions
-	) => Promise<string | null>
 	return async (argv = process.argv.slice(2)) => {
 		const json = argv.includes('--json')
 		const print = (value: unknown) =>
@@ -73,6 +74,8 @@ export function createCli<T extends readonly QueueContract[]>(
 					'run-at': { type: 'string' },
 					'max-attempts': { type: 'string' },
 					'job-key': { type: 'string' },
+					key: { type: 'string' },
+					all: { type: 'boolean' },
 					queue: { type: 'string' },
 					state: { type: 'string' },
 					limit: { type: 'string' },
@@ -114,10 +117,13 @@ export function createCli<T extends readonly QueueContract[]>(
 					})
 					break
 				}
+				case 'trigger-cron':
 				case 'create-job': {
 					const name = required(args[0], 'Queue name')
 					const queue = worker.queues.find((q) => q.name === name)
 					if (!queue) throw new Error(`Queue "${name}" not found`)
+					if (command === 'trigger-cron' && queue.cron === undefined)
+						throw new Error(`Queue "${name}" has no cron schedule`)
 					const options: JobOptions = {}
 					const priority = number(values.priority, 'priority', -32768, 32767)
 					const maxAttempts = number(
@@ -136,8 +142,13 @@ export function createCli<T extends readonly QueueContract[]>(
 							throw new RangeError('Invalid run-at timestamp')
 					}
 					const payload: unknown =
-						args[1] === undefined ? undefined : JSON.parse(args[1])
-					print({ jobId: await enqueue(name, payload, options) })
+						command === 'trigger-cron' || args[1] === undefined
+							? undefined
+							: JSON.parse(args[1])
+					// A cron name without a payload triggers its run, as trigger-cron does.
+					print({
+						jobId: await worker.enqueueByName(name, payload, options)
+					})
 					break
 				}
 				case 'stats':
@@ -165,7 +176,23 @@ export function createCli<T extends readonly QueueContract[]>(
 					break
 				}
 				case 'get-job':
-					print(await worker.getJob(required(args[0], 'Job id')))
+					print(
+						values.key === undefined
+							? await worker.getJob(required(args[0], 'Job id'))
+							: await worker.getJobByKey(values.key)
+					)
+					break
+				case 'release-locks':
+					print({
+						released: await worker.releaseLocks({ all: values.all === true })
+					})
+					break
+				case 'delete-failed':
+					print({
+						deleted: await worker.deleteFailedJobs(
+							duration(required(args[0], 'Duration'))
+						)
+					})
 					break
 				case 'retry':
 					print({

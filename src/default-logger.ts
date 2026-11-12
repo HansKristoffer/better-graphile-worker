@@ -7,18 +7,22 @@ function formatAttributes(attributes?: LogAttributes): string {
 
 export function createConsoleLogger(options: CreateLoggerOptions): JobLogger {
 	const prefix = `[${options.queue} ${options.jobId}]`
+	const line = (message: string, attributes?: LogAttributes) =>
+		`${prefix} ${message}${formatAttributes(
+			options.attributes ? { ...options.attributes, ...attributes } : attributes
+		)}`
 	return {
 		debug(message, attributes) {
-			console.debug(`${prefix} ${message}${formatAttributes(attributes)}`)
+			console.debug(line(message, attributes))
 		},
 		info(message, attributes) {
-			console.info(`${prefix} ${message}${formatAttributes(attributes)}`)
+			console.info(line(message, attributes))
 		},
 		warn(message, attributes) {
-			console.warn(`${prefix} ${message}${formatAttributes(attributes)}`)
+			console.warn(line(message, attributes))
 		},
 		error(message, attributes) {
-			console.error(`${prefix} ${message}${formatAttributes(attributes)}`)
+			console.error(line(message, attributes))
 		}
 	}
 }

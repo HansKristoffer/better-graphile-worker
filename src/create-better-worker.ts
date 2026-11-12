@@ -20,11 +20,13 @@ import {
 	type CompletedJobsStore
 } from './completed-jobs-store.js'
 import {
+	deleteFailedJobs,
 	getQueueDefinitions,
 	mergeJobStats,
 	queryJobCounts,
 	queryRecentJobs,
 	queryJobProgress,
+	removeJobByKey,
 	type ListedJob,
 	type ListJobsOptions,
 	type QueueDefinition,
@@ -36,11 +38,13 @@ import {
 	DEFAULT_CONCURRENCY,
 	DEFAULT_POLL_INTERVAL,
 	logRegisteredQueues,
+	reportShutdownFailures,
 	runOnceTasks,
 	startRunner,
-	type GraphileRunnerOverrides
+	type GraphileRunnerOverrides,
+	type RunningJob
 } from './worker.js'
-import { jobLogger, observe } from './observers.js'
+import { jobLogger, observe, reportPermanentFailure } from './observers.js'
 import {
 	queryJob,
 	resolveOutcomeRetention,
@@ -54,17 +58,23 @@ import {
 } from './lifecycle.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
-import { assertInteger } from './validation.js'
+import { assertInteger, parseDuration } from './validation.js'
 import { createNoopSpan, getOtel, type OtelOption } from './otel.js'
 import { withQueueMetrics } from './metrics.js'
 import type { JobKeyMode, PayloadMode } from './create-job.js'
 import { assertUniqueQueueNames } from './define-queues.js'
 import {
+	createMaintenance,
 	maintainOnce,
+	releaseLocks,
 	resolveCrashRecovery,
-	startMaintenance,
-	type CrashRecoveryOptions
+	type CrashRecoveryOptions,
+	type Maintenance,
+	type ReleaseLocksOptions
 } from './maintenance.js'
+import { permanentlyFailJobs, type ReleasedJob } from './private-jobs.js'
+import { extractProducerLink } from './payload.js'
+import type { PermanentFailureReason } from './hooks.js'
 import type {
 	CreateJobFn,
 	CreateJobsFn,
@@ -77,7 +87,7 @@ import type {
 	JobsApi,
 	QueueName
 } from './types.js'
-import type { JobOptions, StopOptions } from './job-options.js'
+import type { Duration, JobOptions, StopOptions } from './job-options.js'
 
 export type CompletedJobsOption = false | { maxPerQueue?: number }
 
@@ -139,6 +149,19 @@ type BaseWorkerOptions<TQueues extends readonly QueueContract[]> = {
 	 * enqueue paths keep Graphile's `replace`. Defaults to `replace`.
 	 */
 	transactionalJobKeyMode?: JobKeyMode | undefined
+	/**
+	 * How long running jobs get after `stop()`, in milliseconds. `ctx.signal` aborts when it
+	 * ends; jobs still running 500 ms later are failed (their attempt spent) and unlocked,
+	 * and `stop()` resolves. Without it, `ctx.signal` aborts 5 seconds after `stop()` and
+	 * `stop()` waits for running jobs with no limit.
+	 */
+	shutdownGrace?: number | undefined
+	/**
+	 * Run `migrate()` once before the first enqueue, prepare or admin read, for processes
+	 * that enqueue without starting a worker. Off by default: enqueue-only roles that
+	 * cannot create tables keep working.
+	 */
+	autoMigrate?: boolean | undefined
 }
 
 /** How handlers are registered: inline `processFn`s or a contract handler registry. */
@@ -184,6 +207,15 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	/** Prepare one job and run it in a Prisma transaction, so it commits with the transaction. */
 	readonly enqueueInTransaction: EnqueueInTransactionFn<TQueues>
 	readonly jobs: JobsApi<TQueues>
+	/**
+	 * Enqueue by a name known only at runtime, validated like `createJob`. A cron queue, or
+	 * a cron-init queue without a payload, triggers its cron run.
+	 */
+	enqueueByName(
+		name: string,
+		payload?: unknown,
+		options?: JobOptions
+	): Promise<string | null>
 	readonly promise: Promise<void>
 	migrate(): Promise<void>
 	start(): Promise<void>
@@ -202,6 +234,20 @@ export type BetterWorker<TQueues extends readonly QueueContract[]> = {
 	getJobStats(): Promise<WorkerJobStatsRow[]>
 	listJobs(options?: ListJobsOptions): Promise<ListedJob[]>
 	getJob(id: string): Promise<JobState>
+	/** The live job with this `jobKey`, payload included; null when there is none. */
+	getJobByKey(key: string): Promise<ListedJob | null>
+	/**
+	 * Graphile's `removeJob`: delete the unlocked job with this key, or stop a running one
+	 * from retrying and free its key. Returns its id, or null when there was none.
+	 */
+	removeJob(key: string): Promise<string | null>
+	/**
+	 * Release jobs and lanes whose lock owner looks dead (see `ReleaseLocksOptions`), with
+	 * crash recovery's `staleAfter`. Each attempt stays spent. Returns the released job ids.
+	 */
+	releaseLocks(options?: ReleaseLocksOptions): Promise<string[]>
+	/** Delete permanently failed jobs not updated for `olderThan`. Returns their ids. */
+	deleteFailedJobs(olderThan: Duration): Promise<string[]>
 	/** Read a job's `ctx.progress` value; null once the job no longer exists. */
 	readonly getJobProgress: GetJobProgressFn<TQueues>
 	retryJobs(ids: string[]): Promise<string[]>
@@ -251,16 +297,34 @@ export function createBetterWorker<
 	return createWorker(options, resolveCompletedJobsStore(options.completedJobs))
 }
 
-/** A worker pool's runners share one history, so any of them reports all its jobs. */
+/**
+ * The connections a worker or pool's started runners hold for good: one LISTEN each and
+ * one shared maintenance connection. Without one more, no job can ever be fetched.
+ */
+export function assertPoolSize(pgPool: Pool, runners: number): void {
+	const max = (pgPool as { options?: { max?: unknown } }).options?.max
+	const needed = runners + 2
+	if (typeof max === 'number' && max < needed)
+		throw new TypeError(
+			`pgPool max is ${max}, but ${runners} started runner(s) hold ${runners + 1} connections and need one more to fetch jobs; set max to at least ${needed}, or use pgPoolSize()`
+		)
+}
+
+/**
+ * A worker pool's runners share one history, so any of them reports all its jobs, and
+ * one maintenance loop.
+ */
 export function createWorker<const TQueues extends readonly QueueContract[]>(
 	options: BetterWorkerOptions<TQueues>,
 	completedJobs: CompletedJobsStore,
-	runnerName?: string
+	runnerName?: string,
+	maintenanceLoop: Maintenance = createMaintenance()
 ): BetterWorker<TQueues> {
 	assertUniqueQueueNames(options.queues)
-	const queues = selectProcessed(
-		normalizeWorkerQueues(options.queues, options.handlers),
-		options.process
+	const registered = normalizeWorkerQueues(options.queues, options.handlers)
+	const queues = selectProcessed(registered, options.process)
+	const failureHooks = new Map(
+		registered.map((queue) => [queue.name, queue.onPermanentFailure])
 	)
 	const otel = options.otel ? options.otel.api : getOtel()
 	assertInteger(options.concurrency ?? DEFAULT_CONCURRENCY, 'concurrency', 1)
@@ -281,6 +345,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			0,
 			2147483647
 		)
+	if (options.shutdownGrace !== undefined)
+		assertInteger(options.shutdownGrace, 'shutdownGrace', 0, 2147483647)
 
 	const crashRecovery = resolveCrashRecovery(options.crashRecovery)
 	const restart = resolveRestart(options.restart)
@@ -294,6 +360,15 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		pgPool: options.pgPool,
 		schema
 	})
+	const ready = options.autoMigrate ? () => client.ensureMigrated() : undefined
+	/** Admin reads and writes run after `autoMigrate`'s migration. */
+	const admin = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+		ready
+			? async (...args: A) => {
+					await ready()
+					return fn(...args)
+				}
+			: fn
 	const producer = bindCreateJob<TQueues>({
 		enqueue: client.enqueue,
 		otel,
@@ -304,14 +379,39 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 			validateOnEnqueue: options.validateOnEnqueue,
 			defaultMaxAttempts: options.defaultMaxAttempts,
 			payloadMode: options.payloadMode,
-			transactionalJobKeyMode: options.transactionalJobKeyMode
+			transactionalJobKeyMode: options.transactionalJobKeyMode,
+			ready
 		})
 	})
 	const { createJob, createJobs, prepareJob, prepareJobs } = producer
 	const jobs = createJobsApi(createJob, options.queues)
 	const logger = createStartupLogger(hooks)
 	const outcomeRetention = resolveOutcomeRetention(options.jobOutcomes)
-	let maintenance: ReturnType<typeof startMaintenance> | undefined
+	let maintenance: ReturnType<Maintenance['register']> | undefined
+	const running = new Map<string, RunningJob>()
+	/** Report jobs that failed for good without a handler finishing them. */
+	async function reportFailed(
+		jobs: readonly ReleasedJob[],
+		reason: PermanentFailureReason
+	) {
+		for (const job of jobs) {
+			const init = job.task.endsWith(CRON_INIT_SUFFIX)
+			await reportPermanentFailure(
+				hooks,
+				init ? undefined : failureHooks.get(job.task),
+				{
+					reason,
+					error: new Error(job.lastError),
+					queue: job.task,
+					jobId: job.id,
+					operation: init ? 'init' : 'process',
+					attempts: job.attempts,
+					maxAttempts: job.maxAttempts,
+					payload: extractProducerLink(job.payload).cleanPayload
+				}
+			)
+		}
+	}
 	const runtime = {
 		hooks,
 		completedJobs,
@@ -326,7 +426,8 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		heartbeatReady: () => maintenance?.ready,
 		queues: options.queues,
 		prepareJob: producer.prepareOne,
-		prepareJobs: producer.prepareMany
+		prepareJobs: producer.prepareMany,
+		running
 	}
 
 	/**
@@ -356,14 +457,16 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		schema,
 		logger,
 		recovery: crashRecovery,
-		outcomeRetention
+		outcomeRetention,
+		onExhausted: (jobs: ReleasedJob[]) => reportFailed(jobs, 'worker_lost')
 	}
 
 	const lifecycle = createLifecycle({
 		start: async (restarting) => {
 			if (!restarting) {
+				if (runnerName === undefined) assertPoolSize(options.pgPool, 1)
 				logger.info('Starting graphile-worker')
-				logRegisteredQueues(queues, logger)
+				logRegisteredQueues(queues, logger, options.defaultTimeout)
 			}
 			const maintained = await prepareTables()
 			return startRunner({
@@ -378,12 +481,14 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 				secondLookOnNotify: options.secondLookOnNotify,
 				prefetch: options.prefetch,
 				runnerName,
+				shutdownGrace: options.shutdownGrace,
+				onForcedShutdown: () => reportShutdownFailures(runtime),
 				maintain: maintained
 					? (workerId) =>
-							(maintenance = startMaintenance({
-								...maintenanceOptions,
-								workerId
-							}))
+							(maintenance = maintenanceLoop.register(
+								workerId,
+								maintenanceOptions
+							))
 					: undefined
 			})
 		},
@@ -432,6 +537,7 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		prepareJobs,
 		enqueueInTransaction: producer.enqueueInTransaction,
 		jobs,
+		enqueueByName: producer.enqueueByName,
 		get promise() {
 			return lifecycle.promise
 		},
@@ -472,35 +578,57 @@ export function createWorker<const TQueues extends readonly QueueContract[]>(
 		getCompletedJobsStats() {
 			return completedJobs.getStats()
 		},
-		async getJobStats() {
-			const utils = client
-			const rows = await queryJobCounts(utils, schema)
+		getJobStats: admin(async () => {
+			const rows = await queryJobCounts(client, schema)
 			const taskIdentifiers = options.queues.flatMap((queue) =>
 				getQueueType(queue) === 'cron-init'
 					? [queue.name, `${queue.name}${CRON_INIT_SUFFIX}`]
 					: [queue.name]
 			)
 			return mergeJobStats(rows, completedJobs.getStats(), taskIdentifiers)
-		},
-		async listJobs(listOptions) {
-			const utils = client
-			return queryRecentJobs(utils, schema, listOptions)
-		},
-		getJob: (id) => queryJob(client, schema, id),
-		getJobProgress: ((queue: string, jobId: string) =>
-			queryJobProgress(
-				client,
-				schema,
-				options.queues,
-				queue,
-				jobId
-			)) as GetJobProgressFn<TQueues>,
-		retryJobs: (ids) => client.retryJobs(ids),
-		async failJobs(ids, reason) {
-			const utils = await client.getUtils()
-			const jobs = await utils.permanentlyFailJobs(ids, reason)
-			return jobs.map((job) => String(job.id))
-		},
+		}),
+		listJobs: admin((listOptions?: ListJobsOptions) =>
+			queryRecentJobs(client, schema, listOptions)
+		),
+		getJob: admin((id: string) => queryJob(client, schema, id)),
+		getJobByKey: admin(async (key: string) => {
+			const [job] = await queryRecentJobs(client, schema, {
+				key,
+				includePayload: true,
+				limit: 1
+			})
+			return job ?? null
+		}),
+		removeJob: admin((key: string) => removeJobByKey(client, schema, key)),
+		releaseLocks: admin(async (releaseOptions?: ReleaseLocksOptions) => {
+			const released = await client.withPgClient((pgClient) =>
+				releaseLocks(
+					pgClient,
+					schema,
+					crashRecovery?.staleAfter ?? resolveCrashRecovery(true)!.staleAfter,
+					releaseOptions
+				)
+			)
+			await reportFailed(
+				released.filter((job) => job.attempts >= job.maxAttempts),
+				'worker_lost'
+			)
+			return released.map((job) => job.id)
+		}),
+		deleteFailedJobs: admin((olderThan: Duration) =>
+			deleteFailedJobs(client, schema, parseDuration(olderThan, 'olderThan'))
+		),
+		getJobProgress: admin((queue: string, jobId: string) =>
+			queryJobProgress(client, schema, options.queues, queue, jobId)
+		) as GetJobProgressFn<TQueues>,
+		retryJobs: admin((ids: string[]) => client.retryJobs(ids)),
+		failJobs: admin(async (ids: string[], reason?: string) => {
+			const failed = await client.withPgClient((pgClient) =>
+				permanentlyFailJobs(pgClient, schema, ids, reason)
+			)
+			await reportFailed(failed, 'failJobs')
+			return failed.map((job) => job.id)
+		}),
 		getQueueDefinitions() {
 			return getQueueDefinitions(
 				options.queues,

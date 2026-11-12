@@ -1,7 +1,7 @@
 /** Version-specific SQL for Graphile Worker 0.17.x; keep private-table access here. */
 import type { JobHelpers, WorkerUtils } from 'graphile-worker'
 import type { PoolClient } from 'pg'
-import { addJobSql } from './enqueue-sql.js'
+import { addJobSql, JOB_KEY_RACE_RERUNS } from './enqueue-sql.js'
 import { StepPersistenceError } from './errors.js'
 import { JOB_OUTCOMES_TABLE } from './job-outcomes.js'
 import { compact } from './options.js'
@@ -342,27 +342,108 @@ FOR UPDATE OF jobs`,
  * job that keeps killing its worker exhausts max_attempts and fails permanently.
  */
 export async function releaseJobsLockedBy(
-	client: PoolClient,
+	client: Pick<PoolClient, 'query'>,
 	schema: string,
 	workerIds: readonly string[]
-): Promise<string[]> {
+): Promise<ReleasedJob[]> {
 	const quoted = quoteSchemaName(schema)
-	const result = await client.query<{ id: string }>(
+	const result = await client.query<{
+		id: string
+		task: string
+		attempts: number
+		max_attempts: number
+		payload: unknown
+		last_error: string
+	}>(
 		`WITH jobs AS (
 	UPDATE ${quoted}._private_jobs SET
 		last_error = 'Worker ' || locked_by || ' stopped sending heartbeats (crashed or blocked); released by crash recovery',
 		run_at = greatest(now(), run_at) + ${graphileBackoff('attempts')},
 		locked_by = NULL, locked_at = NULL
 	WHERE locked_by = ANY($1::text[])
-	RETURNING id
+	RETURNING id, task_id, attempts, max_attempts, payload, last_error
 ), queues AS (
 	UPDATE ${quoted}._private_job_queues SET locked_by = NULL, locked_at = NULL
 	WHERE locked_by = ANY($1::text[])
 )
-SELECT id::text FROM jobs`,
+SELECT jobs.id::text, tasks.identifier AS task, jobs.attempts, jobs.max_attempts, jobs.payload, jobs.last_error
+FROM jobs JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id`,
 		[workerIds]
 	)
-	return result.rows.map((row) => row.id)
+	return result.rows.map((row) => ({
+		id: row.id,
+		task: row.task,
+		attempts: row.attempts,
+		maxAttempts: row.max_attempts,
+		payload: row.payload,
+		lastError: row.last_error
+	}))
+}
+
+/**
+ * Graphile's `permanently_fail_jobs` (unlocked jobs only), with each job's task and
+ * stored payload so the caller can report them.
+ */
+export async function permanentlyFailJobs(
+	client: Pick<PoolClient, 'query'>,
+	schema: string,
+	ids: readonly string[],
+	reason: string | undefined
+): Promise<ReleasedJob[]> {
+	const quoted = quoteSchemaName(schema)
+	const result = await client.query<{
+		id: string
+		task: string
+		attempts: number
+		max_attempts: number
+		payload: unknown
+		last_error: string
+	}>(
+		`SELECT jobs.id::text, tasks.identifier AS task, jobs.attempts, jobs.max_attempts, jobs.payload, jobs.last_error
+FROM ${quoted}.permanently_fail_jobs($1::bigint[], $2::text) AS jobs
+JOIN ${quoted}._private_tasks tasks ON tasks.id = jobs.task_id`,
+		[ids, reason ?? null]
+	)
+	return result.rows.map((row) => ({
+		id: row.id,
+		task: row.task,
+		attempts: row.attempts,
+		maxAttempts: row.max_attempts,
+		payload: row.payload,
+		lastError: row.last_error
+	}))
+}
+
+/** A job crash recovery unlocked; with `attempts >= maxAttempts` it failed for good. */
+export type ReleasedJob = {
+	id: string
+	task: string
+	attempts: number
+	maxAttempts: number
+	/** The stored payload, envelope included. */
+	payload: unknown
+	lastError: string
+}
+
+/** A wait's children, rerun from a savepoint while one loses a `jobKey` race. */
+async function addChildren(
+	client: Pick<PoolClient, 'query'>,
+	prepared: PreparedJob,
+	count: number
+): Promise<string[]> {
+	for (let run = 0; ; run++) {
+		await client.query('SAVEPOINT bgw_children')
+		const added = await client.query<{ id: string | null }>(
+			prepared.text,
+			prepared.values
+		)
+		const ids = added.rows.flatMap((row) => (row.id ? [row.id] : []))
+		if (ids.length === count || run === JOB_KEY_RACE_RERUNS) {
+			await client.query('RELEASE SAVEPOINT bgw_children')
+			return ids
+		}
+		await client.query('ROLLBACK TO SAVEPOINT bgw_children')
+	}
 }
 
 /** Where a suspended job's run_at points when its wait has no timeout. */
@@ -424,12 +505,8 @@ export async function enterWait(
 	VALUES ($1::bigint, $2::text, $3::int, now() + $4::float8 * interval '1 millisecond')`,
 					[...key, wait.count, wait.timeout ?? null]
 				)
-				const added = await client.query<{ id: string | null }>(
-					prepared.text,
-					prepared.values
-				)
-				const ids = added.rows.map((row) => row.id)
-				if (ids.length !== wait.count || ids.some((id) => !id))
+				const ids = await addChildren(client, prepared, wait.count)
+				if (ids.length !== wait.count)
 					throw new Error(
 						`Wait "${wait.waitId}" enqueued ${ids.length} of ${wait.count} children; a jobKey may have been claimed concurrently`
 					)

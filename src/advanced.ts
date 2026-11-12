@@ -14,7 +14,8 @@ export type { IdempotentJobSpec } from './enqueue-sql.js'
 export {
 	buildTaskList,
 	buildCronItems,
-	type TaskListRuntime
+	type TaskListRuntime,
+	type RunningJob
 } from './worker.js'
 export {
 	injectTraceContext,

@@ -10,6 +10,13 @@ export type SqlStatement = {
 
 const ID_COLUMN = 'jobs.id::text AS id'
 
+/**
+ * How often to rerun an enqueue that returned no job for a key. Graphile's keyed upsert
+ * frees a running job's key and then skips a job a worker locked in between; the rerun
+ * sees that lock and frees the key.
+ */
+export const JOB_KEY_RACE_RERUNS = 2
+
 function timestamp(value: TaskSpec['runAt']): string | null {
 	if (value === undefined || value === null) return null
 	return value instanceof Date ? value.toISOString() : String(value)
@@ -190,17 +197,21 @@ BEGIN
 		IF job_id_ IS NOT NULL THEN
 			deduplicated := true;
 		ELSE
-			SELECT jobs.id INTO job_id_ FROM ${quoted}.add_job(
-				identifier := item.spec->>'identifier',
-				payload := item.spec->'payload',
-				queue_name := item.spec->>'queue_name',
-				run_at := (item.spec->>'run_at')::timestamptz,
-				max_attempts := (item.spec->>'max_attempts')::int,
-				job_key := item.spec->>'job_key',
-				priority := (item.spec->>'priority')::int,
-				flags := (SELECT array_agg(flag) FROM json_array_elements_text(item.spec->'flags') AS flag),
-				job_key_mode := coalesce(item.spec->>'job_key_mode', 'replace')
-			) AS jobs;
+			-- A keyed add_job returns no id when a worker locks its job mid-upsert; a rerun frees the key.
+			FOR rerun_ IN 0..${JOB_KEY_RACE_RERUNS} LOOP
+				SELECT jobs.id INTO job_id_ FROM ${quoted}.add_job(
+					identifier := item.spec->>'identifier',
+					payload := item.spec->'payload',
+					queue_name := item.spec->>'queue_name',
+					run_at := (item.spec->>'run_at')::timestamptz,
+					max_attempts := (item.spec->>'max_attempts')::int,
+					job_key := item.spec->>'job_key',
+					priority := (item.spec->>'priority')::int,
+					flags := (SELECT array_agg(flag) FROM json_array_elements_text(item.spec->'flags') AS flag),
+					job_key_mode := coalesce(item.spec->>'job_key_mode', 'replace')
+				) AS jobs;
+				EXIT WHEN job_id_ IS NOT NULL OR item.spec->>'job_key' IS NULL;
+			END LOOP;
 			IF item.spec->>'idempotency_key' IS NOT NULL THEN
 				UPDATE ${table} SET job_id = job_id_
 				WHERE queue = item.spec->>'identifier' AND key = item.spec->>'idempotency_key';

@@ -6,6 +6,7 @@ import type { Pool } from 'pg'
 import {
 	buildTaskList,
 	buildCronItems,
+	logRegisteredQueues,
 	type TaskListRuntime
 } from './worker.js'
 import { DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS } from './create-job.js'
@@ -473,4 +474,28 @@ describe('explicit failure policy', () => {
 			)
 		).resolves.toBeUndefined()
 	})
+})
+
+test('the startup log lists each queue with its effective timeout', () => {
+	const lines: string[] = []
+	logRegisteredQueues(
+		[
+			defineQueue({ name: 'fast', inputSchema: z.string(), timeout: 30_000 }),
+			defineQueue({ name: 'odd', inputSchema: z.string(), timeout: 1500 }),
+			defineQueue({ name: 'tick', cron: '* * * * *' })
+		],
+		{
+			debug() {},
+			warn() {},
+			error() {},
+			info: (line) => void lines.push(line)
+		},
+		120_000
+	)
+	expect(lines).toEqual([
+		'Registered queues:',
+		'  - fast (regular, timeout 30s)',
+		'  - odd (regular, timeout 1500ms)',
+		'  - tick (cron: * * * * *, timeout 2m)'
+	])
 })

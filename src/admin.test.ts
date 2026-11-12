@@ -33,6 +33,7 @@ describe('mergeJobStats', () => {
 
 		expect(stats).toEqual([
 			{
+				queue: 'sendEmail',
 				taskIdentifier: 'sendEmail',
 				pending: 2,
 				running: 1,
@@ -41,6 +42,7 @@ describe('mergeJobStats', () => {
 				recentFailed: 1
 			},
 			{
+				queue: 'dailySweep',
 				taskIdentifier: 'dailySweep',
 				pending: 0,
 				running: 0,
@@ -69,6 +71,7 @@ describe('mergeJobStats', () => {
 		)
 		expect(stats).toEqual([
 			{
+				queue: 'leftover',
 				taskIdentifier: 'leftover',
 				pending: 0,
 				running: 0,

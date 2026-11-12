@@ -1,4 +1,4 @@
-import { expect, expectTypeOf, test } from 'bun:test'
+import { describe, expect, expectTypeOf, test } from 'bun:test'
 import { z } from 'zod'
 import { defineQueue } from './queue.js'
 import { defineQueues } from './define-queues.js'
@@ -6,6 +6,7 @@ import { createTestHarness } from './testing.js'
 import { createBetterWorker } from './create-better-worker.js'
 import { normalizeWorkerQueues } from './registry.js'
 import type { Pool } from 'pg'
+import type { PermanentFailureReason } from './hooks.js'
 
 test('inline handlers infer transformed payloads and enqueue through queue references', async () => {
 	const received: number[] = []
@@ -158,4 +159,43 @@ test('inline definitions require valid initializers and cannot also register han
 			handlers: { inline: () => {} }
 		})
 	).toThrow('not both')
+})
+
+describe('onPermanentFailure types', () => {
+	test('inline and registry hooks receive the wire input; contracts cannot carry one', () => {
+		const inline = defineQueue({
+			name: 'inlineHook',
+			inputSchema: z.object({ count: z.coerce.number() }),
+			processFn: async () => {},
+			onPermanentFailure: (input, event) => {
+				expectTypeOf(input).toEqualTypeOf<{ count: unknown }>()
+				expectTypeOf(event.reason).toEqualTypeOf<PermanentFailureReason>()
+			}
+		})
+		const contract = defineQueue({
+			name: 'contractHook',
+			inputSchema: z.object({ id: z.string() })
+		})
+		void (() =>
+			createBetterWorker({
+				pgPool: {} as Pool,
+				queues: [contract],
+				handlers: {
+					contractHook: {
+						processFn: async () => {},
+						onPermanentFailure: (input) => {
+							expectTypeOf(input).toEqualTypeOf<{ id: string }>()
+						}
+					}
+				}
+			}))
+		void (() =>
+			defineQueue({
+				name: 'contractWithHook',
+				inputSchema: z.string(),
+				// @ts-expect-error A shared contract carries no handler-side hook.
+				onPermanentFailure: () => {}
+			}))
+		expect(inline.name).toBe('inlineHook')
+	})
 })

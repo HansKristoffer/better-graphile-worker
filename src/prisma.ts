@@ -1,3 +1,4 @@
+import { JOB_KEY_RACE_RERUNS } from './enqueue-sql.js'
 import { EnqueueCountError, EnqueueSkippedError } from './errors.js'
 import type { PreparedJob } from './types.js'
 
@@ -47,9 +48,9 @@ function jobIds(queue: string, rows: unknown): (string | null)[] {
 
 /**
  * Run a `prepareJob` / `prepareJobs` statement in a Prisma transaction, so the jobs commit
- * or roll back with its other writes. Returns the job ids in input order, and throws
- * `EnqueueCountError`, which rolls the transaction back, when Graphile created fewer jobs
- * than prepared.
+ * or roll back with its other writes. Returns the job ids in input order. A single job
+ * that lost a `jobKey` race is rerun; otherwise it throws `EnqueueCountError`, which rolls
+ * the transaction back, when Graphile created fewer jobs than prepared.
  */
 export async function enqueueInTransaction(
 	tx: RawQueryClient,
@@ -59,11 +60,15 @@ export async function enqueueInTransaction(
 	if (prepared.skipped && options?.required)
 		throw new EnqueueSkippedError(prepared.queue)
 	if (prepared.count === 0) return []
-	const ids = jobIds(
-		prepared.queue,
-		await tx.$queryRawUnsafe(prepared.text, ...prepared.values)
-	).filter((id) => id !== null)
-	if (ids.length !== prepared.count)
-		throw new EnqueueCountError(prepared.queue, prepared.count, ids.length)
-	return ids
+	for (let run = 0; ; run++) {
+		const ids = jobIds(
+			prepared.queue,
+			await tx.$queryRawUnsafe(prepared.text, ...prepared.values)
+		).filter((id) => id !== null)
+		if (ids.length === prepared.count) return ids
+		// A single job that returned no id inserted nothing, so it can run again in the same
+		// transaction. A short batch already inserted its other jobs.
+		if (prepared.count !== 1 || run === JOB_KEY_RACE_RERUNS)
+			throw new EnqueueCountError(prepared.queue, prepared.count, ids.length)
+	}
 }

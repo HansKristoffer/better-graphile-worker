@@ -12,10 +12,14 @@ import {
 import type { JobLogger, LogAttributes } from './hooks.js'
 import { createNoopSpan } from './otel.js'
 import type {
-	QueueInput,
-	QueueName,
+	CreateJobFn,
+	CreateJobsFn,
 	CronInitQueueName,
-	InferInput
+	CronQueueName,
+	EnqueueInTransactionFn,
+	InferInput,
+	QueueInput,
+	QueueName
 } from './types.js'
 import {
 	createStepRunner,
@@ -25,7 +29,11 @@ import {
 } from './steps.js'
 import { encodeQueueOutput, type ChildReport } from './waits.js'
 import { extractProducerLink } from './payload.js'
-import { bindCreateJob, parseQueuePayload } from './create-job.js'
+import {
+	bindCreateJob,
+	DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS,
+	parseQueuePayload
+} from './create-job.js'
 import { normalizeWorkerQueues, type NormalizedQueue } from './registry.js'
 import type { JobOptions } from './job-options.js'
 import { JobContinuedSignal, UnknownQueueError } from './errors.js'
@@ -83,6 +91,26 @@ export type TestHarness<T extends readonly QueueContract[]> = {
 		queueName: N,
 		extras?: Partial<JobContext<T, NoInfer<N>>>
 	): JobContext<T, N>
+	/**
+	 * Enqueue as the worker would, validated and with derived options, into `enqueued`.
+	 * Hand these to the code under test in place of the app's producer.
+	 */
+	createJob: CreateJobFn<T>
+	createJobs: CreateJobsFn<T>
+	/** Like `createJob`; the transaction is not used. */
+	enqueueInTransaction: EnqueueInTransactionFn<T>
+	/** Capture a cron queue's run: its task, or its `{name}_cron-init` task. */
+	triggerCron<N extends CronQueueName<T>>(
+		queueName: N,
+		options?: JobOptions
+	): Promise<string | null>
+	/**
+	 * Run each enqueued job that has not run yet, and the jobs those enqueue, in order
+	 * until none is left, ignoring `runAt`. A cron-init trigger runs its `initFn` and
+	 * enqueues its items. Continuations stay in `continued`. Throws the first job's error,
+	 * or after `maxJobs` (default 1000) runs. Returns how many ran.
+	 */
+	drain(options?: { maxJobs?: number }): Promise<number>
 }
 
 function createCapturingLogger(logs: CapturedLog[]): JobLogger {
@@ -174,6 +202,8 @@ export function createTestHarness<
 	let invocation = 0
 	const enqueued: CapturedEnqueue[] = []
 	const continued: CapturedContinue[] = []
+	/** Captured jobs that already ran: drained ones and waited children. */
+	const ran = new Set<string>()
 	const producer = bindCreateJob({
 		queues: contracts,
 		otel: null,
@@ -219,6 +249,7 @@ export function createTestHarness<
 				: [await producer.enqueueOne(queue.name, inputs[0])]
 			// The harness has no shouldSkipEnqueue hook, so every child has an id.
 			const ids = enqueued.filter((id) => id !== null)
+			for (const id of ids) ran.add(id)
 
 			const child = getQueue(queue.name)
 			const reports: (ChildReport & { id: string })[] = []
@@ -255,11 +286,27 @@ export function createTestHarness<
 		}
 	}
 
+	/** The queue's own maxAttempts, as Graphile would store it on the job. */
+	function maxAttemptsOf(queueName: string): number {
+		const name = queueName.endsWith(CRON_INIT_SUFFIX)
+			? queueName.slice(0, -CRON_INIT_SUFFIX.length)
+			: queueName
+		const queue = queues.find((item) => item.name === name)
+		return (
+			(queue?.cron === undefined
+				? undefined
+				: queue.cronOptions?.maxAttempts) ??
+			queue?.maxAttempts ??
+			DEFAULT_GRAPHILE_JOB_MAX_ATTEMPTS
+		)
+	}
+
 	function createContext(
 		queueName: string,
 		extras?: Partial<JobContext>
 	): { ctx: JobContext; progress: ProgressRunner } {
 		const jobId = extras?.jobId ?? `test-job-${++invocation}`
+		const maxAttempts = extras?.maxAttempts ?? maxAttemptsOf(queueName)
 		const cacheId = JSON.stringify([queueName, jobId])
 		if (!stepCaches.has(cacheId))
 			stepCaches.set(cacheId, createMemoryStepStore())
@@ -277,13 +324,14 @@ export function createTestHarness<
 			extras?.helpers?.abortSignal ??
 			new AbortController().signal
 		const helpers =
-			extras?.helpers ?? fakeHelpers(queueName, { ...extras, jobId, signal })
+			extras?.helpers ??
+			fakeHelpers(queueName, { ...extras, jobId, signal, maxAttempts })
 		let called = false
 		const ctx: JobContext = {
 			jobId,
 			queue: extras?.queue ?? queueName,
 			attempt: extras?.attempt ?? 1,
-			maxAttempts: extras?.maxAttempts ?? 4,
+			maxAttempts,
 			logger: extras?.logger ?? logger,
 			span,
 			helpers,
@@ -378,7 +426,37 @@ export function createTestHarness<
 			)
 			return result ?? []
 		},
-		context
+		context,
+		createJob: producer.enqueueOne,
+		createJobs: producer.enqueueMany,
+		triggerCron: producer.triggerCron,
+		enqueueInTransaction(
+			_tx: unknown,
+			{
+				task,
+				payload,
+				...jobOptions
+			}: { task: string; payload?: unknown } & JobOptions
+		) {
+			return producer.enqueueOne(task, payload, jobOptions)
+		},
+		async drain({ maxJobs = 1000 }: { maxJobs?: number } = {}) {
+			let count = 0
+			for (;;) {
+				const next = enqueued.find((job) => !ran.has(job.id))
+				if (!next) return count
+				if (++count > maxJobs)
+					throw new Error(
+						`drain() ran ${maxJobs} jobs and more are enqueued; a job may enqueue itself`
+					)
+				ran.add(next.id)
+				if (next.queue.endsWith(CRON_INIT_SUFFIX)) {
+					const name = next.queue.slice(0, -CRON_INIT_SUFFIX.length)
+					const items = await harness.init(name)
+					if (items.length) await producer.enqueueMany(name, items)
+				} else await harness.process(next.queue, next.payload)
+			}
+		}
 	}
 	return harness as unknown as TestHarness<TQueues>
 }
