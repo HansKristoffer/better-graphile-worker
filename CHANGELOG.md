@@ -1,5 +1,17 @@
 # Changelog
 
+## [3.0.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.8.0...v3.0.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* free serial lanes at once, faster batch enqueue and safer worker defaults ([#38](https://github.com/HansKristoffer/better-graphile-worker/issues/38))
+
+### Features
+
+* free serial lanes at once, faster batch enqueue and safer worker defaults ([#38](https://github.com/HansKristoffer/better-graphile-worker/issues/38)) ([53f4ca8](https://github.com/HansKristoffer/better-graphile-worker/commit/53f4ca8474fe852801dfcc087a34b001714e823e))
+* report every permanent failure, bound shutdown, queue retry delays and rerun jobKey races ([#36](https://github.com/HansKristoffer/better-graphile-worker/issues/36)) ([e290e87](https://github.com/HansKristoffer/better-graphile-worker/commit/e290e87d2360c647b13a863eeb9aae02fb2de9d1))
+
 ## [2.8.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.7.0...v2.8.0) (2026-10-30)
 
 
