@@ -71,7 +71,7 @@ export function normalizeWorkerQueues<T extends readonly QueueContract[]>(
 			typeof value.processFn !== 'function'
 		)
 			throw new TypeError(`Queue "${queue.name}" requires a processFn`)
-		if (queue.timeout !== undefined)
+		if (queue.timeout !== undefined && queue.timeout !== false)
 			assertInteger(
 				queue.timeout,
 				`Queue "${queue.name}" timeout`,

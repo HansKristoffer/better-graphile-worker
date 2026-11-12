@@ -30,6 +30,11 @@ export type StopOptions = {
 	 * Shutdown continues and can still be awaited. Off by default.
 	 */
 	probeDatabase?: boolean | DatabaseProbeOptions | undefined
+	/**
+	 * End `pgPool` once shutdown finishes, for a process that is about to exit. After
+	 * `DatabaseUnreachableError` the pool is ended without waiting for its clients.
+	 */
+	endPool?: boolean | undefined
 }
 
 export type DatabaseProbeOptions = {

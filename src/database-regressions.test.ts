@@ -123,9 +123,7 @@ suite('PostgreSQL regression cases', () => {
 			hooks: { createLogger: () => quiet }
 		})
 		const stats = await fresh.getJobStats()
-		expect(
-			stats.find((row) => row.taskIdentifier === 'permanent')?.failed
-		).toBe(1)
+		expect(stats.find((row) => row.queue === 'permanent')?.failed).toBe(1)
 		const jobs = await fresh.listJobs({
 			queue: 'permanent',
 			includePayload: false
@@ -214,9 +212,8 @@ suite('PostgreSQL regression cases', () => {
 				lastError: expect.stringContaining('version-2 envelope')
 			})
 			expect(
-				(await strict.getJobStats()).find(
-					(row) => row.taskIdentifier === 'unsupported'
-				)?.failed
+				(await strict.getJobStats()).find((row) => row.queue === 'unsupported')
+					?.failed
 			).toBe(1)
 		} finally {
 			await strict.stop()

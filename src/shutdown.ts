@@ -97,3 +97,22 @@ export async function whileReachable(
 	})()
 	return Promise.race([settled, unreachable])
 }
+
+/**
+ * `stop({ endPool })`: end the caller's pool once the stop settles. When the database is
+ * unreachable its checked-out clients may never be released, so the pool is ended
+ * without waiting and the `DatabaseUnreachableError` still rejects.
+ */
+export async function thenEndPool(
+	stopping: Promise<void>,
+	pgPool: Pool
+): Promise<void> {
+	try {
+		await stopping
+	} catch (error) {
+		if (error instanceof DatabaseUnreachableError)
+			void pgPool.end().catch(() => {})
+		throw error
+	}
+	await pgPool.end()
+}

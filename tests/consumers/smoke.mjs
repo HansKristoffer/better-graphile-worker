@@ -4,17 +4,18 @@ import * as client from 'better-graphile-worker/client'
 import * as advanced from 'better-graphile-worker/advanced'
 import { createTestHarness } from 'better-graphile-worker/testing'
 import { createCli } from 'better-graphile-worker/cli'
-import { enqueueInTransaction } from 'better-graphile-worker/prisma'
+import { runPreparedJob } from 'better-graphile-worker/prisma'
 import pg from 'pg'
 import { z } from 'zod'
 
-assert.equal(root.createJobClient, client.createJobClient)
+assert.equal(root.createJobClient, undefined)
+assert.equal(typeof client.createJobClient, 'function')
 assert.equal(typeof advanced.createWorkerClient, 'function')
 for (const name of ['createQueue', 'setOtelApi', 'bindCreateJob', 'createJobsApi', 'buildTaskList', 'createWorkerClient', 'getOtel']) assert.equal(Object.hasOwn(root, name), false)
 assert.equal(advanced.getOtel(), null)
 assert.equal(typeof createTestHarness, 'function')
 assert.equal(typeof createCli, 'function')
-assert.equal(typeof enqueueInTransaction, 'function')
+assert.equal(typeof runPreparedJob, 'function')
 assert.equal(typeof root.createBetterWorkerPool, 'function')
 for (const name of ['EnqueueCountError', 'EnqueueSkippedError', 'DatabaseUnreachableError']) assert.equal(typeof root[name], 'function')
 if (process.env.DATABASE_URL) {
@@ -55,7 +56,7 @@ if (process.env.DATABASE_URL) {
 		await worker.runOnce()
 		assert.equal(calls, 2)
 		assert.equal(children, 2)
-		assert.equal((await worker.getJobStats()).find(row => row.taskIdentifier === 'fail').failed, 1)
+		assert.equal((await worker.getJobStats()).find(row => row.queue === 'fail').failed, 1)
 		await worker.retryJobs([id])
 		assert.equal((await worker.listJobs({ queue: 'fail', state: 'pending' }))[0].attempts, 0)
 		await producer.release()

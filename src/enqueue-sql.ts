@@ -76,7 +76,7 @@ export function addJobsSql(
 	-- One equality column lets PostgreSQL hash-join; keyed rows match by key.
 	SELECT id, coalesce('k' || key, 'c' || row_number() OVER (PARTITION BY key IS NULL, fp ORDER BY id) || fp) AS match
 	FROM (
-		SELECT id, key, jsonb_build_array(run_at, max_attempts, priority, flags)::text || payload::text AS fp
+		SELECT id, key, jsonb_build_array(run_at, max_attempts, priority, flags)::text || payload::text COLLATE "C" AS fp
 		FROM jobs
 	) AS rows
 ), wanted AS (
@@ -85,7 +85,7 @@ export function addJobsSql(
 		SELECT ord, (spec).job_key AS key, jsonb_build_array(
 			coalesce((spec).run_at, now()), coalesce((spec).max_attempts, 25), coalesce((spec).priority, 0),
 			(SELECT jsonb_object_agg(flag, true) FROM unnest((spec).flags) AS flag)
-		)::text || coalesce((spec).payload, '{}'::json)::text AS fp
+		)::text || coalesce((spec).payload, '{}'::json)::text COLLATE "C" AS fp
 		FROM input
 	) AS rows
 )

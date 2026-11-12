@@ -3,11 +3,7 @@ import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
 import { createJobClient } from './job-client.js'
 import { defineQueue } from './queue.js'
-import {
-	enqueueInTransaction,
-	type PrismaRawClient,
-	type RawQueryClient
-} from './prisma.js'
+import { runPreparedJob, type RawQueryClient } from './prisma.js'
 import { EnqueueCountError, EnqueueSkippedError } from './errors.js'
 import type {
 	EnqueueInTransactionFn,
@@ -23,32 +19,32 @@ const prepared = (count: number): PreparedJob => ({
 	count,
 	skipped: false
 })
-const rows = (...ids: (string | null)[]): PrismaRawClient => ({
+const rows = (...ids: (string | null)[]): RawQueryClient => ({
 	$queryRawUnsafe: async <T>() => ids.map((id) => ({ id })) as T
 })
 
-describe('enqueueInTransaction', () => {
+describe('runPreparedJob', () => {
 	test('returns the job ids in order', async () => {
-		expect(await enqueueInTransaction(rows('1', '2'), prepared(2))).toEqual([
+		expect(await runPreparedJob(rows('1', '2'), prepared(2))).toEqual([
 			'1',
 			'2'
 		])
 	})
 
 	test('a skipped or empty statement runs nothing', async () => {
-		const tx: PrismaRawClient = {
+		const tx: RawQueryClient = {
 			$queryRawUnsafe: () => {
 				throw new Error('ran')
 			}
 		}
-		expect(
-			await enqueueInTransaction(tx, { ...prepared(0), skipped: true })
-		).toEqual([])
+		expect(await runPreparedJob(tx, { ...prepared(0), skipped: true })).toEqual(
+			[]
+		)
 	})
 
 	test('throws EnqueueCountError, rolling the transaction back, when a job is missing', async () => {
 		for (const tx of [rows('1', null), rows('1')]) {
-			const error = await enqueueInTransaction(tx, prepared(2)).catch(
+			const error = await runPreparedJob(tx, prepared(2)).catch(
 				(caught: unknown) => caught
 			)
 			expect(error).toBeInstanceOf(EnqueueCountError)
@@ -63,7 +59,7 @@ describe('enqueueInTransaction', () => {
 		const racing: RawQueryClient = {
 			$queryRawUnsafe: async () => answers[runs++] ?? []
 		}
-		expect(await enqueueInTransaction(racing, prepared(1))).toEqual(['7'])
+		expect(await runPreparedJob(racing, prepared(1))).toEqual(['7'])
 		expect(runs).toBe(3)
 
 		runs = 0
@@ -73,7 +69,7 @@ describe('enqueueInTransaction', () => {
 				return []
 			}
 		}
-		await expect(enqueueInTransaction(losing, prepared(1))).rejects.toThrow(
+		await expect(runPreparedJob(losing, prepared(1))).rejects.toThrow(
 			EnqueueCountError
 		)
 		expect(runs).toBe(3)
@@ -81,14 +77,14 @@ describe('enqueueInTransaction', () => {
 
 	test('required throws EnqueueSkippedError for a skipped statement', async () => {
 		const skipped = { ...prepared(0), skipped: true }
-		const error = await enqueueInTransaction(rows(), skipped, {
+		const error = await runPreparedJob(rows(), skipped, {
 			required: true
 		}).catch((caught: unknown) => caught)
 		expect(error).toBeInstanceOf(EnqueueSkippedError)
 		expect(error).toMatchObject({ queue: 'q' })
 		// An empty batch was not skipped, so it has nothing to require.
 		expect(
-			await enqueueInTransaction(rows(), prepared(0), { required: true })
+			await runPreparedJob(rows(), prepared(0), { required: true })
 		).toEqual([])
 	})
 
@@ -97,12 +93,12 @@ describe('enqueueInTransaction', () => {
 			$queryRawUnsafe: (_query: string, ..._values: unknown[]) =>
 				Promise.resolve(result)
 		})
-		expect(
-			await enqueueInTransaction(answering([{ id: '1' }]), prepared(1))
-		).toEqual(['1'])
+		expect(await runPreparedJob(answering([{ id: '1' }]), prepared(1))).toEqual(
+			['1']
+		)
 		for (const result of [undefined, { id: '1' }, [{ id: 1 }], [null]])
 			await expect(
-				enqueueInTransaction(answering(result), prepared(1))
+				runPreparedJob(answering(result), prepared(1))
 			).rejects.toThrow(TypeError)
 	})
 })
@@ -123,7 +119,7 @@ describe('enqueueInTransaction on a producer', () => {
 	/** Records each statement's values and answers with one job id. */
 	const recording = () => {
 		const calls: unknown[][] = []
-		const tx: PrismaRawClient = {
+		const tx: RawQueryClient = {
 			$queryRawUnsafe: async <T>(_text: string, ...values: unknown[]) => {
 				calls.push(values)
 				return [{ id: '7' }] as T
@@ -183,7 +179,7 @@ describe('enqueueInTransaction on a producer', () => {
 		const prepare: PrepareJobFn<typeof queues> = async (...args) =>
 			producer().prepareJob(...args)
 		const enqueue: EnqueueInTransactionFn<typeof queues> = async (
-			_tx: PrismaRawClient,
+			_tx: RawQueryClient,
 			_job
 		) => null
 		expect([typeof prepare, typeof enqueue]).toEqual(['function', 'function'])
@@ -265,7 +261,7 @@ suite('enqueueInTransaction on PostgreSQL', () => {
 	})
 	const client = createJobClient({ pgPool: pool, schema, queues: [queue] })
 	/** The same `$queryRawUnsafe` contract Prisma's transaction client has. */
-	const asPrisma = (connection: PoolClient): PrismaRawClient => ({
+	const asPrisma = (connection: PoolClient): RawQueryClient => ({
 		$queryRawUnsafe: async <T>(text: string, ...values: unknown[]) =>
 			(await connection.query(text, values)).rows as T
 	})
@@ -287,14 +283,12 @@ suite('enqueueInTransaction on PostgreSQL', () => {
 		const connection = await pool.connect()
 		try {
 			await connection.query('BEGIN')
-			expect(
-				await enqueueInTransaction(asPrisma(connection), one)
-			).toHaveLength(1)
+			expect(await runPreparedJob(asPrisma(connection), one)).toHaveLength(1)
 			await connection.query('ROLLBACK')
 			expect(await count()).toBe(0)
 
 			await connection.query('BEGIN')
-			const ids = await enqueueInTransaction(asPrisma(connection), many)
+			const ids = await runPreparedJob(asPrisma(connection), many)
 			await connection.query('COMMIT')
 			expect(ids).toHaveLength(2)
 			expect(await count()).toBe(2)
@@ -312,7 +306,7 @@ suite('enqueueInTransaction on PostgreSQL', () => {
 		const connection = await pool.connect()
 		try {
 			await connection.query('BEGIN')
-			const [id] = await enqueueInTransaction(asPrisma(connection), job, {
+			const [id] = await runPreparedJob(asPrisma(connection), job, {
 				required: true
 			})
 			await connection.query('COMMIT')

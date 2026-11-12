@@ -9,7 +9,8 @@ import {
 import type { JobHelpers } from 'graphile-worker'
 import { Pool, type PoolClient } from 'pg'
 import { z } from 'zod'
-import { createBetterWorker } from './create-better-worker.js'
+import { createBetterWorker, createWorker } from './create-better-worker.js'
+import { createNoopCompletedJobsStore } from './completed-jobs-store.js'
 import { sweepDeadWorkers } from './maintenance.js'
 import { settleLockedJob, sweepWaits } from './private-jobs.js'
 import { defineQueue } from './queue.js'
@@ -354,16 +355,25 @@ suite('waiting on child jobs in PostgreSQL', () => {
 		hooks: { createLogger: () => quiet }
 	}
 	const worker = createBetterWorker(base)
-	const only = (...process: (typeof queues)[number]['name'][]) =>
-		createBetterWorker({ ...base, process })
+	// A worker that runs only some queues, as one pool runner does.
+	const only = (...names: (typeof queues)[number]['name'][]) =>
+		createWorker(
+			base,
+			createNoopCompletedJobsStore(),
+			undefined,
+			undefined,
+			names
+		)
 	const parents = only('sync', 'timed', 'carry')
 	const grands = only('grand')
 	// Children record durable outcomes too, in the same statement as their report.
-	const children = createBetterWorker({
-		...base,
-		process: ['fetch', 'slicer'],
-		jobOutcomes: {}
-	})
+	const children = createWorker(
+		{ ...base, jobOutcomes: {} },
+		createNoopCompletedJobsStore(),
+		undefined,
+		undefined,
+		['fetch', 'slicer']
+	)
 
 	const row = async (id: string) =>
 		(

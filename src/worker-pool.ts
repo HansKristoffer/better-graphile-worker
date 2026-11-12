@@ -9,7 +9,11 @@ import {
 } from './create-better-worker.js'
 import type { QueueContract } from './queue.js'
 import { createMaintenance } from './maintenance.js'
-import { resolveDatabaseProbe, whileReachable } from './shutdown.js'
+import {
+	resolveDatabaseProbe,
+	thenEndPool,
+	whileReachable
+} from './shutdown.js'
 import { DEFAULT_CONCURRENCY } from './worker.js'
 
 type RunnerOf<Q, TDefault extends string> = Q extends {
@@ -134,12 +138,12 @@ export function createBetterWorkerPool<
 		createWorker<TQueues>(
 			{
 				...shared,
-				...(runner === undefined ? {} : runnerOptions[runner]),
-				process: queues
+				...(runner === undefined ? {} : runnerOptions[runner])
 			} as never,
 			completedJobs,
 			runner,
-			maintenance
+			maintenance,
+			queues
 		)
 	const workers = Object.fromEntries(
 		[...assigned].map(([name, queues]) => [name, create(name, queues)])
@@ -224,14 +228,17 @@ export function createBetterWorkerPool<
 			for (const worker of all) void worker.promise.catch(stopAll)
 		},
 		stop(stopOptions) {
-			const { probeDatabase, ...runnerStop } = stopOptions ?? {}
+			const { probeDatabase, endPool, ...runnerStop } = stopOptions ?? {}
 			const probe = resolveDatabaseProbe(probeDatabase)
 			const waiting = idle?.promise
 			idle?.stop()
 			const stopping = all.length
 				? each((worker) => worker.stop(runnerStop))
 				: (waiting ?? primary.stop())
-			return probe ? whileReachable(stopping, options.pgPool, probe) : stopping
+			const stopped = probe
+				? whileReachable(stopping, options.pgPool, probe)
+				: stopping
+			return endPool ? thenEndPool(stopped, options.pgPool) : stopped
 		},
 		waitUntilStopped: () =>
 			idleOr(() => each((worker) => worker.waitUntilStopped())),

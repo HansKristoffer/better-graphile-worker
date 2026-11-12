@@ -8,8 +8,6 @@ import { defineQueue } from './queue.js'
 import { buildTaskList } from './worker.js'
 import { normalizeWorkerQueues } from './registry.js'
 import { createTestHarness } from './testing.js'
-import { createBetterWorker } from './create-better-worker.js'
-import type { Pool } from 'pg'
 
 const advance = defineQueue({
 	name: 'advance',
@@ -287,35 +285,6 @@ describe('prepareJob', () => {
 		])
 		expect(job.text).toContain('add_jobs(')
 		expect(job.values[1]).toBe(true)
-	})
-})
-
-describe('process option', () => {
-	const contracts = [
-		defineQueue({ name: 'a', inputSchema: z.string() }),
-		defineQueue({ name: 'b', cron: '* * * * *' })
-	] as const
-	test('runs a subset but keeps the full producer registry', () => {
-		const worker = createBetterWorker({
-			pgPool: {} as Pool,
-			queues: contracts,
-			handlers: { a: () => {}, b: () => {} },
-			process: ['a']
-		})
-		expect(Object.keys(worker.buildTaskList())).toEqual(['a'])
-		expect(worker.buildCronItems()).toEqual([])
-		expect(Object.keys(worker.jobs)).toEqual(['a', 'b'])
-	})
-	test('rejects unknown, duplicate and empty lists', () => {
-		for (const process of [['x'], ['a', 'a'], []])
-			expect(() =>
-				createBetterWorker({
-					pgPool: {} as Pool,
-					queues: contracts,
-					handlers: { a: () => {}, b: () => {} },
-					process: process as never
-				})
-			).toThrow(TypeError)
 	})
 })
 
