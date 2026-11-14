@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.1](https://github.com/HansKristoffer/better-graphile-worker/compare/v3.0.0...v3.0.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* ship CHANGELOG.md in the npm package ([#39](https://github.com/HansKristoffer/better-graphile-worker/issues/39)) ([9fc22ec](https://github.com/HansKristoffer/better-graphile-worker/commit/9fc22ec54e136d83e5c8c69211cb2888af62bdee))
+
 ## [3.0.0](https://github.com/HansKristoffer/better-graphile-worker/compare/v2.8.0...v3.0.0) (2026-11-12)
 
 
