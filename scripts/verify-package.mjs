@@ -20,6 +20,8 @@ try {
 	const files = new Set(packed.files.map(({ path }) => path))
 	assert.ok([...files].some((file) => /^readme\.md$/i.test(file)), 'Package needs a README')
 	assert.ok(files.has('LICENSE'), 'Package needs its declared license')
+	// Agents upgrading an app read node_modules/<pkg>/CHANGELOG.md to see what changed.
+	assert.ok(files.has('CHANGELOG.md'), 'Package needs its changelog')
 	for (const file of files) {
 		assert.ok(!/\.(test|testing)\.[cm]?[jt]s$|\.tsbuildinfo$|\.tgz$/.test(file), `Unwanted package file: ${file}`)
 		assert.ok(!file.startsWith('docs/') && !file.startsWith('.github/'), `Unwanted package file: ${file}`)
